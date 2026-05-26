@@ -1054,21 +1054,6 @@ echo "✅ Linux 探针安装成功！"
                 options: pingOptions 
             });
 
-            const maxDisplayPoints = 350; 
-            const updateChartData = (chart, newData, datasetIndex = 0) => { 
-                const dataArr = chart.data.datasets[datasetIndex].data; 
-                dataArr.push(newData); 
-                if (dataArr.length > maxDisplayPoints) dataArr.shift(); 
-                chart.update(); 
-            };
-            const updateLabels = (chart, label) => {
-                const labels = chart.data.labels;
-                labels.push(label);
-                if (labels.length > maxDisplayPoints) labels.shift();
-            };
-
-            let initialHistoryLoaded = false;
-
             async function fetchData() {
               try {
                 const res = await fetch('/api/server?id=' + serverId); const data = await res.json();
@@ -1089,42 +1074,33 @@ echo "✅ Linux 探针安装成功！"
                 let hist = {};
                 try { if(data.history) hist = JSON.parse(data.history); } catch(e) {}
                 
-                if (!initialHistoryLoaded && hist.time && hist.time.length > 0) {
-                    const populate = (chart, hDataList) => {
-                        chart.data.labels = [...hist.time];
-                        hDataList.forEach((hData, i) => { chart.data.datasets[i].data = hData ? [...hData] : Array(hist.time.length).fill(0); });
-                        chart.update();
+                if (hist.time && hist.time.length > 0) {
+                    const nowTime = new Date(); 
+                    const timeLabel = nowTime.getHours().toString().padStart(2, '0') + ':' + String(nowTime.getMinutes()).padStart(2, '0');
+                    const rtLabels = [...hist.time, timeLabel];
+
+                    const updateChartSync = (chart, histArray, rtValue) => {
+                        chart.data.labels = rtLabels;
+                        chart.data.datasets[0].data = histArray ? [...histArray, rtValue] : [];
+                        chart.update('none');
                     };
-                    populate(charts.cpu, [hist.cpu]);
-                    populate(charts.ram, [hist.ram]);
-                    populate(charts.proc, [hist.proc]);
-                    populate(charts.net, [hist.net_in, hist.net_out]);
-                    populate(charts.conn, [hist.tcp, hist.udp]);
-                    populate(charts.ping, [hist.ping_ct, hist.ping_cu, hist.ping_cm, hist.ping_bd]);
-                    initialHistoryLoaded = true;
+
+                    const updateMultiChartSync = (chart, histArrays, rtValues) => {
+                        chart.data.labels = rtLabels;
+                        histArrays.forEach((hArr, i) => {
+                            chart.data.datasets[i].data = hArr ? [...hArr, rtValues[i]] : [];
+                        });
+                        chart.update('none');
+                    };
+
+                    updateChartSync(charts.cpu, hist.cpu, parseFloat(data.cpu) || 0);
+                    updateChartSync(charts.ram, hist.ram, parseFloat(data.ram) || 0);
+                    updateChartSync(charts.proc, hist.proc, parseInt(data.processes) || 0);
+
+                    updateMultiChartSync(charts.net, [hist.net_in, hist.net_out], [parseFloat(data.net_in_speed) || 0, parseFloat(data.net_out_speed) || 0]);
+                    updateMultiChartSync(charts.conn, [hist.tcp, hist.udp], [parseInt(data.tcp_conn) || 0, parseInt(data.udp_conn) || 0]);
+                    updateMultiChartSync(charts.ping, [hist.ping_ct, hist.ping_cu, hist.ping_cm, hist.ping_bd], [parseInt(data.ping_ct) || 0, parseInt(data.ping_cu) || 0, parseInt(data.ping_cm) || 0, parseInt(data.ping_bd) || 0]);
                 }
-
-                const nowTime = new Date(); 
-                const timeLabel = nowTime.getHours().toString().padStart(2, '0') + ':' + String(nowTime.getMinutes()).padStart(2, '0') + ':' + String(nowTime.getSeconds()).padStart(2, '0');
-                
-                updateLabels(charts.cpu, timeLabel); updateChartData(charts.cpu, parseFloat(data.cpu) || 0, 0);
-                updateLabels(charts.ram, timeLabel); updateChartData(charts.ram, parseFloat(data.ram) || 0, 0);
-                updateLabels(charts.proc, timeLabel); updateChartData(charts.proc, parseInt(data.processes) || 0, 0);
-                
-                updateLabels(charts.net, timeLabel); 
-                updateChartData(charts.net, parseFloat(data.net_in_speed) || 0, 0); 
-                updateChartData(charts.net, parseFloat(data.net_out_speed) || 0, 1);
-                
-                updateLabels(charts.conn, timeLabel); 
-                updateChartData(charts.conn, parseInt(data.tcp_conn) || 0, 0); 
-                updateChartData(charts.conn, parseInt(data.udp_conn) || 0, 1);
-                
-                updateLabels(charts.ping, timeLabel); 
-                updateChartData(charts.ping, parseInt(data.ping_ct) || 0, 0); 
-                updateChartData(charts.ping, parseInt(data.ping_cu) || 0, 1);
-                updateChartData(charts.ping, parseInt(data.ping_cm) || 0, 2);
-                updateChartData(charts.ping, parseInt(data.ping_bd) || 0, 3);
-
               } catch (e) {}
             }
             setInterval(fetchData, 3000); fetchData();
@@ -1247,11 +1223,15 @@ echo "✅ Linux 探针安装成功！"
                 </div>
                 
                 <div class="card-right">
-                  <div class="stat-col"><div class="stat-label">CPU</div><div class="stat-val">${cpu}%</div><div class="stat-bar"><div style="width:${cpu}%;"></div></div></div>
-                  <div class="stat-col"><div class="stat-label">内存</div><div class="stat-val">${ram}%</div><div class="stat-bar"><div style="width:${ram}%; background:#f59e0b;"></div></div></div>
-                  <div class="stat-col"><div class="stat-label">存储</div><div class="stat-val">${disk}%</div><div class="stat-bar"><div style="width:${disk}%; background:#10b981;"></div></div></div>
-                  <div class="stat-col"><div class="stat-label">上传</div><div class="stat-val">${netOutSpeed}/s</div></div>
-                  <div class="stat-col"><div class="stat-label">下载</div><div class="stat-val">${netInSpeed}/s</div></div>
+                  <div class="card-right-row">
+                    <div class="stat-col"><div class="stat-label">CPU</div><div class="stat-val">${cpu}%</div><div class="stat-bar"><div style="width:${cpu}%;"></div></div></div>
+                    <div class="stat-col"><div class="stat-label">内存</div><div class="stat-val">${ram}%</div><div class="stat-bar"><div style="width:${ram}%; background:#f59e0b;"></div></div></div>
+                    <div class="stat-col"><div class="stat-label">存储</div><div class="stat-val">${disk}%</div><div class="stat-bar"><div style="width:${disk}%; background:#10b981;"></div></div></div>
+                  </div>
+                  <div class="card-right-row" style="padding-top: 4px; justify-content: space-around;">
+                    <div class="stat-col"><div class="stat-label">上传</div><div class="stat-val">${netOutSpeed}/s</div></div>
+                    <div class="stat-col"><div class="stat-label">下载</div><div class="stat-val">${netInSpeed}/s</div></div>
+                  </div>
                 </div>
               </a>
             `;
@@ -1322,7 +1302,8 @@ echo "✅ Linux 探针安装成功！"
           .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; color: white; }
           .badge-bw { background: #3b82f6; } .badge-tf { background: #10b981; } .badge-v4 { background: #a855f7; } .badge-v6 { background: #ec4899; }
           
-          .card-right { flex: 1; display: flex; justify-content: space-between; align-items: center; padding-left: 15px; border-left: 1px solid #f0f0f0; }
+          .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 12px; padding-left: 15px; border-left: 1px solid #f0f0f0; }
+          .card-right-row { display: flex; width: 100%; justify-content: space-between; align-items: center; }
           .stat-col { display: flex; flex-direction: column; align-items: center; flex: 1; padding: 0 2px; }
           .stat-label { font-size: 11px; color: #888; margin-bottom: 8px; white-space: nowrap; }
           .stat-val { font-size: 12px; font-weight: 600; color: #111; margin-bottom: 6px; white-space: nowrap; }
