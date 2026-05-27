@@ -160,7 +160,7 @@ export default {
       .theme2 .group-header { color: #58a6ff; border-left-color: #58a6ff; }
       .theme2 .stat-val, .theme2 .g-val { color: #fff; }
       .theme2 .stat-label, .theme2 .g-label, .theme2 .g-sub, .theme2 .card-meta { color: #8b949e; }
-      .theme2 .stat-bar { background: #21262d; }
+      .theme2 .stat-bar, .theme2 .stat-bar-full { background: #21262d; }
       .theme2 .divider { background: #30363d; }
       .theme2 .card-title { color: #fff; }
       .theme2 .view-controls { background: #0d1117; border: 1px solid #30363d; }
@@ -177,8 +177,8 @@ export default {
       .theme3 .vps-card, .theme3 .global-stats, .theme3 .header-card, .theme3 .chart-card { background: #fff; border: 3px solid #000; border-radius: 0; box-shadow: 6px 6px 0px #000; transition: transform 0.1s, box-shadow 0.1s; }
       .theme3 .vps-card:hover { transform: translate(2px, 2px); box-shadow: 4px 4px 0px #000; border-color: #000; }
       .theme3 .group-header { color: #000; border-left: none; border-bottom: 4px solid #000; padding-left: 0; display: inline-block; font-size: 22px; font-weight: 900; text-transform: uppercase; }
-      .theme3 .stat-bar { background: #e5e5e5; border: 1px solid #000; }
-      .theme3 .stat-bar > div { border-right: 1px solid #000; }
+      .theme3 .stat-bar, .theme3 .stat-bar-full { background: #e5e5e5; border: 1px solid #000; }
+      .theme3 .stat-bar > div, .theme3 .stat-bar-full > div { border-right: 1px solid #000; }
       .theme3 .badge { border: 1px solid #000; border-radius: 0; }
       .theme3 .stat-val, .theme3 .g-val, .theme3 .card-title { font-weight: 900; color: #000; }
       .theme3 .custom-table, .theme3 .filter-tag { background: #fff; border: 3px solid #000; border-radius: 0; box-shadow: 6px 6px 0px #000; }
@@ -189,7 +189,7 @@ export default {
       .theme4 .group-header { color: #fff; border-left-color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }
       .theme4 .stat-val, .theme4 .g-val, .theme4 .card-title { color: #fff; }
       .theme4 .stat-label, .theme4 .g-label, .theme4 .g-sub, .theme4 .card-meta { color: rgba(255,255,255,0.8); }
-      .theme4 .stat-bar { background: rgba(0,0,0,0.2); }
+      .theme4 .stat-bar, .theme4 .stat-bar-full { background: rgba(0,0,0,0.2); }
       .theme4 .divider { background: rgba(255,255,255,0.2); }
       .theme4 .custom-table, .theme4 .filter-tag { background: rgba(255, 255, 255, 0.2); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.4); box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.1); color: #fff; }
       .theme4 .custom-table th, .theme4 .custom-table tr:hover { background: rgba(0,0,0,0.1); color:#fff;}
@@ -201,8 +201,8 @@ export default {
       .theme5 .group-header { color: #f0f; border-left: 5px solid #0ff; text-shadow: 0 0 5px #f0f; }
       .theme5 .stat-val, .theme5 .g-val, .theme5 .card-title { color: #0ff; text-shadow: 0 0 5px #0ff; }
       .theme5 .stat-label, .theme5 .g-label, .theme5 .g-sub, .theme5 .card-meta { color: #f0f; }
-      .theme5 .stat-bar { background: #222; }
-      .theme5 .stat-bar > div { background: #0ff !important; box-shadow: 0 0 10px #0ff; }
+      .theme5 .stat-bar, .theme5 .stat-bar-full { background: #222; border: 1px solid #f0f; border-radius: 0; }
+      .theme5 .stat-bar > div, .theme5 .stat-bar-full > div { background: #0ff !important; box-shadow: 0 0 10px #0ff; border-radius: 0; }
       .theme5 .divider { background: #333; }
       .theme5 .badge-bw { background: #f0f; box-shadow: 0 0 5px #f0f; }
       .theme5 .badge-tf { background: #0ff; color:#000; box-shadow: 0 0 5px #0ff; }
@@ -223,7 +223,7 @@ export default {
         .group-header { color: #fff !important; text-shadow: 0 2px 5px rgba(0,0,0,0.6) !important; border-left-color: #fff !important; }
         .stat-val, .g-val, .card-title { color: #000 !important; font-weight: 800 !important; }
         .stat-label, .g-label, .g-sub, .card-meta { color: #333 !important; font-weight: 600 !important; }
-        .stat-bar { background: rgba(0,0,0,0.1) !important; }
+        .stat-bar, .stat-bar-full { background: rgba(0,0,0,0.1) !important; }
       ` : ''}
 
       .view-controls { display: flex; gap: 8px; background: rgba(0,0,0,0.05); padding: 4px; border-radius: 8px; }
@@ -248,13 +248,15 @@ export default {
       /* 新增的堆叠卡片样式 */
       .stat-group { display: flex; flex-direction: column; margin-bottom: 8px; }
       .stat-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: inherit; }
-      .stat-bar-full { width: 100%; height: 6px; background: rgba(150, 150, 150, 0.2); border-radius: 3px; overflow: hidden; }
+      .stat-bar-full { width: 100%; height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
       .stat-bar-full > div { height: 100%; border-radius: 3px; transition: width 0.3s; }
       .stat-subtext { font-size: 11px; color: #6b7280; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .theme2 .stat-subtext, .theme4 .stat-subtext, .theme5 .stat-subtext { color: rgba(255,255,255,0.6); }
-      .theme5 .stat-bar-full { border: 1px solid #f0f; background: #222; border-radius: 0; }
-      .theme5 .stat-bar-full > div { border-radius: 0; box-shadow: 0 0 5px #0ff; }
       .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
+      
+      /* 表格内进度条通用样式修复 */
+      .stat-bar { width: 100%; height: 4px; background: #e5e7eb; border-radius: 2px; overflow: hidden; }
+      .stat-bar > div { height: 100%; border-radius: 2px; transition: width 0.3s; }
     `;
 
     // ==========================================
@@ -1287,13 +1289,13 @@ echo "✅ Linux 探针安装成功！"
                 <td><span class="os-text">${server.os || 'Linux'} / ${server.arch || 'KVM'}</span></td>
                 <td style="min-width:100px;">
                   <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${cpu}%;"></div></div>
+                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${cpu}%; background:#3b82f6;"></div></div>
                     <span>${cpu}%</span>
                   </div>
                 </td>
                 <td style="min-width:100px;">
                   <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${ram}%; background:#f59e0b;"></div></div>
+                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${ram}%; background:#10b981;"></div></div>
                     <span>${ram}%</span>
                   </div>
                 </td>
