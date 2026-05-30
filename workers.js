@@ -170,7 +170,7 @@ export default {
         return { amount, remValue };
     };
 
-    // 状态机交易结算 (严格防双花与防重放)
+    // 执行状态机交易结算 (严格防双花与防重放)
     const processBlockTransactions = async (txs) => {
         if (!txs || !Array.isArray(txs)) return;
         let txIdsToDelete = [];
@@ -196,6 +196,26 @@ export default {
             await env.DB.prepare(`DELETE FROM mempool WHERE tx_id IN (${txIdsToDelete.join(',')})`).run();
         }
     };
+
+    // ==========================================
+    // 账本状态机绝对一致性自愈修复模块 (Self-Healing)
+    // ==========================================
+    const checkAndRebuildLedger = async () => {
+        try {
+            const flag = await env.DB.prepare("SELECT value FROM settings WHERE key='rebuild_ledger'").first();
+            if (flag && flag.value === 'true') {
+                await env.DB.prepare('DELETE FROM blockchain_wallets').run();
+                await env.DB.prepare('DELETE FROM executed_txs').run();
+                const { results: allBlocks } = await env.DB.prepare('SELECT payload FROM blockchain_ledger ORDER BY slot_id ASC').all();
+                for (const b of allBlocks) {
+                    const pl = JSON.parse(b.payload);
+                    if (pl.txs) await processBlockTransactions(pl.txs);
+                }
+                await env.DB.prepare("UPDATE settings SET value='false' WHERE key='rebuild_ledger'").run();
+            }
+        } catch (e) {}
+    };
+    ctx.waitUntil(checkAndRebuildLedger());
 
     // ==========================================
     // 1. 认证机制与全局设置加载
@@ -288,9 +308,8 @@ export default {
                     return new Response('Block from future rejected', { status: 400 });
                 }
 
-                const currentBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
+                const currentBlock = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
                 
-                // 解决区块不一致的终极方案：先到先得，不覆盖旧区块。避免节点来回跳跃产生分叉。
                 if (!currentBlock) {
                     await env.DB.prepare(`
                         INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) 
@@ -306,6 +325,10 @@ export default {
                     `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()).run();
                     
                     if (pl.txs) await processBlockTransactions(pl.txs);
+                } else if (currentBlock.block_hash !== block.block_hash && block.block_hash < currentBlock.block_hash) {
+                    // 确定性分叉解决：哈希较小者胜出，覆盖本地分叉并触发全链账本自愈重建
+                    await env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(block.proposer_domain, block.block_hash, block.payload, Date.now(), block.slot_id).run();
+                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
                 }
                 return new Response('Consensus Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
             } catch(e) { return new Response('Block Reject', { status: 400 }); }
@@ -336,20 +359,23 @@ export default {
     const mineAndGossip = async (localAsset, localVpsCount) => {
         try {
             const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
-            const hash = await miniHash(`${currentSlot}-${host}`);
+            
+            // 打包内存池中的交易
+            const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC LIMIT 20').all();
+            let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
+            
+            // 出块奖励 1 Cycle (使用 deterministic ID 防多节点打包产生重复奖励)
+            if (sys.miner_wallet) {
+                const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
+                blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: Date.now() });
+            }
+
+            const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs });
+            
+            // 修复：哈希强绑定 payload，彻底根除“同哈希不同交易”分叉现象
+            const hash = await miniHash(`${currentSlot}-${host}-${payloadStr}`);
             
             if (parseInt(hash.slice(-1), 16) <= 14) {
-                // 打包内存池中的交易
-                const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC LIMIT 20').all();
-                let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
-                
-                // 出块奖励 1 Cycle (使用 deterministic ID 防多节点打包产生重复奖励)
-                if (sys.miner_wallet) {
-                    const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
-                    blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: Date.now() });
-                }
-
-                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs });
                 const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, payload: payloadStr };
                 
                 const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
@@ -357,10 +383,13 @@ export default {
                     fetch(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
                 }
                 
-                const currentBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+                const currentBlock = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
                 if (!currentBlock) {
                     await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(currentSlot, host, hash, payloadStr, Date.now()).run();
                     await processBlockTransactions(blockTxs);
+                } else if (currentBlock.block_hash !== hash && hash < currentBlock.block_hash) {
+                    await env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(host, hash, payloadStr, Date.now(), currentSlot).run();
+                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
                 }
             }
 
@@ -375,14 +404,17 @@ export default {
                         const syncData = await syncRes.json();
                         for (const b of syncData.blocks) {
                             if (b.slot_id <= currentSlotNow + 2) {
-                                // 增加 exist 判定，严格保证本节点一条时间线，不被新来的块乱覆盖
-                                const exist = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(b.slot_id).first();
+                                const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(b.slot_id).first();
                                 if (!exist) {
                                     await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp).run();
                                     const pl = JSON.parse(b.payload);
                                     const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 100000000);
                                     await env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp).run();
                                     if (pl.txs) await processBlockTransactions(pl.txs);
+                                } else if (exist.block_hash !== b.block_hash && b.block_hash < exist.block_hash) {
+                                    // 发现更优哈希的分叉，执行覆盖与自愈重建
+                                    await env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(b.proposer_domain, b.block_hash, b.payload, b.timestamp, b.slot_id).run();
+                                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
                                 }
                             }
                         }
@@ -1400,7 +1432,7 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
           th { background: #f8f9fa; }
           .btn { cursor: pointer; border-radius: 4px; font-size: 13px; transition: opacity 0.2s; border: none; padding: 6px 10px; color: white; margin-left: 5px; }
           .btn:hover { opacity: 0.8; }
-          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; } .btn-purple { background: #8b5cf6; } .btn-orange { background: #f59e0b; }
+          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; } .btn-purple { background: #8b5cf6; }
           .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
           .form-group { display: flex; flex-direction: column; margin-bottom: 15px; }
           .form-group label { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #555;}
@@ -2117,7 +2149,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             const ast = calcServerAsset(s, nowMs).amount;
             currentAsset += isNaN(ast) ? 0 : ast;
         }
-        // 增加本地资产上限，防止无限累加
         currentAsset = Math.min(currentAsset, 100000000); 
         
         ctx.waitUntil(mineAndGossip(currentAsset, allS.length));
