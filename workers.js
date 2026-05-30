@@ -100,9 +100,9 @@ export default {
           VALUES (?, 'true', ?, 9999) ON CONFLICT(domain) DO UPDATE SET is_beacon='true', reputation_score=9999
         `).bind(SEED_NODE, Date.now()).run();
 
-        // 清理由于恶意节点广播产生的离谱异常资产重力数据
+        // 强力清洗历史脏数据，确保 Consensus Gravity 精准
         try {
-            await env.DB.prepare('UPDATE blockchain_peers SET total_asset = 0 WHERE total_asset > 100000000').run();
+            await env.DB.prepare('UPDATE blockchain_peers SET total_asset = 0 WHERE total_asset > 1000000').run();
         } catch(e) {}
 
         const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
@@ -135,7 +135,7 @@ export default {
         if (server.price && server.price.match(/[\d.]+/)) {
             const match = server.price.match(/[\d.]+/);
             let rawAmount = match ? parseFloat(match[0]) : 0;
-            // 增加本地资产解析封顶防溢出，防止价格填写异常导致重力爆炸
+            // 本地资产解析封顶防溢出，防止异常重力爆炸
             rawAmount = Math.min(rawAmount, 100000); 
 
             let rate = 1; const pUpper = server.price.toUpperCase();
@@ -216,6 +216,26 @@ export default {
             } catch(e) {}
         }
     };
+
+    // ==========================================
+    // 账本状态机绝对一致性自愈修复模块 (Self-Healing)
+    // ==========================================
+    const checkAndRebuildLedger = async () => {
+        try {
+            const flag = await env.DB.prepare("SELECT value FROM settings WHERE key='rebuild_ledger'").first();
+            if (flag && flag.value === 'true') {
+                await env.DB.prepare('DELETE FROM blockchain_wallets').run();
+                await env.DB.prepare('DELETE FROM executed_txs').run();
+                const { results: allBlocks } = await env.DB.prepare('SELECT payload FROM blockchain_ledger ORDER BY slot_id ASC').all();
+                for (const b of allBlocks) {
+                    const pl = JSON.parse(b.payload);
+                    if (pl.txs) await processBlockTransactions(pl.txs);
+                }
+                await env.DB.prepare("UPDATE settings SET value='false' WHERE key='rebuild_ledger'").run();
+            }
+        } catch (e) {}
+    };
+    ctx.waitUntil(checkAndRebuildLedger());
 
     // ==========================================
     // 1. 认证机制与全局设置加载
@@ -318,7 +338,7 @@ export default {
                     `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.payload, Date.now()).run();
                     
                     const pl = JSON.parse(block.payload);
-                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 100000000); 
+                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 1000000); 
                     await env.DB.prepare(`
                         INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) 
                         VALUES (?, ?, ?, ?) 
@@ -327,7 +347,7 @@ export default {
                     
                     if (pl.txs) await processBlockTransactions(pl.txs);
                 } else if (block.block_hash < currentBlock.block_hash) {
-                    // 发生更优分叉，精准回滚被遗弃区块的交易，绝不清空重置余额
+                    // 发生更优分叉，精准回滚被遗弃区块的交易
                     const oldPayload = JSON.parse(currentBlock.payload);
                     if (oldPayload.txs) await revertBlockTransactions(oldPayload.txs);
 
@@ -417,7 +437,7 @@ export default {
                                 if (!exist) {
                                     await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp).run();
                                     const pl = JSON.parse(b.payload);
-                                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 100000000);
+                                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 1000000);
                                     await env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp).run();
                                     if (pl.txs) await processBlockTransactions(pl.txs);
                                 } else if (b.block_hash < exist.block_hash) {
@@ -2773,18 +2793,10 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             <h1 style="margin:0;">${sys.site_title}</h1>
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
               <div class="view-controls">
-                <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片
-                </button>
-                <button class="toggle-btn" id="btn-table" onclick="switchView('table')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg> 表格
-                </button>
-                <button class="toggle-btn" id="btn-map" onclick="switchView('map')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"></polygon><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg> 地图
-                </button>
-                <button class="toggle-btn" id="btn-block" onclick="switchView('block')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg> 链上区块
-                </button>
+                <button class="toggle-btn active" id="btn-card" onclick="switchView('card')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片</button>
+                <button class="toggle-btn" id="btn-table" onclick="switchView('table')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg> 表格</button>
+                <button class="toggle-btn" id="btn-map" onclick="switchView('map')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"></polygon><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg> 地图</button>
+                <button class="toggle-btn" id="btn-block" onclick="switchView('block')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg> 链上区块</button>
               </div>
               <a href="/admin" class="admin-btn">${sys.admin_title}</a>
             </div>
