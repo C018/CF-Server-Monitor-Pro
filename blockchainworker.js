@@ -2217,7 +2217,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
-      // Web3 获取去中心化排名与节点数量
+      // Web3 获取去中心化排名与节点数量 (引入活性淘汰机制)
       let localRank = 1;
       let globalNetAsset = totalAsset;
       let globalProposer = '--';
@@ -2226,7 +2226,11 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       let globalNodes = 1;
       
       try {
-          const { results: rankList } = await env.DB.prepare('SELECT domain, total_asset FROM blockchain_peers').all();
+          // 设定存活阈值：只承认最近 5 分钟内有心跳的节点 (5 * 60 * 1000)
+          const activeThreshold = Date.now() - 300000; 
+          
+          // 修复 1：只拉取存活节点的资产参与排名
+          const { results: rankList } = await env.DB.prepare('SELECT domain, total_asset FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).all();
           let higherCount = 0;
           let otherAssets = 0;
           
@@ -2238,6 +2242,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               }
           }
           
+          // 如果自己没在活跃列表里，把自己加上
           localRank = higherCount + 1;
           globalNetAsset = totalAsset + otherAssets;
           
@@ -2247,12 +2252,16 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               globalProposer = latestBlock.proposer_domain.replace('https://', '');
           }
 
-          const bCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE is_beacon IN ("true", "1")').first();
+          // 修复 2：信标数量只统计活着的
+          const bCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND last_seen > ?').bind(activeThreshold).first();
           activeBeacons = bCountRow ? bCountRow.c : 0;
           
-          const nCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers').first();
-          globalNodes = nCountRow ? nCountRow.c : 1;
-      } catch(e) {}
+          // 修复 3：全网节点总数只统计活着的
+          const nCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).first();
+          globalNodes = nCountRow && nCountRow.c > 0 ? nCountRow.c : 1;
+      } catch(e) {
+          console.error("Web3 Data Fetch Error:", e);
+      }
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${results.length}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
