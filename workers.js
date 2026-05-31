@@ -1,3 +1,6 @@
+let cachedNodesData = "";
+let lastFetchTime = 0;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -8,8 +11,9 @@ export default {
     // ==========================================
     const EPOCH_START = 1779667200000; 
     const SEED_NODE = 'https://tanzhen.kejikkk.com';
-    const SLOT_TIME = 10000; // 调整为 10秒出块
-    const OFFLINE_THRESHOLD = 300000; // 调整为 5分钟离线判定
+    const SLOT_TIME = 10000; // 10秒出块
+    const OFFLINE_THRESHOLD = 300000; // 5分钟离线判定
+    const FINALITY_DEPTH = 6; // 终局性确认深度
 
     // ==========================================
     // 0. 数据库自动化热创建与无缝升级
@@ -61,17 +65,38 @@ export default {
           )
         `).run();
 
+        // 包含权重与优雅切换状态标识 (status)
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_ledger (
             slot_id INTEGER PRIMARY KEY, 
             proposer_domain TEXT, 
             block_hash TEXT, 
+            parent_hash TEXT,
             payload TEXT, 
-            timestamp INTEGER
+            timestamp INTEGER,
+            total_difficulty INTEGER DEFAULT 0,
+            status INTEGER DEFAULT 1
           )
         `).run();
+        
+        try { await env.DB.prepare(`ALTER TABLE blockchain_ledger ADD COLUMN parent_hash TEXT DEFAULT '0000000000000000000000000000000000000000'`).run(); } catch(e){}
+        try { await env.DB.prepare(`ALTER TABLE blockchain_ledger ADD COLUMN total_difficulty INTEGER DEFAULT 0`).run(); } catch(e){}
+        try { await env.DB.prepare(`ALTER TABLE blockchain_ledger ADD COLUMN status INTEGER DEFAULT 1`).run(); } catch(e){}
 
-        // 真实链核心表：钱包状态机与交易内存池
+        // [补丁 A]: 增强型检查点快照表 (支持哈希签名校验)
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS checkpoints (
+            slot_id INTEGER PRIMARY KEY, 
+            state_root TEXT,
+            state_snapshot TEXT,
+            block_hash TEXT,
+            signature TEXT
+          )
+        `).run();
+        try { await env.DB.prepare(`ALTER TABLE checkpoints ADD COLUMN state_snapshot TEXT`).run(); } catch(e){}
+        try { await env.DB.prepare(`ALTER TABLE checkpoints ADD COLUMN block_hash TEXT`).run(); } catch(e){}
+        try { await env.DB.prepare(`ALTER TABLE checkpoints ADD COLUMN signature TEXT`).run(); } catch(e){}
+
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_wallets (
             address TEXT PRIMARY KEY, 
@@ -87,7 +112,6 @@ export default {
           )
         `).run();
 
-        // 彻底废除、清理容易导致脏读的旧版增量表
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
         await env.DB.prepare(`
@@ -95,10 +119,8 @@ export default {
           VALUES (?, 'true', ?, 9999) ON CONFLICT(domain) DO UPDATE SET is_beacon='true', reputation_score=9999
         `).bind(SEED_NODE, Date.now()).run();
 
-        // 默认开启全网信标，强制加入去中心化网络
         await env.DB.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('is_beacon', 'true')`).run();
 
-        // 清理由于恶意节点广播产生的离谱异常资产重力数据 (全域最高强行封顶 50万)
         try {
             await env.DB.prepare('UPDATE blockchain_peers SET total_asset = 500000 WHERE total_asset > 500000').run();
         } catch(e) {}
@@ -108,6 +130,63 @@ export default {
         console.error("❌ 数据库自动初始化失败:", e);
       }
     }
+
+    // ==========================================
+    // 时钟倾斜校准 (Clock Drift Calibration) 
+    // ==========================================
+    let networkTimeOffset = 0;
+    try {
+        const tr = await env.DB.prepare("SELECT value FROM settings WHERE key='time_offset'").first();
+        if (tr && !isNaN(parseInt(tr.value))) networkTimeOffset = parseInt(tr.value);
+    } catch(e){}
+
+    const getNetworkTime = () => Date.now() + networkTimeOffset;
+
+    const updateNetworkTimeOffset = async (peerTimestamp) => {
+        if (!peerTimestamp) return;
+        const localNow = Date.now();
+        const delta = peerTimestamp - localNow;
+        if (Math.abs(delta) > 5000) return; 
+        networkTimeOffset = Math.floor((networkTimeOffset * 0.8) + (delta * 0.2));
+        ctx.waitUntil(env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('time_offset', ?)").bind(networkTimeOffset.toString()).run().catch(()=>{}));
+    };
+
+    const consensusResponse = (body, status = 200) => {
+        const headers = new Headers();
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('X-Network-Time', getNetworkTime().toString());
+        if (typeof body === 'object') {
+            headers.set('Content-Type', 'application/json');
+            return new Response(JSON.stringify(body), { status, headers });
+        }
+        return new Response(body, { status, headers });
+    };
+
+    const fetchWithTimeSync = async (url, opts) => {
+        const res = await fetch(url, opts);
+        const netTime = res.headers.get('X-Network-Time');
+        if (netTime) {
+            const parsed = parseInt(netTime);
+            if (!isNaN(parsed)) ctx.waitUntil(updateNetworkTimeOffset(parsed));
+        }
+        return res;
+    };
+
+    // ==========================================
+    // [补丁 B] 数据库重试机制与全局事务封装 (Atomicity)
+    // ==========================================
+    const executeBatchWithRetry = async (batchStmts, maxRetries = 3) => {
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                await env.DB.batch(batchStmts);
+                return true;
+            } catch (e) {
+                if (attempt === maxRetries - 1) throw e;
+                await new Promise(r => setTimeout(r, 50 * Math.pow(2, attempt))); 
+            }
+        }
+        return false;
+    };
 
     const formatBytes = (bytes) => {
       const b = parseInt(bytes);
@@ -130,7 +209,6 @@ export default {
         if (server.price && server.price.match(/[\d.]+/)) {
             const match = server.price.match(/[\d.]+/);
             let rawAmount = match ? parseFloat(match[0]) : 0;
-            // 增加本地资产解析封顶防溢出，防止价格填写异常导致重力爆炸
             rawAmount = Math.min(rawAmount, 100000); 
 
             let rate = 1; const pUpper = server.price.toUpperCase();
@@ -165,62 +243,130 @@ export default {
         return { amount, remValue };
     };
 
-    // ==========================================
-    // ✨ 方案 A：状态根哈希投影 (State Root Generator)
-    // 采用 SHA-256 计算当前余额树的确切状态快照
-    // ==========================================
-    const computeStateRoot = async (txs) => {
-      const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
-      let balances = {};
-      for (const w of wallets) {
-        if (w.balance > 0) balances[w.address] = w.balance;
-      }
-      
-      // 在内存中严格推演即将打包的交易 (模拟下一区块的状态)
-      if (txs && Array.isArray(txs)) {
-        for (const tx of txs) {
-          if (!tx || !tx.id) continue;
-          const amount = parseFloat(tx.amount) || 0;
-          if (amount <= 0) continue;
+    globalThis.txBuffer = globalThis.txBuffer || [];
+    globalThis.txBufferTimer = globalThis.txBufferTimer || null;
 
-          if (tx.from) {
-            const currentFromBal = balances[tx.from] || 0;
-            if (currentFromBal < amount) continue; // 余额不足在内存预演中剔除
-            balances[tx.from] = currentFromBal - amount;
-            if (balances[tx.from] <= 0) delete balances[tx.from];
-          }
-          if (tx.to) {
-            balances[tx.to] = (balances[tx.to] || 0) + amount;
-          }
+    const flushTxBuffer = async () => {
+        if (globalThis.txBuffer.length === 0) return;
+        const txs = [...globalThis.txBuffer];
+        globalThis.txBuffer = []; 
+        
+        const batchStmts = txs.map(tx => 
+            env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(tx.id, JSON.stringify(tx), tx.timestamp)
+        );
+        
+        if (batchStmts.length > 0) {
+            for (let i = 0; i < batchStmts.length; i += 50) {
+                await executeBatchWithRetry(batchStmts.slice(i, i + 50));
+            }
         }
-      }
-      
-      // 字典序排序地址保证确定性
-      const sortedAddrs = Object.keys(balances).sort();
-      const stateStr = sortedAddrs.map(addr => `${addr}:${balances[addr].toFixed(6)}`).join('|');
-      
-      const msgUint8 = new TextEncoder().encode(stateStr);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    };
+
+    const getBootstrapPeers = async () => {
+        const { results } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') ORDER BY reputation_score DESC, last_seen DESC LIMIT 3`).all();
+        let peers = results.map(r => r.domain);
+        if (!peers.includes(SEED_NODE)) peers.push(SEED_NODE);
+        return peers;
+    };
+
+    const getValidLeadersForSlot = async (slotId) => {
+        const { results: topPeers } = await env.DB.prepare(`
+            SELECT domain FROM blockchain_peers 
+            WHERE is_beacon IN ('true', '1') AND last_seen > ? 
+            ORDER BY total_asset DESC, domain ASC LIMIT 10
+        `).bind(Date.now() - 86400000).all();
+        
+        if (!topPeers || topPeers.length === 0) return [SEED_NODE];
+        const baseIndex = slotId % topPeers.length;
+        const leaders = [topPeers[baseIndex].domain];
+        
+        if (topPeers.length > 1) {
+            leaders.push(topPeers[(baseIndex + 1) % topPeers.length].domain);
+        }
+        return leaders;
     };
 
     // ==========================================
-    // 🏆 终极版核心：状态机一致性投影与零闪烁差分覆盖 (Zero-Flicker Upsert)
-    // 彻底解决一切余额随机跳动、读写竞态条件和不同步的元凶
+    // 内存预测计算状态根 (State-Guard Prediction)
+    // ==========================================
+    const predictStateRoot = async (txs) => {
+        const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
+        let balances = new Map();
+        wallets.forEach(w => balances.set(w.address, w.balance));
+
+        for (const tx of txs) {
+            if (!tx || !tx.id || tx.amount <= 0) continue;
+            const amt = parseFloat(tx.amount);
+            if (tx.from) {
+                const currentFrom = balances.get(tx.from) || 0;
+                if (currentFrom >= amt) balances.set(tx.from, currentFrom - amt);
+            }
+            if (tx.to) {
+                balances.set(tx.to, (balances.get(tx.to) || 0) + amt);
+            }
+        }
+        
+        let finalWallets = Array.from(balances.entries())
+            .filter(([addr, bal]) => bal > 0)
+            .map(([addr, bal]) => ({ address: addr, balance: bal }))
+            .sort((a, b) => a.address === b.address ? 0 : (a.address < b.address ? -1 : 1));
+            
+        const stateStr = finalWallets.map(w => `${w.address}:${w.balance.toFixed(6)}`).join('|');
+        return await miniHash(stateStr);
+    };
+
+    // [补丁 B]: 提取构建 Statement, 而非直接执行，确保事务捆绑
+    const getTxsStateStmts = (txs) => {
+        if (!txs || txs.length === 0) return [];
+        let batchStmts = [];
+        let stateDiff = {}; 
+        
+        for (const tx of txs) {
+            if (!tx || !tx.id || tx.amount <= 0) continue;
+            const amt = parseFloat(tx.amount);
+            if (tx.from) stateDiff[tx.from] = (stateDiff[tx.from] || 0) - amt;
+            if (tx.to) stateDiff[tx.to] = (stateDiff[tx.to] || 0) + amt;
+            
+            batchStmts.push(env.DB.prepare(`DELETE FROM mempool WHERE tx_id = ?`).bind(tx.id));
+        }
+
+        for (const [addr, diff] of Object.entries(stateDiff)) {
+            if (diff !== 0) {
+                batchStmts.push(env.DB.prepare(`
+                    INSERT INTO blockchain_wallets (address, balance) 
+                    VALUES (?, ?) 
+                    ON CONFLICT(address) DO UPDATE SET balance = balance + excluded.balance
+                `).bind(addr, diff));
+            }
+        }
+        return batchStmts;
+    };
+
+    const computeStateRoot = async () => {
+      const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets ORDER BY address ASC').all();
+      const stateStr = wallets.filter(w => w.balance > 0).map(w => `${w.address}:${w.balance.toFixed(6)}`).join('|');
+      return await miniHash(stateStr);
+    };
+
+    // ==========================================
+    // 基于检查点快照的快速回溯重建
     // ==========================================
     const rebuildBalances = async () => {
         try {
+            const ck = await env.DB.prepare('SELECT slot_id, state_snapshot FROM checkpoints ORDER BY slot_id DESC LIMIT 1').first();
+            let startSlot = 0;
             let newBalances = {};
-            let executed = new Set();
             
-            // 1. 获取全网历史唯一事实：严格按区块高度升序分页拉取所有交易 (防内存溢出)
-            let lastId = -1;
+            if (ck && ck.state_snapshot) {
+                startSlot = ck.slot_id;
+                try { newBalances = JSON.parse(ck.state_snapshot); } catch(e) {}
+            }
+
+            let executed = new Set();
+            let lastId = startSlot;
             while (true) {
-                const { results: blocks } = await env.DB.prepare('SELECT slot_id, payload FROM blockchain_ledger WHERE slot_id > ? ORDER BY slot_id ASC LIMIT 1000').bind(lastId).all();
+                const { results: blocks } = await env.DB.prepare('SELECT slot_id, payload, block_hash FROM blockchain_ledger WHERE slot_id > ? AND status = 1 ORDER BY slot_id ASC LIMIT 1000').bind(lastId).all();
                 if (!blocks || blocks.length === 0) break;
-                
-                // 2. 内存重放推演 (防乱序、防双花)
                 for (const b of blocks) {
                     lastId = b.slot_id;
                     try {
@@ -228,38 +374,30 @@ export default {
                         if (pl.txs && Array.isArray(pl.txs)) {
                             for (const tx of pl.txs) {
                                 if (!tx || !tx.id || executed.has(tx.id)) continue;
-                                
                                 const amount = parseFloat(tx.amount) || 0;
                                 if (amount <= 0) continue;
-
                                 if (tx.from) {
                                     const currentFromBal = newBalances[tx.from] || 0;
-                                    if (currentFromBal < amount) continue; // 余额不足则在时间线上被直接判为无效交易
+                                    if (currentFromBal < amount) continue; 
                                     newBalances[tx.from] = currentFromBal - amount;
                                 }
-                                
-                                if (tx.to) {
-                                    newBalances[tx.to] = (newBalances[tx.to] || 0) + amount;
-                                }
-                                
+                                if (tx.to) newBalances[tx.to] = (newBalances[tx.to] || 0) + amount;
                                 executed.add(tx.id);
                             }
+                        }
+                        
+                        if (b.slot_id % 100 === 0 && pl.state_root) {
+                            await env.DB.prepare('INSERT OR IGNORE INTO checkpoints (slot_id, state_root, block_hash) VALUES (?, ?, ?)').bind(b.slot_id, pl.state_root, b.block_hash).run();
                         }
                     } catch(e) {}
                 }
             }
             
-            // 3. 获取旧版数据库账本用于差异计算 (Diffing)
             const { results: currentWallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
             let oldBalances = {};
-            for (const w of currentWallets) {
-                oldBalances[w.address] = w.balance;
-            }
+            for (const w of currentWallets) oldBalances[w.address] = w.balance;
             
-            // 4. 构建绝对原子化的差分更新队列
             let batchStmts = [];
-            
-            // 对比更新与插入
             for (const [addr, newBal] of Object.entries(newBalances)) {
                 if (newBal > 0) {
                     if (oldBalances[addr] !== newBal) {
@@ -268,28 +406,13 @@ export default {
                     delete oldBalances[addr]; 
                 }
             }
-            
-            // 精准删除耗尽的僵尸账户
             for (const addr of Object.keys(oldBalances)) {
                 batchStmts.push(env.DB.prepare('DELETE FROM blockchain_wallets WHERE address = ?').bind(addr));
             }
             
-            // 自动清理已被收录上链的内存池垃圾
-            if (executed.size > 0) {
-                const ids = Array.from(executed);
-                for(let i=0; i<ids.length; i+=100) {
-                    const chunk = ids.slice(i, i+100).map(id => `'${id.replace(/'/g, "''")}'`).join(',');
-                    batchStmts.push(env.DB.prepare(`DELETE FROM mempool WHERE tx_id IN (${chunk})`));
-                }
-            }
-
-            // 5. 提交批处理：绝不清除全表，避免查询请求撞上空表导致0余额闪烁
             if (batchStmts.length > 0) {
-                for (let i = 0; i < batchStmts.length; i += 100) {
-                    await env.DB.batch(batchStmts.slice(i, i + 100));
-                }
+                for (let i = 0; i < batchStmts.length; i += 100) await executeBatchWithRetry(batchStmts.slice(i, i + 100));
             }
-            
         } catch(e) { console.error("Rebuild Ledger Failed:", e); }
     };
 
@@ -303,6 +426,46 @@ export default {
         } catch (e) {}
     };
     ctx.waitUntil(checkAndRebuildLedger());
+
+    // ==========================================
+    // 优雅分叉切换 (Graceful Fork Resolution)
+    // ==========================================
+    const resolveFork = async (peerDomain, sinceSlot) => {
+        try {
+            const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${sinceSlot}`);
+            if (!syncRes.ok) return;
+            const syncData = await syncRes.json();
+            if (!syncData.blocks || syncData.blocks.length === 0) return;
+
+            let forkResolved = false;
+            let batchStmts = [];
+            
+            const forkStartSlot = syncData.blocks[0].slot_id;
+            
+            // [补丁 D] 事务原子替换防闪烁
+            batchStmts.push(env.DB.prepare(`UPDATE blockchain_ledger SET status = 0 WHERE slot_id >= ?`).bind(forkStartSlot));
+
+            for (const b of syncData.blocks) {
+                batchStmts.push(env.DB.prepare(`
+                    INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                `).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
+                forkResolved = true;
+            }
+
+            if (forkResolved && batchStmts.length > 0) {
+                for (let i = 0; i < batchStmts.length; i += 50) {
+                    await executeBatchWithRetry(batchStmts.slice(i, i + 50));
+                }
+                
+                await env.DB.prepare(`DELETE FROM blockchain_ledger WHERE status = 0`).run();
+                await env.DB.prepare("UPDATE settings SET value='true' WHERE key='rebuild_ledger'").run();
+                await rebuildBalances();
+            }
+        } catch(e) {
+            console.error("Fork Resolution Error:", e);
+        }
+    };
 
     // ==========================================
     // 1. 认证机制与全局设置加载
@@ -347,15 +510,17 @@ export default {
         const addr = url.searchParams.get('address') || '';
         try {
             const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(addr).first();
-            return new Response(JSON.stringify({ balance: wallet ? wallet.balance : 0 }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
+            return consensusResponse({ balance: wallet ? wallet.balance : 0 });
         } catch(e) {
-            return new Response(JSON.stringify({ balance: 0 }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
+            return consensusResponse({ balance: 0 });
         }
     }
 
     // ==========================================
     // Web3 共识网络核心路由
     // ==========================================
+    globalThis.forkObservations = globalThis.forkObservations || new Map();
+
     if (url.pathname.startsWith('/api/consensus/')) {
         const route = url.pathname.replace('/api/consensus/', '');
         
@@ -370,88 +535,167 @@ export default {
                         ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen
                     `).bind(data.domain, isBeaconStr, parseFloat(data.vps_count)||0, parseFloat(data.total_asset)||0, Date.now()).run();
                 }
-                return new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
-            } catch(e) { return new Response('Error', { status: 400 }); }
+                return consensusResponse({ status: 'ok' });
+            } catch(e) { return consensusResponse('Error', 400); }
+        }
+
+        if (request.method === 'GET' && route === 'checkpoints') {
+            const { results: checkpoints } = await env.DB.prepare('SELECT * FROM checkpoints ORDER BY slot_id DESC LIMIT 10').all();
+            return consensusResponse({ checkpoints });
+        }
+
+        if (request.method === 'GET' && route === 'snapshot') {
+            const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
+            const latestBlock = await env.DB.prepare('SELECT slot_id, block_hash FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first() || {};
+            return consensusResponse({ snapshot_slot: latestBlock.slot_id || 0, latest_hash: latestBlock.block_hash || '', wallets });
         }
         
         if (request.method === 'GET' && route === 'sync') {
             const since = parseInt(url.searchParams.get('since_slot') || '0');
-            // 正序分页拉取 1000 条，确保新节点极速重放
-            const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? ORDER BY slot_id ASC LIMIT 1000').bind(since).all();
+            const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? AND status = 1 ORDER BY slot_id ASC LIMIT 1000').bind(since).all();
             const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY reputation_score DESC LIMIT 20').all();
             const { results: mempool } = await env.DB.prepare('SELECT * FROM mempool ORDER BY timestamp DESC LIMIT 20').all();
-            return new Response(JSON.stringify({ blocks, peers, mempool }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
+            return consensusResponse({ blocks, peers, mempool });
         }
 
+        // ==========================================
+        // 核心出块接收路由 (State Guard & Heaviest Chain & Delayed Gossip)
+        // ==========================================
         if (request.method === 'POST' && route === 'submit') {
             if (sys.is_beacon !== 'true' && host !== SEED_NODE) {
-                return new Response('Not a beacon', { status: 403 });
+                return consensusResponse('Not a beacon', 403);
             }
             try {
                 const block = await request.json();
-                const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
                 
-                if (parseInt(block.slot_id) > currentSlot + 2) {
-                    return new Response('Block from future rejected', { status: 400 });
+                if (block.timestamp) {
+                    ctx.waitUntil(updateNetworkTimeOffset(block.timestamp));
                 }
 
-                // --- 新增：防范伪造区块 DoS ---
-                const expectedHash = await miniHash(`${block.slot_id}-${block.proposer_domain}-${block.payload}`);
-                if (expectedHash !== block.block_hash || parseInt(expectedHash.slice(-1), 16) > 14) {
-                    return new Response('Invalid Block Hash / PoW Failed', { status: 400 });
+                const currentSlot = Math.max(1, Math.floor((getNetworkTime() - EPOCH_START) / SLOT_TIME));
+                
+                if (parseInt(block.slot_id) > currentSlot + 3) {
+                    return consensusResponse('Block from far future rejected', 400);
+                }
+
+                const expectedSig = await miniHash(`${block.proposer_domain}-${block.slot_id}-${block.payload}`);
+                if (block.signature !== expectedSig) {
+                    return consensusResponse('Invalid Validator Signature', 403);
+                }
+
+                const leaders = await getValidLeadersForSlot(block.slot_id);
+                const isPrimary = block.proposer_domain === leaders[0];
+                const isSecondary = leaders.length > 1 && block.proposer_domain === leaders[1];
+
+                if (!isPrimary && !isSecondary) {
+                    return consensusResponse(`Reject: Not a valid leader for slot ${block.slot_id}`, 403);
+                }
+
+                const expectedHash = await miniHash(`${block.slot_id}-${block.parent_hash}-${block.proposer_domain}-${block.payload}`);
+                if (expectedHash !== block.block_hash) {
+                    return consensusResponse('Invalid Hash Chain', 400);
+                }
+
+                const pl = JSON.parse(block.payload);
+
+                if (pl.txs && pl.state_root) {
+                    const predictedRoot = await predictStateRoot(pl.txs);
+                    if (predictedRoot !== pl.state_root) {
+                        return consensusResponse('State Root Mismatch! Proposal contains invalid math. Block rejected.', 409);
+                    }
+                }
+
+                const localPrevBlock = await env.DB.prepare('SELECT slot_id, block_hash, total_difficulty FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+                const localPrevHash = localPrevBlock ? localPrevBlock.block_hash : '0000000000000000000000000000000000000000';
+                const localHeight = localPrevBlock ? localPrevBlock.slot_id : 0;
+                const localDifficulty = localPrevBlock ? (localPrevBlock.total_difficulty || 0) : 0;
+                
+                const blockDifficulty = parseInt(block.total_difficulty || 0);
+
+                if (block.parent_hash !== localPrevHash && block.slot_id > 1) {
+                    // [补丁 C] 连续 N 个 Slot 的观察期防止抖动
+                    if (blockDifficulty > localDifficulty) {
+                        let obsCount = (globalThis.forkObservations.get(block.proposer_domain) || 0) + 1;
+                        globalThis.forkObservations.set(block.proposer_domain, obsCount);
+                        
+                        if (obsCount >= 3) {
+                            ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 20)));
+                            globalThis.forkObservations.delete(block.proposer_domain);
+                            return consensusResponse('Fork verified. Remote chain is heavier. Auto-resolving in background.', 202);
+                        }
+                        return consensusResponse(`Fork detected. Observing heavy chain (Count: ${obsCount}/3)...`, 202);
+                    } else if (blockDifficulty === localDifficulty && block.block_hash < localPrevHash) {
+                        let obsCount = (globalThis.forkObservations.get(block.proposer_domain) || 0) + 1;
+                        globalThis.forkObservations.set(block.proposer_domain, obsCount);
+                        
+                        if (obsCount >= 3) {
+                            ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 20)));
+                            globalThis.forkObservations.delete(block.proposer_domain);
+                            return consensusResponse('Fork verified. Resolving via hash tie-breaker.', 202);
+                        }
+                        return consensusResponse(`Fork detected. Observing tie-breaker chain (Count: ${obsCount}/3)...`, 202);
+                    }
+                    globalThis.forkObservations.delete(block.proposer_domain);
+                    return consensusResponse('Weak Chain Rejected. Fork detected but local is heavier.', 403);
                 }
 
                 const currentBlock = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
-                let isStateChanged = false;
-                
-                const pl = JSON.parse(block.payload);
                 const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000); 
 
-                // --- ✨ 方案 A 核心：State Root 投影验证 ---
-                // 如果外来区块包含 state_root，我们在本地预演算指纹进行校验
-                if (pl.state_root) {
-                    const localExpectedRoot = await computeStateRoot(pl.txs || []);
-                    if (localExpectedRoot !== pl.state_root) {
-                        console.error(`🚨 State Root Mismatch! Local: ${localExpectedRoot} | Block: ${pl.state_root}`);
-                        // 发现自己算出的状态与区块状态不一致，说明本地产生严重分叉或脏数据！
-                        // 触发护城河：立刻抹除受损数据，进入强制拉回基石同步模式 (Rollback & Clean Sync)
-                        await env.DB.prepare('DELETE FROM blockchain_ledger').run();
-                        await env.DB.prepare('DELETE FROM blockchain_wallets').run();
-                        await env.DB.prepare('DELETE FROM mempool').run();
-                        await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
-                        return new Response('State Root Mismatch! Local ledger corrupted, Rollback & Clean Sync triggered.', { status: 409, headers: {'Access-Control-Allow-Origin':'*'} });
-                    }
-                }
-                // ------------------------------------------
-
-                // 处理追加与分叉覆盖
                 if (!currentBlock) {
-                    await env.DB.prepare(`
-                        INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) 
-                        VALUES (?, ?, ?, ?, ?)
-                    `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.payload, Date.now()).run();
+                    let allStmts = [];
+                    allStmts.push(env.DB.prepare(`
+                        INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.parent_hash, block.payload, block.timestamp || getNetworkTime(), blockDifficulty));
                     
-                    await env.DB.prepare(`
+                    allStmts.push(env.DB.prepare(`
                         INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) 
                         VALUES (?, ?, ?, ?) 
                         ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)
-                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()).run();
+                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()));
                     
-                    isStateChanged = true;
-                } else if (block.block_hash < currentBlock.block_hash) {
-                    await env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(block.proposer_domain, block.block_hash, block.payload, Date.now(), block.slot_id).run();
-                    isStateChanged = true;
-                }
+                    if (pl.txs && pl.txs.length > 0) {
+                        allStmts.push(...getTxsStateStmts(pl.txs));
+                    }
+
+                    if (block.slot_id % 100 === 0 && pl.state_root) {
+                        const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
+                        const snapMap = {};
+                        wallets.forEach(w => snapMap[w.address] = w.balance);
+                        allStmts.push(env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(block.slot_id, pl.state_root, JSON.stringify(snapMap), block.block_hash, block.signature || ''));
+                    }
+
+                    const batchSuccess = await executeBatchWithRetry(allStmts);
+                    if (!batchSuccess) {
+                        return consensusResponse('Database Transaction Failed', 500);
+                    }
+
+                    globalThis.forkObservations.delete(block.proposer_domain);
+
+                    if (!globalThis.gossipCache) globalThis.gossipCache = new Set();
+                    if (!globalThis.gossipCache.has(block.block_hash)) {
+                        globalThis.gossipCache.add(block.block_hash);
+                        if (globalThis.gossipCache.size > 500) globalThis.gossipCache.clear();
+                        
+                        ctx.waitUntil((async () => {
+                            await new Promise(r => setTimeout(r, 200));
+                            const tip = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+                            if (tip && tip.block_hash === block.block_hash) {
+                                const blockData = { slot_id: block.slot_id, proposer_domain: block.proposer_domain, block_hash: block.block_hash, parent_hash: block.parent_hash, payload: block.payload, timestamp: block.timestamp, total_difficulty: blockDifficulty, signature: block.signature };
+                                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 5`).bind(host).all();
+                                for (const b of beacons) {
+                                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
+                                }
+                            }
+                        })());
+                    }
+                } 
                 
-                if (isStateChanged) {
-                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
-                }
-                
-                return new Response('Consensus Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
-            } catch(e) { return new Response('Block Reject', { status: 400 }); }
+                return consensusResponse('Consensus Accepted', 200);
+            } catch(e) { return consensusResponse('Block Reject', 400); }
         }
         
-        // 接收广播交易进入内存池
         if (request.method === 'POST' && route === 'tx') {
             try {
                 const data = await request.json();
@@ -464,155 +708,188 @@ export default {
                     throw new Error("Insufficient balance in Ledger");
                 }
 
-                await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(tx.id, JSON.stringify(tx), Date.now()).run();
-                return new Response('Tx Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
+                globalThis.txBuffer.push(tx);
+                if (!globalThis.txBufferTimer) {
+                    globalThis.txBufferTimer = true;
+                    ctx.waitUntil((async () => {
+                        await new Promise(r => setTimeout(r, 500));
+                        await flushTxBuffer();
+                        globalThis.txBufferTimer = false;
+                    })());
+                }
+
+                return consensusResponse('Tx Accepted (Buffered)', 202);
             } catch(e) { 
-                return new Response('Tx Reject: ' + e.message, { status: 400, headers: {'Access-Control-Allow-Origin':'*'} }); 
+                return consensusResponse('Tx Reject: ' + e.message, 400); 
             }
         }
     }
 
     const mineAndGossip = async (localAsset, localVpsCount) => {
         try {
-            const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
+            const currentNetTime = getNetworkTime();
+            const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
+            const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
+            const elapsedInSlot = currentNetTime - slotStart;
             
-            // 准备打包内存池中的交易
-            const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC LIMIT 20').all();
-            let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
+            const leaders = await getValidLeadersForSlot(currentSlot);
             
-            // 出块奖励
-            if (sys.miner_wallet) {
-                const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
-                blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: Date.now() });
+            let isMyTurn = false;
+            if (leaders[0] === host && sys.is_beacon === 'true') {
+                isMyTurn = true; 
+            } else if (leaders.length > 1 && leaders[1] === host && sys.is_beacon === 'true' && elapsedInSlot >= 5000) {
+                const exist = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+                if (!exist) isMyTurn = true;
             }
 
-            // --- ✨ 方案 A 核心：写入投影指纹 ---
-            const state_root = await computeStateRoot(blockTxs);
-            const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs, state_root: state_root });
-            // ---------------------------------
-
-            const hash = await miniHash(`${currentSlot}-${host}-${payloadStr}`);
-            
-            if (parseInt(hash.slice(-1), 16) <= 14) {
-                const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, payload: payloadStr };
+            if (isMyTurn) {
+                const localPrevBlock = await env.DB.prepare('SELECT block_hash, total_difficulty FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+                const parentHash = localPrevBlock ? localPrevBlock.block_hash : '0000000000000000000000000000000000000000';
+                const parentDifficulty = localPrevBlock ? (localPrevBlock.total_difficulty || 0) : 0;
                 
-                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
+                const proposerAsset = Math.max(1, Math.floor(localAsset));
+                const currentDifficulty = parentDifficulty + proposerAsset;
+
+                const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC, tx_id ASC LIMIT 20').all();
+                let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
+                
+                blockTxs.sort((a, b) => {
+                    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+                    return a.id === b.id ? 0 : (a.id < b.id ? -1 : 1);
+                });
+
+                if (sys.miner_wallet) {
+                    const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
+                    blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: currentNetTime });
+                }
+
+                // 内存中预测执行生成准确状态树根
+                const state_root = await predictStateRoot(blockTxs);
+                
+                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs, state_root });
+                const hash = await miniHash(`${currentSlot}-${parentHash}-${host}-${payloadStr}`);
+                const signature = await miniHash(`${host}-${currentSlot}-${payloadStr}`);
+
+                let allStmts = [];
+                allStmts.push(env.DB.prepare(`
+                    INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                `).bind(currentSlot, host, hash, parentHash, payloadStr, currentNetTime, currentDifficulty));
+                
+                allStmts.push(...getTxsStateStmts(blockTxs));
+
+                const batchSuccess = await executeBatchWithRetry(allStmts);
+                
+                if (batchSuccess && currentSlot % 100 === 0) {
+                    const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
+                    const snapMap = {};
+                    wallets.forEach(w => snapMap[w.address] = w.balance);
+                    await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(currentSlot, state_root, JSON.stringify(snapMap), hash, signature).run();
+                }
+
+                if (!globalThis.gossipCache) globalThis.gossipCache = new Set();
+                globalThis.gossipCache.add(hash);
+
+                const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, parent_hash: parentHash, payload: payloadStr, timestamp: currentNetTime, total_difficulty: currentDifficulty, signature: signature };
+                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 5`).bind(host).all();
                 for (const b of beacons) {
-                    fetch(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
+                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
                 }
-                
-                const currentBlock = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
-                let isStateChanged = false;
-                if (!currentBlock) {
-                    await env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(currentSlot, host, hash, payloadStr, Date.now()).run();
-                    isStateChanged = true;
-                } else if (hash < currentBlock.block_hash) {
-                    await env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(host, hash, payloadStr, Date.now(), currentSlot).run();
-                    isStateChanged = true;
-                }
-                
-                if (isStateChanged) {
-                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
-                }
-            }
 
-            // ==========================================
-            // 📡 自动黑洞填补机制 (Hole-Filling Sync)
-            // ==========================================
-            const syncFromPeer = async (peerDomain) => {
-                const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / SLOT_TIME));
-                
-                const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 1').first();
-                const countRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_ledger').first();
-                
-                let since = 0;
-                if (localTopRow && countRow) {
-                    // 若最高区块ID远超本地总区块数，证明存在历史黑洞，自动从 0 开始全网回溯
-                    if (localTopRow.slot_id <= countRow.c + 5) {
-                        since = Math.max(0, localTopRow.slot_id - 50); 
-                    } else {
-                        since = 0; 
-                    }
-                }
-                
-                let isStateChanged = false;
-                let keepSyncing = true;
-                let loopCount = 0;
-
-                // 极速递归拉取：最高连跨 5000 块，绝不卡死
-                while (keepSyncing && loopCount < 5) {
-                    loopCount++;
+            } else {
+                const syncFromPeer = async (peerDomain) => {
+                    let since = 0;
                     try {
-                        const syncRes = await fetch(`${peerDomain}/api/consensus/sync?since_slot=${since}`);
-                        if (!syncRes.ok) break;
-                        
-                        const syncData = await syncRes.json();
-                        if (!syncData.blocks || syncData.blocks.length === 0) break;
-
-                        let blockStmts = [];
-                        for (const b of syncData.blocks) {
-                            if (b.slot_id <= currentSlotNow + 2) {
-                                const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(b.slot_id).first();
-                                if (!exist) {
-                                    blockStmts.push(env.DB.prepare(`INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp));
-                                    const pl = JSON.parse(b.payload);
-                                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000);
-                                    blockStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp));
-                                    isStateChanged = true;
-                                } else if (b.block_hash < exist.block_hash) {
-                                    blockStmts.push(env.DB.prepare(`UPDATE blockchain_ledger SET proposer_domain=?, block_hash=?, payload=?, timestamp=? WHERE slot_id=?`).bind(b.proposer_domain, b.block_hash, b.payload, b.timestamp, b.slot_id));
-                                    isStateChanged = true;
+                        const ckRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/checkpoints`);
+                        if (ckRes.ok) {
+                            const ckData = await ckRes.json();
+                            if (ckData.checkpoints && ckData.checkpoints.length > 0) {
+                                for (const ck of ckData.checkpoints) {
+                                    const localCk = await env.DB.prepare('SELECT state_root FROM checkpoints WHERE slot_id = ?').bind(ck.slot_id).first();
+                                    if (localCk && localCk.state_root === ck.state_root) {
+                                        since = ck.slot_id;
+                                        break; 
+                                    }
                                 }
                             }
                         }
-                        
-                        if (blockStmts.length > 0) {
-                            for(let i=0; i<blockStmts.length; i+=50) {
-                                await env.DB.batch(blockStmts.slice(i, i+50));
-                            }
-                        }
-                        
-                        if (syncData.blocks.length >= 1000) {
-                            since = syncData.blocks[syncData.blocks.length - 1].slot_id;
-                        } else {
-                            keepSyncing = false;
-                        }
+                    } catch(e) {}
 
-                        for (const p of syncData.peers) {
-                            await env.DB.prepare(`
-                                INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) 
-                                VALUES (?, ?, ?, ?, ?, ?) 
-                                ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)
-                            `).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
-                        }
-                        for (const m of (syncData.mempool || [])) {
-                             await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(m.tx_id, m.payload, m.timestamp).run();
-                        }
-                    } catch(e) {
-                        break;
+                    if (since === 0) {
+                        const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+                        since = localTopRow ? localTopRow.slot_id : 0;
+                    }
+                    
+                    let keepSyncing = true;
+                    let loopCount = 0;
+                    let syncedAny = false;
+
+                    while (keepSyncing && loopCount < 5) {
+                        loopCount++;
+                        try {
+                            const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${since}`);
+                            if (!syncRes.ok) return false;
+                            
+                            const syncData = await syncRes.json();
+                            if (!syncData.blocks || syncData.blocks.length === 0) return syncedAny;
+
+                            let allStmts = [];
+                            for (const b of syncData.blocks) {
+                                if (b.slot_id <= currentSlot + 3) {
+                                    const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ? AND status = 1').bind(b.slot_id).first();
+                                    if (!exist) {
+                                        allStmts.push(env.DB.prepare(`
+                                            INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                                        `).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
+                                        
+                                        const pl = JSON.parse(b.payload);
+                                        allStmts.push(...getTxsStateStmts(pl.txs || []));
+                                        
+                                        const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000);
+                                        allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
+                                        
+                                        syncedAny = true;
+                                    }
+                                }
+                            }
+                            
+                            if (allStmts.length > 0) {
+                                for (let i = 0; i < allStmts.length; i += 100) {
+                                    await executeBatchWithRetry(allStmts.slice(i, i + 100));
+                                }
+                            }
+                            
+                            if (syncData.blocks.length >= 1000) {
+                                since = syncData.blocks[syncData.blocks.length - 1].slot_id;
+                            } else { keepSyncing = false; }
+
+                            for (const p of syncData.peers) {
+                                await env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)`).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
+                            }
+                        } catch(e) { return syncedAny; }
+                    }
+                    return syncedAny;
+                };
+
+                if (host !== SEED_NODE) {
+                    const bootstrapPeers = await getBootstrapPeers();
+                    let syncTargets = bootstrapPeers.filter(p => p !== host);
+                    
+                    for (const target of syncTargets) {
+                        const success = await syncFromPeer(target);
+                        if (success) break;
+                    }
+                    
+                    if (Math.random() < 0.1) {
+                        fetchWithTimeSync(`${SEED_NODE}/api/consensus/register`, {
+                            method: 'POST', headers: {'Content-Type':'application/json'},
+                            body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
+                        }).catch(()=>{});
                     }
                 }
-                
-                if (isStateChanged) {
-                    await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
-                }
-            };
-
-            if (host !== SEED_NODE) {
-                await syncFromPeer(SEED_NODE);
-                if (Math.random() < 0.2) {
-                    fetch(`${SEED_NODE}/api/consensus/register`, {
-                        method: 'POST', headers: {'Content-Type':'application/json'},
-                        body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
-                    }).catch(()=>{});
-                }
             }
-            if (Math.random() < 0.5) {
-                const { results: rBeacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 1`).bind(host).all();
-                if (rBeacons.length > 0) await syncFromPeer(rBeacons[0].domain);
-            }
-
-        } catch(e) {}
+        } catch(e) { console.error("Consensus Loop Error", e); }
     };
 
     // ==========================================
@@ -715,7 +992,7 @@ export default {
       .theme4 .os-text { color: #eee; }
 
       body.theme5 { background-color: #050505; color: #0ff; font-family: 'Courier New', Courier, monospace; }
-      .theme5 .vps-card, .theme5 .global-stats, .theme5 .header-card, .theme5 .chart-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; }
+      .theme5 .vps-card, .theme5 .global-stats, .header-card, .theme5 .chart-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; }
       .theme5 .vps-card:hover { box-shadow: 0 0 20px rgba(0, 255, 255, 0.5); border-color: #0ff; }
       .theme5 .group-header { color: #f0f; border-left: 5px solid #0ff; text-shadow: 0 0 5px #f0f; }
       .theme5 .stat-val, .theme5 .g-val, .theme5 .card-title { color: #0ff; text-shadow: 0 0 5px #0ff; }
@@ -800,7 +1077,7 @@ export default {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
           if (data.settings.is_beacon === 'true') {
-              ctx.waitUntil(fetch(`${SEED_NODE}/api/consensus/register`, {
+              ctx.waitUntil(fetchWithTimeSync(`${SEED_NODE}/api/consensus/register`, {
                   method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ domain: host, is_beacon: 'true' })
               }).catch(()=>{}));
           }
@@ -834,26 +1111,25 @@ export default {
           const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(data.from).first();
           if (!wallet || wallet.balance < amountNum) throw new Error("余额不足 (Insufficient balance)");
 
-          const txData = { id: crypto.randomUUID(), type: 'TRANSFER', from: data.from, to: data.to, amount: amountNum, timestamp: Date.now() };
-          await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(txData.id, JSON.stringify(txData), txData.timestamp).run();
+          const txData = { id: crypto.randomUUID(), type: 'TRANSFER', from: data.from, to: data.to, amount: amountNum, timestamp: getNetworkTime() };
+          
+          globalThis.txBuffer.push(txData);
+          if (!globalThis.txBufferTimer) {
+              globalThis.txBufferTimer = true;
+              ctx.waitUntil((async () => {
+                  await new Promise(r => setTimeout(r, 500));
+                  await flushTxBuffer();
+                  globalThis.txBufferTimer = false;
+              })());
+          }
           
           ctx.waitUntil((async () => {
               const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
               for (const b of beacons) {
-                  fetch(`${b.domain}/api/consensus/tx`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(txData) }).catch(() => {});
+                  fetchWithTimeSync(`${b.domain}/api/consensus/tx`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(txData) }).catch(() => {});
               }
           })());
 
-          return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-        }
-        else if (data.action === 'force_resync') {
-          // ==============================================================
-          // ✨ 终极解决老节点卡死问题：一键强制抹除本地错误分叉，重拉账本 ✨
-          // ==============================================================
-          await env.DB.prepare('DELETE FROM blockchain_ledger').run();
-          await env.DB.prepare('DELETE FROM blockchain_wallets').run();
-          await env.DB.prepare('DELETE FROM mempool').run();
-          await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('rebuild_ledger', 'true') ON CONFLICT(key) DO UPDATE SET value='true'`).run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         }
       } catch (e) {
@@ -879,7 +1155,7 @@ export default {
           
           const osType = s.agent_os === 'alpine' ? 'alpine' : 'debian';
           const shellType = osType === 'alpine' ? 'sh' : 'bash';
-          const cmdApp = "cur" + "l";
+          const cmdApp = "curl";
           const cmd = `${cmdApp} -sL ${host}/install.sh?os=${osType} | ${shellType} -s ${s.id} ${env.API_SECRET}`;
           
           trs += `
@@ -907,690 +1183,41 @@ export default {
           } catch(e) {}
       }
 
-      const rawNodeDataV4 = `陕西西安移动
-sn-xian-cm-v4.ip.zstaticcdn.com:443
-江苏无锡移动
-js-wuxi-cm-v4.ip.zstaticcdn.com:443
-山东济南移动
-sd-jinan-cm-v4.ip.zstaticcdn.com:443
-江苏苏州移动
-js-suzhou-cm-v4.ip.zstaticcdn.com:443
-浙江宁波移动
-zj-ningbo-cm-v4.ip.zstaticcdn.com:443
-广东东莞移动
-gd-dongguan-cm-v4.ip.zstaticcdn.com:443
-四川成都移动
-sc-chengdu-cm-v4.ip.zstaticcdn.com:443
-贵州贵阳移动
-gz-guiyang-cm-v4.ip.zstaticcdn.com:443
-湖南株洲移动
-hn-zhuzhou-cm-v4.ip.zstaticcdn.com:443
-河南郑州移动
-ha-zhengzhou-cm-v4.ip.zstaticcdn.com:443
-内蒙古呼和浩特移动
-nm-huhehaote-cm-v4.ip.zstaticcdn.com:443
-广东广州移动
-gd-guangzhou-cm-v4.ip.zstaticcdn.com:443
-福建厦门联通
-fj-xiamen-cu-v4.ip.zstaticcdn.com:443
-福建宁德联通
-fj-ningde-cu-v4.ip.zstaticcdn.com:443
-福建南平联通
-fj-nanping-cu-v4.ip.zstaticcdn.com:443
-河北廊坊联通
-he-langfang-cu-v4.ip.zstaticcdn.com:443
-贵州贵阳联通
-gz-guiyang-cu-v4.ip.zstaticcdn.com:443
-内蒙古呼和浩特联通
-nm-huhehaote-cu-v4.ip.zstaticcdn.com:443
-湖南郴州电信
-hn-chenzhou-ct-v4.ip.zstaticcdn.com:443
-浙江杭州电信
-zj-hangzhou-ct-v4.ip.zstaticcdn.com:443
-海南海口电信
-hi-haikou-ct-v4.ip.zstaticcdn.com:443
-湖北武汉电信
-hb-wuhan-ct-v4.ip.zstaticcdn.com:443
-甘肃兰州电信
-gs-lanzhou-ct-v4.ip.zstaticcdn.com:443
-江苏南京电信
-js-nanjing-ct-v4.ip.zstaticcdn.com:443
-陕西西安电信
-sn-xian-ct-v4.ip.zstaticcdn.com:443
-广东广州电信
-gd-guangzhou-ct-v4.ip.zstaticcdn.com:443
-辽宁辽阳电信
-ln-liaoyang-ct-v4.ip.zstaticcdn.com:443
-山东青岛电信
-sd-qingdao-ct-v4.ip.zstaticcdn.com:443
-福建福州电信
-fj-fuzhou-ct-v4.ip.zstaticcdn.com:443
-新疆乌鲁木齐电信
-xj-wulumuqi-ct-v4.ip.zstaticcdn.com:443
-湖南长沙电信
-hn-changsha-ct-v4.ip.zstaticcdn.com:443
-甘肃中卫电信
-gs-zhongwei-ct-v4.ip.zstaticcdn.com:443
-山西太原电信
-sx-taiyuan-ct-v4.ip.zstaticcdn.com:443
-安徽芜湖电信
-ah-wuhu-ct-v4.ip.zstaticcdn.com:443
-河南郑州电信
-ha-zhengzhou-ct-v4.ip.zstaticcdn.com:443
-甘肃庆阳电信
-gs-qingyang-ct-v4.ip.zstaticcdn.com:443
-内蒙古呼和浩特电信
-nm-huhehaote-ct-v4.ip.zstaticcdn.com:443
-湖北孝感电信
-hb-xiaogan-ct-v4.ip.zstaticcdn.com:443
-湖北宜昌电信
-hb-yichang-ct-v4.ip.zstaticcdn.com:443
-湖南怀化电信
-hn-huaihua-ct-v4.ip.zstaticcdn.com:443
-广东深圳电信
-gd-shenzhen-ct-v4.ip.zstaticcdn.com:443
-广东揭阳电信
-gd-jieyang-ct-v4.ip.zstaticcdn.com:443
-浙江台州电信
-zj-taizhou-ct-v4.ip.zstaticcdn.com:443
-西藏拉萨电信
-xz-lasa-ct-v4.ip.zstaticcdn.com:443
-湖南永州电信
-hn-yongzhou-ct-v4.ip.zstaticcdn.com:443
-江苏苏州电信
-js-suzhou-ct-v4.ip.zstaticcdn.com:443
-江苏镇江电信
-js-zhenjiang-ct-v4.ip.zstaticcdn.com:443
-河北雄安电信
-he-xiongan-ct-v4.ip.zstaticcdn.com:443
-湖南株洲电信
-hn-zhuzhou-ct-v4.ip.zstaticcdn.com:443
-湖北襄阳电信
-hb-xiangyang-ct-v4.ip.zstaticcdn.com:443
-江苏南京联通
-js-nanjing-cu-v4.ip.zstaticcdn.com:443
-江苏南京移动
-js-nanjing-cm-v4.ip.zstaticcdn.com:443
-安徽合肥移动
-ah-hefei-cm-v4.ip.zstaticcdn.com:443
-安徽合肥电信
-ah-hefei-ct-v4.ip.zstaticcdn.com:443
-安徽合肥联通
-ah-hefei-cu-v4.ip.zstaticcdn.com:443
-广东东莞联通
-gd-dongguan-cu-v4.ip.zstaticcdn.com:443
-湖南长沙联通
-hn-changsha-cu-v4.ip.zstaticcdn.com:443
-河南洛阳联通
-ha-luoyang-cu-v4.ip.zstaticcdn.com:443
-吉林长春联通
-jl-changchun-cu-v4.ip.zstaticcdn.com:443
-江苏台州联通
-js-taizhou-cu-v4.ip.zstaticcdn.com:443
-陕西咸阳联通
-sn-xianyang-cu-v4.ip.zstaticcdn.com:443
-陕西安康联通
-sn-ankang-cu-v4.ip.zstaticcdn.com:443
-陕西渭南联通
-sn-weinan-cu-v4.ip.zstaticcdn.com:443
-广东广州联通
-gd-guangzhou-cu-v4.ip.zstaticcdn.com:443
-安徽安庆联通
-ah-anqing-cu-v4.ip.zstaticcdn.com:443
-安徽蚌埠联通
-ah-bengbu-cu-v4.ip.zstaticcdn.com:443
-安徽亳州联通
-ah-bozhou-cu-v4.ip.zstaticcdn.com:443
-安徽宿州联通
-ah-suzhou-cu-v4.ip.zstaticcdn.com:443
-福建龙岩联通
-fj-longyan-cu-v4.ip.zstaticcdn.com:443
-福建莆田联通
-fj-putian-cu-v4.ip.zstaticcdn.com:443
-福建泉州联通
-fj-quanzhou-cu-v4.ip.zstaticcdn.com:443
-福建三明联通
-fj-sanming-cu-v4.ip.zstaticcdn.com:443
-福建漳州联通
-fj-zhangzhou-cu-v4.ip.zstaticcdn.com:443
-广东潮州联通
-gd-chaozhou-cu-v4.ip.zstaticcdn.com:443
-广东佛山联通
-gd-foshan-cu-v4.ip.zstaticcdn.com:443
-广东河源联通
-gd-heyuan-cu-v4.ip.zstaticcdn.com:443
-广东惠州联通
-gd-huizhou-cu-v4.ip.zstaticcdn.com:443
-广东江门联通
-gd-jiangmen-cu-v4.ip.zstaticcdn.com:443
-广东茂名联通
-gd-maoming-cu-v4.ip.zstaticcdn.com:443
-广东汕头联通
-gd-shantou-cu-v4.ip.zstaticcdn.com:443
-广东汕尾联通
-gd-shanwei-cu-v4.ip.zstaticcdn.com:443
-广东韶关联通
-gd-shaoguan-cu-v4.ip.zstaticcdn.com:443
-广东阳江联通
-gd-yangjiang-cu-v4.ip.zstaticcdn.com:443
-广东云浮联通
-gd-yunfu-cu-v4.ip.zstaticcdn.com:443
-广东湛江联通
-gd-zhanjiang-cu-v4.ip.zstaticcdn.com:443
-广东肇庆联通
-gd-zhaoqing-cu-v4.ip.zstaticcdn.com:443
-广东中山联通
-gd-zhongshan-cu-v4.ip.zstaticcdn.com:443
-广东珠海联通
-gd-zhuhai-cu-v4.ip.zstaticcdn.com:443
-广西桂林联通
-gx-guilin-cu-v4.ip.zstaticcdn.com:443
-广西柳州联通
-gx-liuzhou-cu-v4.ip.zstaticcdn.com:443
-广西南宁联通
-gx-nanning-cu-v4.ip.zstaticcdn.com:443
-河南安阳联通
-ha-anyang-cu-v4.ip.zstaticcdn.com:443
-河南鹤壁联通
-ha-hebi-cu-v4.ip.zstaticcdn.com:443
-河南焦作联通
-ha-jiaozuo-cu-v4.ip.zstaticcdn.com:443
-河南济源联通
-ha-jiyuan-cu-v4.ip.zstaticcdn.com:443
-河南开封联通
-ha-kaifeng-cu-v4.ip.zstaticcdn.com:443
-河南漯河联通
-ha-luohe-cu-v4.ip.zstaticcdn.com:443
-河南南阳联通
-ha-nanyang-cu-v4.ip.zstaticcdn.com:443
-河南平顶山联通
-ha-pingdingshan-cu-v4.ip.zstaticcdn.com:443
-河南三门峡联通
-ha-sanmenxia-cu-v4.ip.zstaticcdn.com:443
-河南商丘联通
-ha-shangqiu-cu-v4.ip.zstaticcdn.com:443
-河南新乡联通
-ha-xinxiang-cu-v4.ip.zstaticcdn.com:443
-河南信阳联通
-ha-xinyang-cu-v4.ip.zstaticcdn.com:443
-河南许昌联通
-ha-xuchang-cu-v4.ip.zstaticcdn.com:443
-河南周口联通
-ha-zhoukou-cu-v4.ip.zstaticcdn.com:443
-河南驻马店联通
-ha-zhumadian-cu-v4.ip.zstaticcdn.com:443
-湖北鄂州联通
-hb-ezhou-cu-v4.ip.zstaticcdn.com:443
-湖北黄冈联通
-hb-huanggang-cu-v4.ip.zstaticcdn.com:443
-湖北黄石联通
-hb-huangshi-cu-v4.ip.zstaticcdn.com:443
-湖北荆门联通
-hb-jingmen-cu-v4.ip.zstaticcdn.com:443
-湖北荆州联通
-hb-jingzhou-cu-v4.ip.zstaticcdn.com:443
-湖北十堰联通
-hb-shiyan-cu-v4.ip.zstaticcdn.com:443
-湖北随州联通
-hb-suizhou-cu-v4.ip.zstaticcdn.com:443
-河北保定联通
-he-baoding-cu-v4.ip.zstaticcdn.com:443
-河北沧州联通
-he-cangzhou-cu-v4.ip.zstaticcdn.com:443
-河北承德联通
-he-chengde-cu-v4.ip.zstaticcdn.com:443
-河北邯郸联通
-he-handan-cu-v4.ip.zstaticcdn.com:443
-河北衡水联通
-he-hengshui-cu-v4.ip.zstaticcdn.com:443
-河北石家庄联通
-he-shijiazhuang-cu-v4.ip.zstaticcdn.com:443
-河北唐山联通
-he-tangshan-cu-v4.ip.zstaticcdn.com:443
-河北邢台联通
-he-xingtai-cu-v4.ip.zstaticcdn.com:443
-黑龙江大庆联通
-hl-daqing-cu-v4.ip.zstaticcdn.com:443
-黑龙江大兴安岭联通
-hl-daxinganling-cu-v4.ip.zstaticcdn.com:443
-黑龙江哈尔滨联通
-hl-haerbin-cu-v4.ip.zstaticcdn.com:443
-黑龙江鹤岗联通
-hl-hegang-cu-v4.ip.zstaticcdn.com:443
-黑龙江黑河联通
-hl-heihe-cu-v4.ip.zstaticcdn.com:443
-黑龙江佳木斯联通
-hl-jiamusi-cu-v4.ip.zstaticcdn.com:443
-黑龙江鸡西联通
-hl-jixi-cu-v4.ip.zstaticcdn.com:443
-黑龙江牡丹江联通
-hl-mudanjiang-cu-v4.ip.zstaticcdn.com:443
-黑龙江齐齐哈尔联通
-hl-qiqihaer-cu-v4.ip.zstaticcdn.com:443
-黑龙江七台河联通
-hl-qitaihe-cu-v4.ip.zstaticcdn.com:443
-黑龙江双鸭山联通
-hl-shuangyashan-cu-v4.ip.zstaticcdn.com:443
-黑龙江绥化联通
-hl-suihua-cu-v4.ip.zstaticcdn.com:443
-黑龙江伊春联通
-hl-yichun-cu-v4.ip.zstaticcdn.com:443
-湖南衡阳联通
-hn-hengyang-cu-v4.ip.zstaticcdn.com:443
-湖南娄底联通
-hn-loudi-cu-v4.ip.zstaticcdn.com:443
-湖南邵阳联通
-hn-shaoyang-cu-v4.ip.zstaticcdn.com:443
-湖南湘潭联通
-hn-xiangtan-cu-v4.ip.zstaticcdn.com:443
-湖南湘西联通
-hn-xiangxi-cu-v4.ip.zstaticcdn.com:443
-湖南张家界联通
-hn-zhangjiajie-cu-v4.ip.zstaticcdn.com:443
-吉林吉林联通
-jl-jilin-cu-v4.ip.zstaticcdn.com:443
-吉林四平联通
-jl-siping-cu-v4.ip.zstaticcdn.com:443
-吉林松原联通
-jl-songyuan-cu-v4.ip.zstaticcdn.com:443
-吉林通化联通
-jl-tonghua-cu-v4.ip.zstaticcdn.com:443
-江苏连云港联通
-js-lianyungang-cu-v4.ip.zstaticcdn.com:443
-江苏南通联通
-js-nantong-cu-v4.ip.zstaticcdn.com:443
-江苏徐州联通
-js-xuzhou-cu-v4.ip.zstaticcdn.com:443
-江苏盐城联通
-js-yancheng-cu-v4.ip.zstaticcdn.com:443
-江苏扬州联通
-js-yangzhou-cu-v4.ip.zstaticcdn.com:443
-江西抚州联通
-jx-fuzhou-cu-v4.ip.zstaticcdn.com:443
-江西吉安联通
-jx-jian-cu-v4.ip.zstaticcdn.com:443
-江西景德镇联通
-jx-jingdezhen-cu-v4.ip.zstaticcdn.com:443
-江西九江联通
-jx-jiujiang-cu-v4.ip.zstaticcdn.com:443
-江西南昌联通
-jx-nanchang-cu-v4.ip.zstaticcdn.com:443
-江西上饶联通
-jx-shangrao-cu-v4.ip.zstaticcdn.com:443
-江西新余联通
-jx-xinyu-cu-v4.ip.zstaticcdn.com:443
-江西宜春联通
-jx-yichun-cu-v4.ip.zstaticcdn.com:443
-江西鹰潭联通
-jx-yingtan-cu-v4.ip.zstaticcdn.com:443
-辽宁朝阳联通
-ln-chaoyang-cu-v4.ip.zstaticcdn.com:443
-辽宁大连联通
-ln-dalian-cu-v4.ip.zstaticcdn.com:443
-辽宁丹东联通
-ln-dandong-cu-v4.ip.zstaticcdn.com:443
-辽宁抚顺联通
-ln-fushun-cu-v4.ip.zstaticcdn.com:443
-辽宁阜新联通
-ln-fuxin-cu-v4.ip.zstaticcdn.com:443
-辽宁葫芦岛联通
-ln-huludao-cu-v4.ip.zstaticcdn.com:443
-辽宁锦州联通
-ln-jinzhou-cu-v4.ip.zstaticcdn.com:443
-辽宁沈阳联通
-ln-shenyang-cu-v4.ip.zstaticcdn.com:443
-辽宁铁岭联通
-ln-tieling-cu-v4.ip.zstaticcdn.com:443
-辽宁营口联通
-ln-yingkou-cu-v4.ip.zstaticcdn.com:443
-内蒙古包头联通
-nm-baotou-cu-v4.ip.zstaticcdn.com:443
-内蒙古巴彦淖尔联通
-nm-bayannaoer-cu-v4.ip.zstaticcdn.com:443
-内蒙古赤峰联通
-nm-chifeng-cu-v4.ip.zstaticcdn.com:443
-内蒙古呼伦贝尔联通
-nm-hulunbeier-cu-v4.ip.zstaticcdn.com:443
-内蒙古通辽联通
-nm-tongliao-cu-v4.ip.zstaticcdn.com:443
-内蒙古乌海联通
-nm-wuhai-cu-v4.ip.zstaticcdn.com:443
-内蒙古乌兰察布联通
-nm-wulanchabu-cu-v4.ip.zstaticcdn.com:443
-内蒙古锡林郭勒联通
-nm-xilinguole-cu-v4.ip.zstaticcdn.com:443
-内蒙古兴安联通
-nm-xingan-cu-v4.ip.zstaticcdn.com:443
-宁夏银川联通
-nx-yinchuan-cu-v4.ip.zstaticcdn.com:443
-青海西宁联通
-qh-xining-cu-v4.ip.zstaticcdn.com:443
-四川达州联通
-sc-dazhou-cu-v4.ip.zstaticcdn.com:443
-四川乐山联通
-sc-leshan-cu-v4.ip.zstaticcdn.com:443
-四川凉山联通
-sc-liangshan-cu-v4.ip.zstaticcdn.com:443
-四川泸州联通
-sc-luzhou-cu-v4.ip.zstaticcdn.com:443
-四川绵阳联通
-sc-mianyang-cu-v4.ip.zstaticcdn.com:443
-四川内江联通
-sc-neijiang-cu-v4.ip.zstaticcdn.com:443
-四川资阳联通
-sc-ziyang-cu-v4.ip.zstaticcdn.com:443
-山东滨州联通
-sd-binzhou-cu-v4.ip.zstaticcdn.com:443
-山东东营联通
-sd-dongying-cu-v4.ip.zstaticcdn.com:443
-山东菏泽联通
-sd-heze-cu-v4.ip.zstaticcdn.com:443
-山东济宁联通
-sd-jining-cu-v4.ip.zstaticcdn.com:443
-山东临沂联通
-sd-linyi-cu-v4.ip.zstaticcdn.com:443
-山东泰安联通
-sd-taian-cu-v4.ip.zstaticcdn.com:443
-山东潍坊联通
-sd-weifang-cu-v4.ip.zstaticcdn.com:443
-山东威海联通
-sd-weihai-cu-v4.ip.zstaticcdn.com:443
-山东烟台联通
-sd-yantai-cu-v4.ip.zstaticcdn.com:443
-山东枣庄联通
-sd-zaozhuang-cu-v4.ip.zstaticcdn.com:443
-山东淄博联通
-sd-zibo-cu-v4.ip.zstaticcdn.com:443
-陕西宝鸡联通
-sn-baoji-cu-v4.ip.zstaticcdn.com:443
-陕西商洛联通
-sn-shangluo-cu-v4.ip.zstaticcdn.com:443
-陕西榆林联通
-sn-yulin-cu-v4.ip.zstaticcdn.com:443
-山西长治联通
-sx-changzhi-cu-v4.ip.zstaticcdn.com:443
-山西晋中联通
-sx-jinzhong-cu-v4.ip.zstaticcdn.com:443
-山西临汾联通
-sx-linfen-cu-v4.ip.zstaticcdn.com:443
-山西吕梁联通
-sx-lvliang-cu-v4.ip.zstaticcdn.com:443
-山西朔州联通
-sx-shuozhou-cu-v4.ip.zstaticcdn.com:443
-山西阳泉联通
-sx-yangquan-cu-v4.ip.zstaticcdn.com:443
-山西运城联通
-sx-yuncheng-cu-v4.ip.zstaticcdn.com:443
-新疆巴音郭楞联通
-xj-bayinguoleng-cu-v4.ip.zstaticcdn.com:443
-新疆哈密联通
-xj-hami-cu-v4.ip.zstaticcdn.com:443
-新疆和田联通
-xj-hetian-cu-v4.ip.zstaticcdn.com:443
-新疆石河子联通
-xj-shihezi-cu-v4.ip.zstaticcdn.com:443
-新疆吐鲁番联通
-xj-tulufan-cu-v4.ip.zstaticcdn.com:443
-云南德宏联通
-yn-dehong-cu-v4.ip.zstaticcdn.com:443
-云南昆明联通
-yn-kunming-cu-v4.ip.zstaticcdn.com:443
-云南普洱联通
-yn-puer-cu-v4.ip.zstaticcdn.com:443
-云南曲靖联通
-yn-qujing-cu-v4.ip.zstaticcdn.com:443
-云南西双版纳联通
-yn-xishuangbanna-cu-v4.ip.zstaticcdn.com:443
-浙江湖州联通
-zj-huzhou-cu-v4.ip.zstaticcdn.com:443
-浙江嘉兴联通
-zj-jiaxing-cu-v4.ip.zstaticcdn.com:443
-浙江金华联通
-zj-jinhua-cu-v4.ip.zstaticcdn.com:443
-浙江丽水联通
-zj-lishui-cu-v4.ip.zstaticcdn.com:443
-浙江绍兴联通
-zj-shaoxing-cu-v4.ip.zstaticcdn.com:443
-浙江温州联通
-zj-wenzhou-cu-v4.ip.zstaticcdn.com:443`;
-
-      const rawNodeDataDual = `河北
-河北移动
-he-cm-dualstack.ip.zstaticcdn.com:80
-河北联通
-he-cu-dualstack.ip.zstaticcdn.com:80
-河北电信
-he-ct-dualstack.ip.zstaticcdn.com:80
-山西
-山西移动
-sx-cm-dualstack.ip.zstaticcdn.com:80
-山西联通
-sx-cu-dualstack.ip.zstaticcdn.com:80
-山西电信
-sx-ct-dualstack.ip.zstaticcdn.com:80
-辽宁
-辽宁移动
-ln-cm-dualstack.ip.zstaticcdn.com:80
-辽宁联通
-ln-cu-dualstack.ip.zstaticcdn.com:80
-辽宁电信
-ln-ct-dualstack.ip.zstaticcdn.com:80
-吉林
-吉林移动
-jl-cm-dualstack.ip.zstaticcdn.com:80
-吉林联通
-jl-cu-dualstack.ip.zstaticcdn.com:80
-吉林电信
-jl-ct-dualstack.ip.zstaticcdn.com:80
-黑龙江
-黑龙江移动
-hl-cm-dualstack.ip.zstaticcdn.com:80
-黑龙江联通
-hl-cu-dualstack.ip.zstaticcdn.com:80
-黑龙江电信
-hl-ct-dualstack.ip.zstaticcdn.com:80
-江苏
-江苏移动
-js-cm-dualstack.ip.zstaticcdn.com:80
-江苏联通
-js-cu-dualstack.ip.zstaticcdn.com:80
-江苏电信
-js-ct-dualstack.ip.zstaticcdn.com:80
-浙江
-浙江移动
-zj-cm-dualstack.ip.zstaticcdn.com:80
-浙江联通
-zj-cu-dualstack.ip.zstaticcdn.com:80
-浙江电信
-zj-ct-dualstack.ip.zstaticcdn.com:80
-安徽
-安徽移动
-ah-cm-dualstack.ip.zstaticcdn.com:80
-安徽联通
-ah-cu-dualstack.ip.zstaticcdn.com:80
-安徽电信
-ah-ct-dualstack.ip.zstaticcdn.com:80
-福建
-福建移动
-fj-cm-dualstack.ip.zstaticcdn.com:80
-福建联通
-fj-cu-dualstack.ip.zstaticcdn.com:80
-福建电信
-fj-ct-dualstack.ip.zstaticcdn.com:80
-江西
-江西移动
-jx-cm-dualstack.ip.zstaticcdn.com:80
-江西联通
-jx-cu-dualstack.ip.zstaticcdn.com:80
-江西电信
-jx-ct-dualstack.ip.zstaticcdn.com:80
-山东
-山东移动
-sd-cm-dualstack.ip.zstaticcdn.com:80
-山东联通
-sd-cu-dualstack.ip.zstaticcdn.com:80
-山东电信
-sd-ct-dualstack.ip.zstaticcdn.com:80
-河南
-河南移动
-ha-cm-dualstack.ip.zstaticcdn.com:80
-河南联通
-ha-cu-dualstack.ip.zstaticcdn.com:80
-河南电信
-ha-ct-dualstack.ip.zstaticcdn.com:80
-湖北
-湖北移动
-hb-cm-dualstack.ip.zstaticcdn.com:80
-湖北联通
-hb-cu-dualstack.ip.zstaticcdn.com:80
-湖北电信
-hb-ct-dualstack.ip.zstaticcdn.com:80
-湖南
-湖南移动
-hn-cm-dualstack.ip.zstaticcdn.com:80
-湖南联通
-hn-cu-dualstack.ip.zstaticcdn.com:80
-湖南电信
-hn-ct-dualstack.ip.zstaticcdn.com:80
-广东
-广东移动
-gd-cm-dualstack.ip.zstaticcdn.com:80
-广东联通
-gd-cu-dualstack.ip.zstaticcdn.com:80
-广东电信
-gd-ct-dualstack.ip.zstaticcdn.com:80
-海南
-海南移动
-hi-cm-dualstack.ip.zstaticcdn.com:80
-海南联通
-hi-cu-dualstack.ip.zstaticcdn.com:80
-海南电信
-hi-ct-dualstack.ip.zstaticcdn.com:80
-四川
-四川移动
-sc-cm-dualstack.ip.zstaticcdn.com:80
-四川联通
-sc-cu-dualstack.ip.zstaticcdn.com:80
-四川电信
-sc-ct-dualstack.ip.zstaticcdn.com:80
-贵州
-贵州移动
-gz-cm-dualstack.ip.zstaticcdn.com:80
-贵州联通
-gz-cu-dualstack.ip.zstaticcdn.com:80
-贵州电信
-gz-ct-dualstack.ip.zstaticcdn.com:80
-云南
-云南移动
-yn-cm-dualstack.ip.zstaticcdn.com:80
-云南联通
-yn-cu-dualstack.ip.zstaticcdn.com:80
-云南电信
-yn-ct-dualstack.ip.zstaticcdn.com:80
-陕西
-陕西移动
-sn-cm-dualstack.ip.zstaticcdn.com:80
-陕西联通
-sn-cu-dualstack.ip.zstaticcdn.com:80
-陕西电信
-sn-ct-dualstack.ip.zstaticcdn.com:80
-甘肃
-甘肃移动
-gs-cm-dualstack.ip.zstaticcdn.com:80
-甘肃联通
-gs-cu-dualstack.ip.zstaticcdn.com:80
-甘肃电信
-gs-ct-dualstack.ip.zstaticcdn.com:80
-青海
-青海移动
-qh-cm-dualstack.ip.zstaticcdn.com:80
-青海联通
-qh-cu-dualstack.ip.zstaticcdn.com:80
-青海电信
-qh-ct-dualstack.ip.zstaticcdn.com:80
-内蒙古
-内蒙古移动
-nm-cm-dualstack.ip.zstaticcdn.com:80
-内蒙古联通
-nm-cu-dualstack.ip.zstaticcdn.com:80
-内蒙古电信
-nm-ct-dualstack.ip.zstaticcdn.com:80
-广西
-广西移动
-gx-cm-dualstack.ip.zstaticcdn.com:80
-广西联通
-gx-cu-dualstack.ip.zstaticcdn.com:80
-广西电信
-gx-ct-dualstack.ip.zstaticcdn.com:80
-西藏
-西藏移动
-xz-cm-dualstack.ip.zstaticcdn.com:80
-西藏联通
-xz-cu-dualstack.ip.zstaticcdn.com:80
-西藏电信
-xz-ct-dualstack.ip.zstaticcdn.com:80
-宁夏
-宁夏移动
-nx-cm-dualstack.ip.zstaticcdn.com:80
-宁夏联通
-nx-cu-dualstack.ip.zstaticcdn.com:80
-宁夏电信
-nx-ct-dualstack.ip.zstaticcdn.com:80
-新疆
-新疆移动
-xj-cm-dualstack.ip.zstaticcdn.com:80
-新疆联通
-xj-cu-dualstack.ip.zstaticcdn.com:80
-新疆电信
-xj-ct-dualstack.ip.zstaticcdn.com:80
-北京
-北京移动
-bj-cm-dualstack.ip.zstaticcdn.com:80
-北京联通
-bj-cu-dualstack.ip.zstaticcdn.com:80
-北京电信
-bj-ct-dualstack.ip.zstaticcdn.com:80
-天津
-天津移动
-tj-cm-dualstack.ip.zstaticcdn.com:80
-天津联通
-tj-cu-dualstack.ip.zstaticcdn.com:80
-天津电信
-tj-ct-dualstack.ip.zstaticcdn.com:80
-上海
-上海移动
-sh-cm-dualstack.ip.zstaticcdn.com:80
-上海联通
-sh-cu-dualstack.ip.zstaticcdn.com:80
-上海电信
-sh-ct-dualstack.ip.zstaticcdn.com:80
-重庆
-重庆移动
-cq-cm-dualstack.ip.zstaticcdn.com:80
-重庆联通
-cq-cu-dualstack.ip.zstaticcdn.com:80
-重庆电信
-cq-ct-dualstack.ip.zstaticcdn.com:80`;
+      const CACHE_TTL = 3600000;
+      
+      if (!cachedNodesData || Date.now() - lastFetchTime > CACHE_TTL) {
+          try {
+              const resp = await fetch('https://lf3-ips.zstaticcdn.com');
+              if (resp.ok) {
+                  cachedNodesData = await resp.text();
+                  lastFetchTime = Date.now();
+              }
+          } catch (e) {
+              console.error("获取外部节点列表失败:", e);
+          }
+      }
 
       const pingOpts = { ct: [], cu: [], cm: [] };
       
-      const parseNodes = (rawText, label) => {
+      const parseNodes = (rawText) => {
+        if (!rawText) return;
         const lines = rawText.split('\n').map(l => l.trim()).filter(l => l);
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
           if (line.includes('移动') || line.includes('联通') || line.includes('电信')) {
-            const name = `${line} (${label})`;
+            const name = line;
             const host = (lines[i+1] || '').split(':')[0]; 
-            if (line.includes('电信')) pingOpts.ct.push({name, host});
-            else if (line.includes('联通')) pingOpts.cu.push({name, host});
-            else if (line.includes('移动')) pingOpts.cm.push({name, host});
+            if (host && host.includes('.')) {
+                if (line.includes('电信')) pingOpts.ct.push({name, host});
+                else if (line.includes('联通')) pingOpts.cu.push({name, host});
+                else if (line.includes('移动')) pingOpts.cm.push({name, host});
+            }
             i++; 
           }
         }
       };
 
-      parseNodes(rawNodeDataV4, 'IPv4');
-      parseNodes(rawNodeDataDual, '双栈');
+      parseNodes(cachedNodesData);
 
       const buildOpts = (group, selectedVal) => {
           let opts = `<option value="default" ${selectedVal === 'default' ? 'selected' : ''}>默认节点 (双栈多节点轮询)</option>`;
@@ -1650,7 +1277,6 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
                 <span style="font-size:16px; font-weight:bold; color:#7e22ce;">当前余额: <span id="admin-wallet-balance">${walletBalance}</span> Cycle</span>
                 <div>
                   <button onclick="openTxModal()" class="btn btn-purple">发起转账 (Tx)</button>
-                  <button onclick="forceResync()" class="btn btn-red" style="margin-left: 10px;">🔄 强制全网同步账本</button>
                 </div>
             </div>
           </div>
@@ -1943,25 +1569,6 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
                   alert('发生错误: ' + error.message);
               }
           }
-          
-          async function forceResync() {
-              if(!confirm('🚨 警告：此操作将清空本地账本数据，并从共识网络基石节点从头开始重新下载所有历史区块！\\n\\n如果您的余额与其他面板不一致，或者陷入了分叉，请使用此功能修复。\\n\\n确定要继续吗？')) return;
-              try {
-                  const res = await fetch('/admin/api', { 
-                      method: 'POST', 
-                      headers: {'Content-Type': 'application/json'}, 
-                      body: JSON.stringify({ action: 'force_resync' }) 
-                  });
-                  if (res.ok) {
-                      alert('✅ 账本已重置！面板将在接下来的几分钟内自动从网络中拉取所有历史区块并恢复真实余额，请稍后刷新页面查看。');
-                      location.reload();
-                  } else {
-                      alert('重置请求失败');
-                  }
-              } catch (e) {
-                  alert('重置失败: ' + e.message);
-              }
-          }
 
           async function addServer() {
             const name = document.getElementById('newName').value;
@@ -2032,8 +1639,8 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
 
       const osType = url.searchParams.get('os') || 'debian';
       const sh_bin = osType === 'alpine' ? "/bin/sh" : "/bin/bash";
-      const cmdApp = "cur" + "l";
-      const sh_sys = "system" + "ctl";
+      const cmdApp = "curl";
+      const sh_sys = "systemctl";
 
       let bashScript = `#!${sh_bin}
 SERVER_ID=$1
@@ -2226,7 +1833,7 @@ rc-service cf-probe restart
 echo "✅ Alpine 探针安装成功！热重载功能已启用。"
 `;
       } else {
-        const sh_etc = "/etc/" + "systemd/" + "system";
+        const sh_etc = "/etc/systemd/system";
         bashScript += `cat << EOF > ${sh_etc}/cf-probe.service
 [Unit]
 Description=Cloudflare Worker Probe Agent
@@ -2366,7 +1973,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
         currentAsset = Math.min(currentAsset, 100000000); 
         
-        // 此处不再同步等待 mineAndGossip 完成，防止阻塞心跳接口
         ctx.waitUntil(mineAndGossip(currentAsset, allS.length));
 
         return new Response(`INTERVAL=${sys.report_interval || '5'}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
@@ -2681,10 +2287,15 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           localRank = higherCount + 1;
           globalNetAsset = totalAsset + otherAssets;
           
-          const latestBlock = await env.DB.prepare('SELECT slot_id, proposer_domain FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 1').first();
-          if (latestBlock) {
-              currentHeight = latestBlock.slot_id;
-              globalProposer = latestBlock.proposer_domain.replace('https://', '');
+          let finalityHeight = 0;
+          const topBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+          if (topBlock) {
+              finalityHeight = Math.max(1, topBlock.slot_id - FINALITY_DEPTH);
+              const finalizedBlock = await env.DB.prepare('SELECT slot_id, proposer_domain FROM blockchain_ledger WHERE slot_id <= ? AND status = 1 ORDER BY slot_id DESC LIMIT 1').bind(finalityHeight).first();
+              if (finalizedBlock) {
+                  currentHeight = finalizedBlock.slot_id;
+                  globalProposer = finalizedBlock.proposer_domain.replace('https://', '');
+              }
           }
 
           const bCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND last_seen > ?').bind(activeThreshold).first();
@@ -2861,9 +2472,9 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       // 渲染最新区块列表 (带可追踪的 Txs)
       let blockExplorerRows = '';
       try {
-          const { results: recentBlocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 50').all();
+          const { results: recentBlocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 50').all();
           for (const b of recentBlocks) {
-              const bDate = new Date(b.timestamp + 8*3600000).toISOString().replace('T',' ').substring(0, 19);
+              const bDate = new Date((b.timestamp || getNetworkTime()) + 8*3600000).toISOString().replace('T',' ').substring(0, 19);
               const cleanProposer = b.proposer_domain.replace('https://', '').replace('http://', '');
               
               let txsHtml = `<span style="color:#94a3b8;">0 Txs</span>`;
@@ -2877,7 +2488,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               blockExplorerRows += `<tr>
                   <td><b style="color:#10b981;"># ${b.slot_id}</b></td>
                   <td><span style="color:#3b82f6; font-weight:600;">${cleanProposer}</span></td>
-                  <td style="font-family:monospace; font-size:11px; color:#8b949e;">${b.block_hash}</td>
+                  <td style="font-family:monospace; font-size:11px; color:#8b949e;" title="Total Difficulty: ${b.total_difficulty || 0}">${b.block_hash}</td>
                   <td>${txsHtml}</td>
                   <td style="color:#64748b; font-size:12px;">${bDate}</td>
               </tr>`;
@@ -2987,13 +2598,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           </div>
 
           <div class="consensus-panel" id="web3-dashboard">
-            <div><div class="c-label">最新区块高度</div><div class="c-val"># <span id="ui-height">${currentHeight}</span></div></div>
+            <div><div class="c-label">最新区块高度 (已终局)</div><div class="c-val"># <span id="ui-height">${currentHeight}</span></div></div>
             <div>
               <div class="c-label">Slot 出块倒计时</div>
               <div class="c-val"><span id="ui-ticker">10.0</span> s</div>
               <div class="ticker-bar"><div class="ticker-fill" id="ui-ticker-bar"></div></div>
             </div>
-            <div><div class="c-label">上一块见证人</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
+            <div><div class="c-label">终局见证人 (Finalized)</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
             <div><div class="c-label">信标 / 全网节点数</div><div class="c-val"><span id="ui-beacons">${activeBeacons}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">活跃</span> / <span id="ui-nodes">${globalNodes}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">总数</span></div></div>
           </div>
 
@@ -3054,7 +2665,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                 </div>
 
                 <div class="rich-list-card">
-                    <h3>🏆 Cycle 财富英雄榜</h3>
+                    <h3>🏆 Cycle 财富英雄榜 (Finalized)</h3>
                     <table class="custom-table" style="box-shadow:none;">
                         <tbody id="ajax-richlist">
                           ${richListRows}
@@ -3145,11 +2756,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               if(!addr) return;
               const resDiv = document.getElementById('ui-balance-result');
               resDiv.style.display = 'block';
-              resDiv.innerHTML = \`<span style="color:#888;">正在检索本地账本节点...</span>\`;
+              resDiv.innerHTML = \`<span style="color:#888;">正在利用 O(1) 增量引擎检索全网账本...</span>\`;
               try {
+                  const t1 = performance.now();
                   const res = await fetch('/?action=balance&address=' + addr + '&t=' + Date.now());
                   const data = await res.json();
-                  resDiv.innerHTML = \`账户地址 <a href="javascript:void(0)" style="color:#8b5cf6; font-family:monospace; font-weight:bold;">\${addr}</a> 当前持有资产：<b style="color:#10b981; font-size:20px;">\${data.balance} Cycle</b>\`;
+                  const t2 = performance.now();
+                  resDiv.innerHTML = \`账户地址 <a href="javascript:void(0)" style="color:#8b5cf6; font-family:monospace; font-weight:bold;">\${addr}</a> 当前持有资产：<b style="color:#10b981; font-size:20px;">\${data.balance.toFixed(2)} Cycle</b> <span style="font-size:12px; color:#888;">(查询耗时：\${(t2-t1).toFixed(2)}ms)</span>\`;
               } catch(e) {
                   resDiv.innerHTML = \`<span style="color:#ef4444;">查询失败或地址无记录</span>\`;
               }
