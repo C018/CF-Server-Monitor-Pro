@@ -14,7 +14,7 @@ export default {
     const host = url.origin;
     
     // ==========================================
-    // 0. 数据库自动化热创建与无缝升级
+    // 0. 数据库自动化热创建与无缝升级 (含数据自愈迁移)
     // ==========================================
     if (!globalThis.dbInitialized) {
       try {
@@ -61,6 +61,13 @@ export default {
             reputation_score INTEGER DEFAULT 100
           )
         `).run();
+
+        // [自动修复机制] 一次性清洗被 MAX() 污染的历史远程节点资产数据
+        const fixFlag = await env.DB.prepare("SELECT value FROM settings WHERE key='fix_asset_bug_v2'").first();
+        if (!fixFlag) {
+            await env.DB.prepare("UPDATE blockchain_peers SET total_asset = 0 WHERE domain != ?").bind(host).run();
+            await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('fix_asset_bug_v2', 'true')").run();
+        }
 
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_ledger (
@@ -125,7 +132,7 @@ export default {
                 if (ghData.cu) initialPingNodes.cu = ghData.cu;
                 if (ghData.cm) initialPingNodes.cm = ghData.cm;
             }
-        } catch(e) { console.error("Initial nodes.json fetch failed", e); }
+        } catch(e) {}
 
         for (const peer of initialPeers) {
             await env.DB.prepare(`
@@ -342,29 +349,36 @@ export default {
         return peers;
     };
 
+    // 【核心修复点 1】: 强制共识同步的合法见证人提取。完全依赖链上一致的记录，杜绝“脑裂”。
     const getValidLeadersForSlot = async (slotId) => {
-        const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+        const refBlock = await env.DB.prepare('SELECT block_hash, payload FROM blockchain_ledger WHERE status = 1 AND slot_id < ? ORDER BY slot_id DESC LIMIT 1').bind(slotId).first();
         
-        if (!localTopRow) return [GENESIS_NODE];
-
-        const peers = await getBootstrapPeers();
-        const { results: topPeers } = await env.DB.prepare(`
-            SELECT domain FROM blockchain_peers 
-            WHERE is_beacon IN ('true', '1') AND last_seen > ? AND reputation_score > 0
-            ORDER BY total_asset DESC, domain ASC LIMIT 10
-        `).bind(Date.now() - 86400000).all();
+        let leaderPool = [];
+        if (refBlock) {
+            try {
+                const pl = JSON.parse(refBlock.payload);
+                if (pl.active_nodes && Array.isArray(pl.active_nodes) && pl.active_nodes.length > 0) {
+                    leaderPool = pl.active_nodes;
+                }
+            } catch(e) {}
+        }
         
-        let leaderPool = topPeers.length > 0 ? topPeers.map(p => p.domain) : peers;
-        if (leaderPool.length === 0) leaderPool = [host];
+        if (leaderPool.length === 0) {
+            leaderPool = [GENESIS_NODE];
+            if (host !== GENESIS_NODE) leaderPool.push(host);
+        }
         
-        const hashHex = await miniHash(slotId + "-leader-seed");
+        // 强制全网一致性排序
+        leaderPool = [...new Set(leaderPool)].sort();
+        
+        const hashHex = await miniHash(slotId + "-leader-seed-" + (refBlock ? refBlock.block_hash : "genesis"));
         const pseudoRandom = parseInt(hashHex.substring(0, 8), 16);
         const baseIndex = pseudoRandom % leaderPool.length;
         
         const leaders = [leaderPool[baseIndex]];
-        if (leaderPool.length > 1) {
-            leaders.push(leaderPool[(baseIndex + 1) % leaderPool.length]); 
-        }
+        if (leaderPool.length > 1) leaders.push(leaderPool[(baseIndex + 1) % leaderPool.length]); 
+        if (leaderPool.length > 2) leaders.push(leaderPool[(baseIndex + 2) % leaderPool.length]); 
+        
         return leaders;
     };
 
@@ -611,7 +625,7 @@ export default {
                 if (block.signature !== expectedSig) return consensusResponse('Invalid Signature', 403);
 
                 const leaders = await getValidLeadersForSlot(block.slot_id);
-                if (block.proposer_domain !== leaders[0] && block.proposer_domain !== leaders[1]) {
+                if (!leaders.includes(block.proposer_domain)) {
                     return consensusResponse(`Reject: Not a valid leader`, 403);
                 }
 
@@ -653,7 +667,17 @@ export default {
                 if (!currentBlock) {
                     let allStmts = [];
                     allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(block.slot_id, block.proposer_domain, block.block_hash, block.parent_hash, block.payload, block.timestamp || getNetworkTime(), blockDifficulty));
-                    allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()));
+                    
+                    // 当收到合法区块，说明对方绝对是活跃节点，强制覆写其最后可见时间和信标状态
+                    allStmts.push(env.DB.prepare(`
+                        INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen) 
+                        VALUES (?, 'true', ?, ?, ?) 
+                        ON CONFLICT(domain) DO UPDATE SET 
+                            is_beacon='true', 
+                            vps_count=excluded.vps_count, 
+                            total_asset=excluded.total_asset, 
+                            last_seen=MAX(last_seen, excluded.last_seen)
+                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()));
                     
                     if (pl.txs && pl.txs.length > 0) allStmts.push(...getTxsStateStmts(pl.txs, evalResult.stateDiff));
 
@@ -663,7 +687,7 @@ export default {
                                 allStmts.push(env.DB.prepare(`
                                     INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score)
                                     VALUES (?, 'true', ?, 100)
-                                    ON CONFLICT(domain) DO NOTHING
+                                    ON CONFLICT(domain) DO UPDATE SET is_beacon='true'
                                 `).bind(peerDomain, Date.now()));
                             }
                         }
@@ -728,6 +752,13 @@ export default {
 
     const mineAndGossip = async (localAsset, localVpsCount) => {
         try {
+            // 首先强行更新本地表中自身的信标/资产状态，防止自身在节点列表中变成掉队状态
+            await env.DB.prepare(`
+                INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score)
+                VALUES (?, ?, ?, ?, ?, 9999)
+                ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)
+            `).bind(host, sys.is_beacon === 'true' ? 'true' : 'false', localVpsCount, Math.max(0, localAsset), Date.now()).run().catch(()=>{});
+
             const currentNetTime = getNetworkTime();
             const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
             const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
@@ -772,12 +803,22 @@ export default {
                                     const evalRes = await evaluateTxs(pl.txs || []);
                                     allStmts.push(...getTxsStateStmts(pl.txs || [], evalRes.stateDiff));
                                     const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000);
-                                    allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
+                                    
+                                    // 修复覆盖同步逻辑：使用最新的时间戳数据
+                                    allStmts.push(env.DB.prepare(`
+                                        INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen) 
+                                        VALUES (?, 'true', ?, ?, ?) 
+                                        ON CONFLICT(domain) DO UPDATE SET 
+                                            is_beacon='true', 
+                                            vps_count=CASE WHEN excluded.last_seen > last_seen THEN excluded.vps_count ELSE vps_count END, 
+                                            total_asset=CASE WHEN excluded.last_seen > last_seen THEN excluded.total_asset ELSE total_asset END, 
+                                            last_seen=MAX(last_seen, excluded.last_seen)
+                                    `).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
                                     
                                     if (pl.active_nodes && Array.isArray(pl.active_nodes)) {
                                         for (const peerD of pl.active_nodes) {
                                             if (peerD && peerD.startsWith('http') && peerD !== host) {
-                                                allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) VALUES (?, 'true', ?, 100) ON CONFLICT(domain) DO NOTHING`).bind(peerD, Date.now()));
+                                                allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) VALUES (?, 'true', ?, 100) ON CONFLICT(domain) DO UPDATE SET is_beacon='true'`).bind(peerD, Date.now()));
                                             }
                                         }
                                     }
@@ -790,8 +831,18 @@ export default {
                         }
                         if (syncData.blocks.length >= 1000) since = syncData.blocks[syncData.blocks.length - 1].slot_id; else keepSyncing = false;
 
+                        // 【修复点 2】：八卦数据同步更新覆盖策略，修复因单调 MAX() 导致的资产不能缩减的问题
                         for (const p of syncData.peers) {
-                            await env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)`).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
+                            await env.DB.prepare(`
+                                INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) 
+                                VALUES (?, ?, ?, ?, ?, ?) 
+                                ON CONFLICT(domain) DO UPDATE SET 
+                                    is_beacon=CASE WHEN excluded.last_seen > last_seen THEN excluded.is_beacon ELSE is_beacon END, 
+                                    vps_count=CASE WHEN excluded.last_seen > last_seen THEN excluded.vps_count ELSE vps_count END, 
+                                    total_asset=CASE WHEN excluded.last_seen > last_seen THEN excluded.total_asset ELSE total_asset END, 
+                                    reputation_score=MAX(reputation_score, excluded.reputation_score),
+                                    last_seen=MAX(last_seen, excluded.last_seen)
+                            `).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
                         }
                     } catch(e) { return syncedAny; }
                 }
@@ -809,9 +860,13 @@ export default {
             const leaders = await getValidLeadersForSlot(currentSlot);
             let isMyTurn = false;
             
+            // 顺位延时接替出块，最高宽容度达 3 位顺位
             if (leaders[0] === host && sys.is_beacon === 'true') {
                 isMyTurn = true; 
-            } else if (leaders.length > 1 && leaders[1] === host && sys.is_beacon === 'true' && elapsedInSlot >= 5000) {
+            } else if (leaders.length > 1 && leaders[1] === host && sys.is_beacon === 'true' && elapsedInSlot >= 3000) {
+                const exist = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+                if (!exist) isMyTurn = true;
+            } else if (leaders.length > 2 && leaders[2] === host && sys.is_beacon === 'true' && elapsedInSlot >= 6000) {
                 const exist = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
                 if (!exist) isMyTurn = true;
             }
@@ -835,8 +890,12 @@ export default {
                     blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: currentNetTime });
                 }
 
-                const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? AND reputation_score > 0 ORDER BY last_seen DESC LIMIT 10`).bind(host).all();
-                const active_nodes = topPeers.map(p => p.domain);
+                // 强制将自己和创世节点包含到下一区块见证池，确保网络连续性
+                const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND reputation_score > 0 ORDER BY total_asset DESC, last_seen DESC LIMIT 15`).all();
+                let active_nodes = topPeers.map(p => p.domain);
+                if (!active_nodes.includes(host)) active_nodes.push(host);
+                if (!active_nodes.includes(GENESIS_NODE)) active_nodes.push(GENESIS_NODE);
+                active_nodes = [...new Set(active_nodes)].sort();
 
                 const evalResult = await evaluateTxs(blockTxs);
                 const state_root = evalResult.state_root;
@@ -2138,11 +2197,21 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
           const activeThreshold = Date.now() - 86400000; 
           const { results: rankList } = await env.DB.prepare('SELECT domain, total_asset FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).all();
           let higherCount = 0; let otherAssets = 0;
+          
           for (const p of rankList) {
               if (p.domain !== host) {
                   let pAsset = parseFloat(p.total_asset) || 0;
-                  pAsset = Math.min(pAsset, 500000); otherAssets += pAsset;
-                  if (pAsset > totalAsset) higherCount++;
+                  pAsset = Math.min(pAsset, 500000); 
+                  otherAssets += pAsset;
+                  
+                  // 【修复点 3】：排名决胜机制，加入同等资产下的域名字母排序，确保全网排名唯一，拒绝并列第1
+                  if (pAsset > totalAsset) {
+                      higherCount++;
+                  } else if (pAsset === totalAsset) {
+                      if (p.domain > host) {
+                          higherCount++;
+                      }
+                  }
               }
           }
           localRank = higherCount + 1; globalNetAsset = totalAsset + otherAssets;
