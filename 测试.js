@@ -578,8 +578,7 @@ export default {
             if (sys.is_beacon !== 'true') return consensusResponse('Not a beacon', 403);
             try {
                 const block = await request.json();
-                // [修复点一：注释掉未定义的 updateNetworkTimeOffset 调用]
-                // if (block.timestamp) ctx.waitUntil(updateNetworkTimeOffset(block.timestamp));
+                if (block.timestamp) ctx.waitUntil(updateNetworkTimeOffset(block.timestamp));
 
                 const currentSlot = Math.max(1, Math.floor((getNetworkTime() - EPOCH_START) / SLOT_TIME));
                 if (parseInt(block.slot_id) > currentSlot + 3) return consensusResponse('Block from future rejected', 400);
@@ -650,8 +649,7 @@ export default {
                     const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
                     const snapMap = {};
                     wallets.forEach(w => snapMap[w.address] = w.balance);
-                    // [修复点二：将未定义的 hash 和 signature 替换为传递进来的 block.block_hash 和 block.signature]
-                    await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(block.slot_id, pl.state_root, JSON.stringify(snapMap), block.block_hash, block.signature).run();
+                    await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(block.slot_id, pl.state_root, JSON.stringify(snapMap), hash, signature).run();
                 }
 
                 if (!globalThis.gossipCache) globalThis.gossipCache = new Set();
@@ -672,9 +670,7 @@ export default {
                     })());
                 }
                 return consensusResponse('Consensus Accepted', 200);
-            } catch(e) { 
-                return consensusResponse('Block Reject: ' + e.message, 400); 
-            }
+            } catch(e) { return consensusResponse('Block Reject', 400); }
         }
         
         if (request.method === 'POST' && route === 'tx') {
