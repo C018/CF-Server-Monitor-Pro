@@ -1,7 +1,7 @@
 // ==========================================
 // 创世时间戳与网络参数 (Genesis Setup)
 // ==========================================
-const EPOCH_START = 1700000000000; 
+const EPOCH_START = 1780239482981; 
 const GENESIS_NODE = 'https://sweet-mode-d36b.lucy01012023.workers.dev'; 
 const DEFAULT_SEEDS = [GENESIS_NODE]; 
 const SLOT_TIME = 10000; // 10秒出块
