@@ -2589,6 +2589,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             } catch (e) {}
           }, 15000); 
         </script>
+        ${sys.custom_script || ''}
       </body>
       </html>`;
       return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
