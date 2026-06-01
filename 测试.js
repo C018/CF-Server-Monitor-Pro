@@ -341,7 +341,8 @@ export default {
     };
 
     const getBootstrapPeers = async () => {
-        const { results } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') ORDER BY last_seen DESC LIMIT 15`).all();
+        // 🚀 修复点 2：将拉取本地活跃节点的上限提升，防遗漏
+        const { results } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') ORDER BY last_seen DESC LIMIT 50`).all();
         let peers = results.map(r => r.domain);
         DEFAULT_SEEDS.forEach(seed => {
             if (!peers.includes(seed) && seed !== host) peers.push(seed);
@@ -666,7 +667,8 @@ export default {
         if (request.method === 'GET' && route === 'sync') {
             const since = parseInt(url.searchParams.get('since_slot') || '0');
             const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? AND status = 1 ORDER BY slot_id ASC LIMIT 1000').bind(since).all();
-            const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY last_seen DESC LIMIT 30').all();
+            // 🚀 修复点 1：每次拉取通讯录的吞吐量增加至 150，确保全网所有节点一次性交接完毕
+            const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY last_seen DESC LIMIT 150').all();
             const { results: mempool } = await env.DB.prepare('SELECT * FROM mempool ORDER BY timestamp DESC LIMIT 20').all();
             return consensusResponse({ blocks, peers, mempool });
         }
@@ -764,7 +766,7 @@ export default {
                         const tip = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                         if (tip && tip.block_hash === block.block_hash) {
                             const blockData = { slot_id: block.slot_id, proposer_domain: host, block_hash: block.block_hash, parent_hash: block.parent_hash, payload: block.payload, timestamp: block.timestamp, total_difficulty: blockDifficulty, signature: block.signature };
-                            const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY last_seen DESC LIMIT 15`).bind(host).all();
+                            const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 15`).bind(host).all();
                             for (const b of beacons) {
                                 fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }, b.domain).catch(() => {});
                             }
@@ -890,8 +892,9 @@ export default {
                 blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: currentNetTime });
             }
 
+            // 🚀 修复点 3：这里也顺便提升一下本地抓取广播目标的数量
             const activeThreshold = Date.now() - 86400000;
-            const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND last_seen > ? ORDER BY total_asset DESC, last_seen DESC LIMIT 100`).bind(activeThreshold).all();
+            const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND last_seen > ? ORDER BY total_asset DESC, last_seen DESC LIMIT 200`).bind(activeThreshold).all();
             let active_nodes = topPeers.map(p => p.domain);
             if (!active_nodes.includes(host)) active_nodes.push(host);
             if (!active_nodes.includes(GENESIS_NODE)) active_nodes.push(GENESIS_NODE);
@@ -1628,230 +1631,6 @@ export default {
     }
 
     // ==========================================
-    // 一键安装脚本 (/install.sh)
-    // ==========================================
-    if (request.method === 'GET' && url.pathname === '/install.sh') {
-      let reportInterval = '5';
-      let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default';
-      try {
-        const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm')").all();
-        if (res && res.results) {
-           res.results.forEach(r => {
-              if (r.key === 'report_interval') reportInterval = r.value || '5';
-              if (r.key === 'ping_node_ct') pingCt = r.value || 'default';
-              if (r.key === 'ping_node_cu') pingCu = r.value || 'default';
-              if (r.key === 'ping_node_cm') pingCm = r.value || 'default';
-           });
-        }
-      } catch(e) {}
-
-      const osType = url.searchParams.get('os') || 'debian';
-      const sh_bin = osType === 'alpine' ? "/bin/sh" : "/bin/bash";
-      const cmdApp = "curl"; const sh_sys = "systemctl";
-
-      const CACHE_CONFIG_URL = `${host}/config.json`; 
-
-      let bashScript = `#!${sh_bin}
-SERVER_ID=$1
-SECRET=$2
-WORKER_URL="${host}/update"
-STATIC_URL="${CACHE_CONFIG_URL}"
-
-if [ -z "$SERVER_ID" ] || [ -z "$SECRET" ]; then echo "错误: 缺少参数。"; exit 1; fi
-echo "开始安装强力脱钩・秒级热重载探针 Agent..."
-
-# 清理旧环境
-`;
-
-      if (osType === 'alpine') {
-        bashScript += `rc-service cf-probe stop 2>/dev/null\n`;
-      } else {
-        bashScript += `${sh_sys} stop cf-probe.service 2>/dev/null\n`;
-      }
-      bashScript += `pkill -f cf-probe.sh 2>/dev/null
-
-cat << EOF > /usr/local/bin/cf-probe.sh
-#!${sh_bin}
-SERVER_ID="$SERVER_ID"
-SECRET="$SECRET"
-WORKER_URL="$WORKER_URL"
-STATIC_URL="$STATIC_URL"
-
-get_net_bytes() { awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}' /proc/net/dev; }
-get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
-get_http_ping() { rtt=\\$(${cmdApp} -o /dev/null -s -m 2 -w "%{time_total}" "http://\\$1" 2>/dev/null | awk '{printf "%.0f", \\$1*1000}'); echo "\\\${rtt:-0}"; }
-
-NET_STAT=\\$(get_net_bytes)
-RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
-TX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$2}')
-
-CPU_STAT=\\$(get_cpu_stat)
-PREV_CPU_TOTAL=\\$(echo \\$CPU_STAT | awk '{print \\$1}')
-PREV_CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
-
-LOOP_COUNT=0
-IPV4="0"; IPV6="0"
-PING_CT="0"; PING_CU="0"; PING_CM="0"; PING_BD="0"
-
-REPORT_INTERVAL="${reportInterval}"
-PING_NODE_CT="${pingCt}"; PING_NODE_CU="${pingCu}"; PING_NODE_CM="${pingCm}"
-
-LAST_CONFIG_TIME=0
-LAST_REPORT_TIME=0
-PREV_CPU_VAL=0; PREV_RAM_VAL=0; PREV_DISK_VAL=0
-PREV_V4_STATE="X"; PREV_V6_STATE="X"
-
-while true; do
-  NOW=\\$(date +%s)
-  
-  if [ \\$((NOW - LAST_CONFIG_TIME)) -ge 15 ]; then
-      RES_STATIC=\\$(${cmdApp} -s -m 3 "\\$STATIC_URL" 2>/dev/null)
-      if echo "\\$RES_STATIC" | grep -q "INTERVAL"; then
-         NEW_INV=\\$(echo "\\$RES_STATIC" | sed -n 's/.*"INTERVAL":\\([0-9]*\\).*/\\1/p')
-         if [ -n "\\$NEW_INV" ] && [ "\\$NEW_INV" -gt 0 ] 2>/dev/null; then
-             REPORT_INTERVAL=\\$NEW_INV
-         fi
-      fi
-      LAST_CONFIG_TIME=\\$NOW
-  fi
-
-  if [ \\$((LOOP_COUNT % 12)) -eq 0 ]; then
-    ${cmdApp} -s -4 -m 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip=" && IPV4="1" || IPV4="0"
-    ${cmdApp} -s -6 -m 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip=" && IPV6="1" || IPV6="0"
-  fi
-  
-  if [ \\$((LOOP_COUNT % 6)) -eq 0 ]; then
-    idx=\\$((LOOP_COUNT % 3))
-    case \\$idx in
-      0) D_CT="bj-ct-dualstack.ip.zstaticcdn.com"; D_CU="bj-cu-dualstack.ip.zstaticcdn.com"; D_CM="bj-cm-dualstack.ip.zstaticcdn.com" ;;
-      1) D_CT="sh-ct-dualstack.ip.zstaticcdn.com"; D_CU="sh-cu-dualstack.ip.zstaticcdn.com"; D_CM="sh-cm-dualstack.ip.zstaticcdn.com" ;;
-      2) D_CT="gd-ct-dualstack.ip.zstaticcdn.com"; D_CU="gd-cu-dualstack.ip.zstaticcdn.com"; D_CM="gd-cm-dualstack.ip.zstaticcdn.com" ;;
-    esac
-    CT_NODE="\\$PING_NODE_CT"; CU_NODE="\\$PING_NODE_CU"; CM_NODE="\\$PING_NODE_CM"
-    [ "\\$CT_NODE" = "default" ] && CT_NODE="\\$D_CT"
-    [ "\\$CU_NODE" = "default" ] && CU_NODE="\\$D_CU"
-    [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
-
-    PING_CT=\\$(get_http_ping "\\$CT_NODE")
-    PING_CU=\\$(get_http_ping "\\$CU_NODE")
-    PING_CM=\\$(get_http_ping "\\$CM_NODE")
-    PING_BD=\\$(get_http_ping "lf3-ips.zstaticcdn.com")
-  fi
-  
-  LOOP_COUNT=\\$((LOOP_COUNT + 1))
-
-  OS=\\$(awk -F= '/^PRETTY_NAME/{print \\$2}' /etc/os-release 2>/dev/null | tr -d '"')
-  [ -z "\\$OS" ] && OS=\\$(uname -srm)
-  ARCH=\\$(uname -m)
-  BOOT_TIME=\\$(uptime -s 2>/dev/null || echo "Unknown")
-  CPU_INFO=\\$(grep -m 1 'model name' /proc/cpuinfo | awk -F: '{print \\$2}' | xargs | tr -d '"')
-  
-  VIRT="Unknown"
-  command -v systemd-detect-virt >/dev/null 2>&1 && VIRT=\\$(systemd-detect-virt 2>/dev/null)
-
-  CPU_STAT=\\$(get_cpu_stat)
-  CPU_TOTAL=\\$(echo \\$CPU_STAT | awk '{print \\$1}')
-  CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
-  DIFF_TOTAL=\\$((CPU_TOTAL - PREV_CPU_TOTAL))
-  DIFF_IDLE=\\$((CPU_IDLE - PREV_CPU_IDLE))
-  CPU=\\$(awk -v t=\\$DIFF_TOTAL -v i=\\$DIFF_IDLE 'BEGIN {if (t<=0) print 0; else {pct=(1 - i/t)*100; printf "%.1f", pct}}')
-  PREV_CPU_TOTAL=\\$CPU_TOTAL; PREV_CPU_IDLE=\\$CPU_IDLE
-  
-  MEM_INFO=\\$(free -m 2>/dev/null)
-  RAM_TOTAL=\\$(echo "\\$MEM_INFO" | awk '/Mem:/ {print \\$2}')
-  RAM_USED=\\$(echo "\\$MEM_INFO" | awk '/Mem:/ {print \\$3}')
-  RAM=\\$(awk "BEGIN {if(\\$RAM_TOTAL>0) printf \\"%.1f\\", \\$RAM_USED/\\$RAM_TOTAL * 100.0; else print 0}")
-  SWAP_TOTAL=\\$(echo "\\$MEM_INFO" | awk '/Swap:/ {print \\$2}')
-  SWAP_USED=\\$(echo "\\$MEM_INFO" | awk '/Swap:/ {print \\$3}')
-
-  DISK_INFO=\\$(df -m / 2>/dev/null | tail -n1 | awk '{print \\$2, \\$3, \\$5}')
-  DISK_TOTAL=\\$(echo "\\$DISK_INFO" | awk '{print \\$1}')
-  DISK_USED=\\$(echo "\\$DISK_INFO" | awk '{print \\$2}')
-  DISK=\\$(echo "\\$DISK_INFO" | awk '{print \\$3}' | tr -d '%')
-
-  LOAD=\\$(cat /proc/loadavg | awk '{print \\$1, \\$2, \\$3}')
-  UPTIME=\\$(uptime -p 2>/dev/null | sed 's/up //' || echo "N/A")
-  PROCESSES=\\$(ps -e 2>/dev/null | wc -l)
-  TCP_CONN=\\$(ss -ant 2>/dev/null | wc -l)
-  UDP_CONN=\\$(ss -anu 2>/dev/null | wc -l)
-  
-  NET_STAT=\\$(get_net_bytes)
-  RX_NOW=\\$(echo \\$NET_STAT | awk '{print \\$1}')
-  TX_NOW=\\$(echo \\$NET_STAT | awk '{print \\$2}')
-  
-  RX_SPEED=\\$(((RX_NOW - RX_PREV) / 5))
-  TX_SPEED=\\$(((TX_NOW - TX_PREV) / 5))
-  RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
-
-  NEED_REPORT=0
-  
-  if [ \\$((NOW - LAST_REPORT_TIME)) -ge \\$REPORT_INTERVAL ]; then NEED_REPORT=1; fi
-  
-  CPU_DIFF=\\$(awk "BEGIN {d=\\$CPU-\\$PREV_CPU_VAL; print (d<0?-d:d)}")
-  RAM_DIFF=\\$(awk "BEGIN {d=\\$RAM-\\$PREV_RAM_VAL; print (d<0?-d:d)}")
-  DISK_DIFF=\\$(awk "BEGIN {d=\\$DISK-\\$PREV_DISK_VAL; print (d<0?-d:d)}")
-  
-  if [ \\$(awk "BEGIN {print (\\$CPU_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
-  if [ \\$(awk "BEGIN {print (\\$RAM_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
-  if [ \\$(awk "BEGIN {print (\\$DISK_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
-  if [ "\\$IPV4" != "\\$PREV_V4_STATE" ] || [ "\\$IPV6" != "\\$PREV_V6_STATE" ]; then NEED_REPORT=1; fi
-
-  if [ \\$NEED_REPORT -eq 1 ]; then
-    PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
-    
-    ${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" > /dev/null 2>&1
-    
-    LAST_REPORT_TIME=\\$NOW
-    PREV_CPU_VAL=\\$CPU; PREV_RAM_VAL=\\$RAM; PREV_DISK_VAL=\\$DISK
-    PREV_V4_STATE=\\$IPV4; PREV_V6_STATE=\\$IPV6
-  elif [ \\$((NOW - LAST_REPORT_TIME)) -ge 180 ]; then
-    PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"type\\": \\"ping\\"}"
-    ${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" > /dev/null 2>&1
-    LAST_REPORT_TIME=\\$NOW
-  fi
-
-  sleep 5
-done
-EOF
-chmod +x /usr/local/bin/cf-probe.sh
-`;
-
-      if (osType === 'alpine') {
-        bashScript += `cat << 'EOF' > /etc/init.d/cf-probe
-#!/sbin/openrc-run
-name="cf-probe"
-command="/usr/local/bin/cf-probe.sh"
-command_background="yes"
-pidfile="/run/cf-probe.pid"
-EOF
-chmod +x /etc/init.d/cf-probe
-rc-update add cf-probe default
-rc-service cf-probe restart
-echo "✅ Alpine 高精脱钩版探针安装成功！"
-`;
-      } else {
-        const sh_etc = "/etc/systemd/system";
-        bashScript += `cat << EOF > ${sh_etc}/cf-probe.service
-[Unit]
-Description=Cloudflare Worker Probe Agent Static-Filter
-After=network.target
-[Service]
-ExecStart=/usr/local/bin/cf-probe.sh
-Restart=always
-User=root
-[Install]
-WantedBy=multi-user.target
-EOF
-${sh_sys} daemon-reload
-${sh_sys} enable cf-probe.service
-${sh_sys} restart cf-probe.service
-echo "✅ Linux 高精脱钩版探针安装成功！"
-`;
-      }
-      return new Response(bashScript, { headers: { 'Content-Type': 'text/plain;charset=UTF-8' } });
-    }
-
-    // ==========================================
     // API 接收数据 (/update)
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/update') {
@@ -1995,12 +1774,13 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
       if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
 
       const isAjax = url.searchParams.get('ajax') === '1';
-      if (!isAjax) {
-        const nowTime = new Date();
-        const tzOffset = 8 * 60 * 60000; 
-        const localNow = new Date(nowTime.getTime() + tzOffset);
-        const todayStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}-${localNow.getDate()}`;
+      
+      const nowTime = new Date();
+      const tzOffset = 8 * 60 * 60000; 
+      const localNow = new Date(nowTime.getTime() + tzOffset);
+      const todayStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}-${localNow.getDate()}`;
         
+      if (!isAjax) {
         let vTotal = parseInt(sys.visits_total || '0');
         let vToday = parseInt(sys.visits_today || '0');
         let vDate = sys.visits_date || '';
@@ -2012,6 +1792,24 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         ctx.waitUntil(env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(vTotal.toString(), vToday.toString(), todayStr).run().catch(()=>{}));
       }
       
+      // 🚀 修复点 4：强制更新本地节点的活跃状态，即使没有探针连接也能保持在排行榜上
+      let currentAssetUpdate = 0;
+      let { results: allS } = await env.DB.prepare('SELECT price, expire_date FROM servers WHERE is_hidden="false"').all();
+      for(const s of allS) { currentAssetUpdate += (calcServerAsset(s, Date.now()).amount || 0); }
+      currentAssetUpdate = Math.min(currentAssetUpdate, 100000000);
+      
+      ctx.waitUntil(env.DB.prepare(`
+          INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score)
+          VALUES (?, ?, ?, ?, ?, 9999)
+          ON CONFLICT(domain) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen), vps_count=excluded.vps_count, total_asset=excluded.total_asset
+      `).bind(host, sys.is_beacon === 'true' ? 'true' : 'false', allS.length, currentAssetUpdate, Date.now()).run().catch(()=>{}));
+      
+      // 🚀 修复点 5：被动探活，打开页面时顺手执行一次种子同步，防止掉队
+      ctx.waitUntil((async () => {
+          const seed = DEFAULT_SEEDS[Math.floor(Math.random() * DEFAULT_SEEDS.length)];
+          if (seed !== host) await syncAndAlign(seed);
+      })());
+
       const viewId = url.searchParams.get('id');
       if (viewId) {
         const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(viewId).first();
@@ -2165,10 +1963,10 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
       
       try {
           const activeThreshold = Date.now() - 86400000; 
-          const { results: rankList } = await env.DB.prepare('SELECT domain, vps_count, total_asset, last_seen FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).all();
+          // 🚀 修复点 6：精准拉取活跃且具有 beacon 资格的节点，确保展示排行榜完整准确
+          const { results: rankList } = await env.DB.prepare('SELECT domain, vps_count, total_asset, last_seen FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND last_seen > ?').bind(activeThreshold).all();
           let higherCount = 0; let otherAssets = 0;
           
-          // 🚀 1. 新增：拉取最近300个区块，智能建立 [域名 -> 钱包] 映射表
           let domainToWallet = {};
           try {
               const { results: recentCoinbases } = await env.DB.prepare("SELECT proposer_domain, payload FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 300").all();
@@ -2183,14 +1981,12 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
               }
           } catch(e) {}
           
-          // 🚀 获取当前所有钱包的余额
           let walletBalances = {};
           try {
               const { results: wBals } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
               wBals.forEach(w => walletBalances[w.address] = w.balance);
           } catch(e) {}
 
-          // 🚀 构建排行榜 HTML
           let sortedPeers = [...rankList];
           sortedPeers.sort((a, b) => {
               let aA = Math.min(parseFloat(a.total_asset)||0, 500000);
@@ -2346,7 +2142,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         }
       }
 
-      // 🚀 2. 修改：点击富豪榜地址，直接调用 searchBalance 函数填入上方并搜索
       let richListRows = '';
       try {
           const { results: rList } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets ORDER BY balance DESC LIMIT 10').all();
@@ -2515,7 +2310,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
               document.querySelectorAll('#ajax-table tr').forEach(el => el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? '' : 'none');
           }
           
-          // 🚀 4. 新增：快捷搜索功能
           function searchBalance(addr) {
               document.getElementById('radar-input').value = addr;
               executeSearch();
@@ -2556,7 +2350,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
               if (payloadData) {
                   document.getElementById('ui-rank').innerText = payloadData.getAttribute('data-rank'); document.getElementById('ui-net-asset').innerText = payloadData.getAttribute('data-net-asset'); document.getElementById('ui-proposer').innerText = payloadData.getAttribute('data-proposer'); document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height'); document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons'); document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes'); document.getElementById('ui-pending-txs').innerText = payloadData.getAttribute('data-pending-txs');
               }
-              // 🚀 5. 修改：让排行数据表也能实现自动更新
               ['ajax-stats', 'ajax-cards', 'ajax-table', 'table-blocks-body', 'ajax-filters', 'map-data', 'ajax-richlist', 'table-rank-body'].forEach(id => {
                   const newEl = newDoc.getElementById(id === 'table-blocks-body' ? 'ajax-blocks' : (id === 'table-rank-body' ? 'ajax-ranklist' : id));
                   if (newEl && document.getElementById(id)) { if (id === 'map-data') document.getElementById(id).textContent = newEl.textContent; else document.getElementById(id).innerHTML = newEl.innerHTML; }
