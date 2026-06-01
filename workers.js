@@ -57,6 +57,15 @@ export default {
           }
         }
 
+        // 新增：保存自定义主题的表
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS custom_themes (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            css TEXT
+          )
+        `).run();
+
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_peers (
             domain TEXT PRIMARY KEY, 
@@ -1174,6 +1183,17 @@ export default {
 
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         }
+        // 新增：保存自定义主题 API
+        else if (data.action === 'save_custom_theme') {
+            const id = crypto.randomUUID();
+            await env.DB.prepare('INSERT INTO custom_themes (id, name, css) VALUES (?, ?, ?)').bind(id, data.name, data.css).run();
+            return new Response(JSON.stringify({ success: true, id }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        // 新增：删除自定义主题 API
+        else if (data.action === 'delete_custom_theme') {
+            await env.DB.prepare('DELETE FROM custom_themes WHERE id = ?').bind(data.id).run();
+            return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+        }
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 400 });
       }
@@ -1216,6 +1236,13 @@ export default {
           `;
         }
       }
+
+      // 获取已保存的自定义主题
+      let customThemes = [];
+      try {
+          const { results: themes } = await env.DB.prepare('SELECT id, name, css FROM custom_themes').all();
+          customThemes = themes || [];
+      } catch(e) {}
 
       let walletBalance = 0;
       if (sys.miner_wallet) {
@@ -1321,9 +1348,24 @@ export default {
                 </select>
               </div>
 
-              <div class="form-group" id="custom_css_group" style="display: ${sys.theme === 'theme6' ? 'flex' : 'none'};">
-                <label>🧑‍💻 自定义 CSS 代码</label>
-                <textarea id="cfg_custom_css" rows="5" placeholder="body.theme6 { background: #000; } ...">${sys.custom_css || ''}</textarea>
+              <div class="form-group" id="custom_css_group" style="display: ${sys.theme === 'theme6' ? 'flex' : 'none'}; flex-direction: column; background: #fff; border: 1px dashed #ccc; padding: 15px; border-radius: 8px;">
+                <label style="color: #3b82f6;">🧑‍💻 主题库管理 (自定义 CSS)</label>
+                
+                <div style="display: flex; gap: 10px; margin-bottom: 15px; align-items: center;">
+                    <select id="saved_themes_select" style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <option value="">-- 选择已保存的自定义主题 --</option>
+                        ${customThemes.map(t => `<option value="${t.id}" data-css="${encodeURIComponent(t.css)}">${t.name}</option>`).join('')}
+                    </select>
+                    <button type="button" onclick="loadCustomTheme()" class="btn btn-purple">加载</button>
+                    <button type="button" onclick="deleteCustomTheme()" class="btn btn-red">删除</button>
+                </div>
+
+                <textarea id="cfg_custom_css" rows="6" placeholder="body.theme6 { background: #000; } ...">${sys.custom_css || ''}</textarea>
+                
+                <div style="display: flex; gap: 10px; margin-top: 15px;">
+                    <input type="text" id="new_theme_name" placeholder="输入你想保存的主题名称..." style="flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                    <button type="button" onclick="saveCustomTheme()" class="btn btn-green">💾 另存为新主题</button>
+                </div>
               </div>
 
               <div class="form-group">
@@ -1561,6 +1603,59 @@ export default {
             };
             const res = await fetch('/admin/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
             if (res.ok) { alert('✅ 设置已保存！'); location.reload(); } else alert('保存失败');
+          }
+
+          // 新增：加载自定义主题
+          function loadCustomTheme() {
+              const select = document.getElementById('saved_themes_select');
+              const selected = select.options[select.selectedIndex];
+              if (selected && selected.value) {
+                  const cssCode = decodeURIComponent(selected.getAttribute('data-css'));
+                  document.getElementById('cfg_custom_css').value = cssCode;
+                  alert('✅ 主题【' + selected.text + '】加载成功！请点击底部“保存全局设置”使其生效。');
+              } else {
+                  alert('请先选择一个保存的主题！');
+              }
+          }
+
+          // 新增：保存当前 CSS 为新主题
+          async function saveCustomTheme() {
+              const name = document.getElementById('new_theme_name').value.trim();
+              const css = document.getElementById('cfg_custom_css').value.trim();
+              if (!name || !css) {
+                  return alert('请输入主题名称并确保上面的 CSS 代码框不为空！');
+              }
+              const res = await fetch('/admin/api', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ action: 'save_custom_theme', name, css })
+              });
+              if (res.ok) { 
+                  alert('✅ 自定义主题另存成功！'); 
+                  location.reload(); 
+              } else {
+                  alert('主题保存失败');
+              }
+          }
+
+          // 新增：删除自定义主题
+          async function deleteCustomTheme() {
+              const select = document.getElementById('saved_themes_select');
+              const id = select.value;
+              if (!id) return alert('请先在下拉框中选择要删除的主题！');
+              if (!confirm('确定要彻底删除该自定义主题吗？')) return;
+              
+              const res = await fetch('/admin/api', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ action: 'delete_custom_theme', id })
+              });
+              if (res.ok) { 
+                  alert('✅ 主题已删除！'); 
+                  location.reload(); 
+              } else {
+                  alert('主题删除失败');
+              }
           }
 
           function openTxModal() {
