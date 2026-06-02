@@ -1,0 +1,82 @@
+<div style="background:#f3e8ff; padding:15px; border-radius:8px; border:1px solid #e9d5ff; margin-bottom:20px;">
+  <h3 style="margin-top:0; color:#6b21a8;">💼 Web3 钱包与转账 (Cycle Ledger)</h3>
+  <div class="form-group">
+      <label>本站出块奖励收款钱包地址 (自动挖矿 Cycle，请填写 0x... EVM格式地址)</label>
+      <input type="text" id="cfg_miner_wallet" placeholder="例如 0x123...abc">
+  </div>
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size:16px; font-weight:bold; color:#7e22ce;">当前余额: <span id="admin-wallet-balance">{{WALLET_BALANCE}}</span> Cycle</span>
+      <div><button onclick="openTxModal()" class="btn btn-purple">发起转账 (Tx)</button></div>
+  </div>
+</div>
+
+<div class="settings-grid">
+  <div>
+    <div class="form-group">
+      <label>🎨 前端主题风格 (6选1)</label>
+      <select id="cfg_theme" onchange="toggleCustomCss()">
+        <option value="theme1">1. 默认清爽白 (Classic White)</option>
+        <option value="theme2">2. 暗黑极客 (Dark Mode)</option>
+        <option value="theme3">3. 新粗野主义 (Brutalism)</option>
+        <option value="theme4">4. 动态渐变毛玻璃 (Glassmorphism)</option>
+        <option value="theme5">5. 赛博朋克 (Cyberpunk)</option>
+        <option value="theme6">6. 完全自定义 CSS (Custom Theme)</option>
+      </select>
+    </div>
+    <div class="form-group" id="custom_css_group" style="display: none; flex-direction: column; background: #fff; border: 1px dashed #ccc; padding: 15px; border-radius: 8px;">
+      <label style="color: #3b82f6;">🧑‍💻 主题库管理 (自定义 CSS)</label>
+      <div style="display: flex; gap: 10px; margin-bottom: 15px; align-items: center;">
+          <select id="saved_themes_select" style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+              <option value="">-- 选择已保存的自定义主题 --</option>
+          </select>
+          <button type="button" onclick="loadCustomTheme()" class="btn btn-purple">加载</button>
+          <button type="button" onclick="deleteCustomTheme()" class="btn btn-red">删除</button>
+      </div>
+      <textarea id="cfg_custom_css" rows="6" placeholder="body.theme6 { background: #000; } ..."></textarea>
+      <div style="display: flex; gap: 10px; margin-top: 15px;">
+          <input type="text" id="new_theme_name" placeholder="输入你想保存的主题名称..." style="flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+          <button type="button" onclick="saveCustomTheme()" class="btn btn-green">💾 另存为新主题</button>
+      </div>
+    </div>
+
+    <div class="form-group"><label>🧑‍💻 自定义 &lt;head&gt; 注入</label><textarea id="cfg_custom_head" rows="3" placeholder="&lt;link rel='stylesheet' href='...'&gt;"></textarea></div>
+    <div class="form-group"><label>🧑‍💻 自定义底部 Script 注入</label><textarea id="cfg_custom_script" rows="4" placeholder="&lt;script&gt;console.log('Hello');&lt;/script&gt;"></textarea></div>
+
+    <div class="form-group">
+      <label>🖼️ 自定义背景图片</label>
+      <div style="display:flex; gap:8px;">
+         <input type="text" id="cfg_custom_bg" placeholder="粘贴图片 URL 或 点击上传" style="flex:1;">
+         <input type="file" id="bg_file" accept="image/*" style="display:none;" onchange="uploadBg(this)">
+         <button class="btn btn-gray" onclick="document.getElementById('bg_file').click()">📁 本地上传</button>
+      </div>
+      <img id="bg_preview" style="max-height: 120px; margin-top: 10px; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); display: none; object-fit: cover;">
+      <span style="font-size:12px; color:#888; margin-top:5px;">* 建议使用 500KB 以下的图片。</span>
+    </div>
+    <div class="form-group"><label>前台看板标题</label><input type="text" id="cfg_site_title"></div>
+    <div class="form-group"><label>后台标签栏名称</label><input type="text" id="cfg_admin_title"></div>
+    <div class="form-group"><label>⏱️ Agent 上报间隔 (秒)</label><input type="number" id="cfg_report_interval" min="1" max="120" placeholder="默认 40 秒"></div>
+  </div>
+  <div>
+    <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #555;">👁️ 前台展示控制</label>
+    <div class="checkbox-group" style="background:#fefce8; padding:8px; border-radius:6px; border:1px solid #fef08a; margin-bottom:15px;"><input type="checkbox" id="cfg_auto_reset_traffic"><label for="cfg_auto_reset_traffic"><b>启用每月1号重置流量</b></label></div>
+    <div class="checkbox-group"><input type="checkbox" id="cfg_is_public"><label for="cfg_is_public"><b>公开访问</b></label></div>
+    <div class="checkbox-group"><input type="checkbox" id="cfg_show_price"><label for="cfg_show_price">在前台显示 <b>价格</b></label></div>
+    <div class="checkbox-group"><input type="checkbox" id="cfg_show_expire"><label for="cfg_show_expire">在前台显示 <b>到期时间</b></label></div>
+    <div class="checkbox-group"><input type="checkbox" id="cfg_show_bw"><label for="cfg_show_bw">在前台显示 <b>带宽徽章</b></label></div>
+    <div class="checkbox-group"><input type="checkbox" id="cfg_show_tf"><label for="cfg_show_tf">在前台显示 <b>流量配额徽章</b></label></div>
+    <hr style="margin: 15px 0; border: none; border-top: 1px dashed #ccc;">
+    <div class="checkbox-group"><input type="checkbox" id="cfg_show_asset"><label for="cfg_show_asset">在前台和卡片显示 <b>数字资产价值</b></label></div>
+    <div class="form-group" style="margin-left: 28px; margin-top: -5px; margin-bottom: 5px;"><label style="font-size: 12px;">资产货币展示单位</label><input type="text" id="cfg_asset_currency" style="width: 120px; padding: 6px;"></div>
+    <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
+    <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #e63946;">✈️ Telegram 离线告警设置</label>
+    <div class="form-group"><label>开启离线通知</label><select id="cfg_tg_notify"><option value="false">关闭告警</option><option value="true">开启告警</option></select></div>
+    <div class="form-group"><label>Bot Token</label><input type="text" id="cfg_tg_bot_token" placeholder="Bot Token"></div>
+    <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" placeholder="Chat ID"></div>
+    <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
+    <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #8b5cf6;">📡 三网延迟测试节点选择 (配置保存后生效)</label>
+    <div class="form-group"><label>电信 (CT)</label><select id="cfg_ping_node_ct"></select></div>
+    <div class="form-group"><label>联通 (CU)</label><select id="cfg_ping_node_cu"></select></div>
+    <div class="form-group"><label>移动 (CM)</label><select id="cfg_ping_node_cm"></select></div>
+  </div>
+</div>
+<button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
