@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>加载中...</title>
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  
+  <script>
+    // ⚠️ 核心：接收 Worker 注入的全局系统配置 JSON
+    window.SYS = {{SYS_JSON}};
+  </script>
+  
+  <style>
+    /* 注入主题及自定义 CSS */
+    {{THEME_STYLES}}
+    
+    /* 基础布局样式 */
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+    .admin-btn { padding: 8px 16px; background: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; font-weight:bold; }
+    .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; }
+    .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; }
+    .g-label { font-size: 13px; color: #666; }
+    
+    /* 区块链共识网络面板样式 */
+    .consensus-panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); padding: 15px 20px; border-radius: 12px; margin-bottom: 25px; font-family: monospace; box-sizing: border-box;}
+    .c-label { font-size: 12px; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
+    .c-val { font-size: 18px; font-weight: bold; color: #10b981; }
+    .ticker-bar { width: 100%; height: 4px; background: #e2e8f0; margin-top: 8px; border-radius: 2px; overflow: hidden; }
+    .ticker-fill { height: 100%; background: #10b981; transition: width 0.1s linear; }
+    
+    .asset-radar { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+    .asset-radar input { flex: 1; min-width: 250px; padding: 10px 15px; border: 1px solid #e2e8f0; border-radius: 8px; font-family: monospace; }
+    .asset-radar button { background: #8b5cf6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+    .block-dashboard-layout { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
+    .rich-list-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+    
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; }
+    .modal-content { background: white; padding: 20px; border-radius: 12px; width: 600px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; }
+  </style>
+</head>
+<body id="body-tag">
+  <div class="container" id="app-container">
+    <div class="header">
+      <h1 id="site-title" style="margin:0;"></h1>
+      <div style="display: flex; align-items: center; gap: 15px;">
+        <div class="view-controls">
+          <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">卡片</button>
+          <button class="toggle-btn" id="btn-table" onclick="switchView('table')">表格</button>
+          <button class="toggle-btn" id="btn-map" onclick="switchView('map')">地图</button>
+          <button class="toggle-btn" id="btn-block" onclick="switchView('block')">链上区块</button>
+        </div>
+        <a href="/admin" id="admin-link" class="admin-btn">后台管理</a>
+      </div>
+    </div>
+
+    <div class="consensus-panel" id="web3-dashboard">
+      <div><div class="c-label">最新区块高度 (已终局)</div><div class="c-val"># <span id="ui-height">--</span></div></div>
+      <div>
+        <div class="c-label">Slot 出块倒计时</div>
+        <div class="c-val"><span id="ui-ticker">10.0</span> s</div>
+        <div class="ticker-bar"><div class="ticker-fill" id="ui-ticker-bar"></div></div>
+      </div>
+      <div><div class="c-label">终局见证人</div><div class="c-val" style="font-size:13px;" id="ui-proposer">--</div></div>
+      <div><div class="c-label">信标 / 全网节点数</div><div class="c-val"><span id="ui-beacons">0</span> / <span id="ui-nodes">0</span></div></div>
+    </div>
+
+    <div class="global-stats" style="margin-bottom:15px;">
+      <div class="g-item">
+        <div class="g-label">全网综合排名 / 内存池待打包</div>
+        <div class="g-val">🏆 第 <a href="javascript:void(0)" onclick="document.getElementById('rankModal').style.display='block'" style="color:#f59e0b; text-decoration:underline; cursor:pointer;" id="ui-rank">--</a> 名 | <span style="color:#8b5cf6;" id="ui-pending-txs">0</span> 笔</div>
+      </div>
+      <div class="g-item">
+        <div class="g-label">全网探针总资产重力</div>
+        <div class="g-val">💰 <span id="ui-net-asset">0.00</span> CNY</div>
+      </div>
+    </div>
+
+    <div class="filter-bar" id="ajax-filters">
+        {{FILTER_TAGS}}
+    </div>
+    
+    <div class="global-stats" id="ajax-stats">
+        </div>
+
+    <div id="view-card" class="view-panel active">
+        <div id="ajax-cards">{{CARD_CONTENT}}</div>
+    </div>
+    
+    <div id="view-table" class="view-panel">
+        <div class="table-responsive">
+            <table class="custom-table">
+                <thead><tr><th>状态</th><th>节点名称</th><th>地区</th><th>系统</th><th>CPU</th><th>内存</th><th>磁盘</th><th>流量</th><th>下行</th><th>上行</th><th>更新</th></tr></thead>
+                <tbody id="ajax-table">{{TABLE_BODY}}</tbody>
+            </table>
+        </div>
+    </div>
+    
+    <div id="view-map" class="view-panel">
+        <div id="map-container"></div>
+    </div>
+    
+    <div id="view-block" class="view-panel">
+      <div class="asset-radar">
+          <input type="text" id="radar-input" placeholder="输入 EVM 钱包地址 (0x...)">
+          <button onclick="executeSearch()">🔍 查询资产</button>
+      </div>
+      <div id="ui-balance-result" style="display:none; padding:15px; margin-bottom:20px; background:rgba(16,185,129,0.1); border-radius:8px;"></div>
+      
+      <div class="block-dashboard-layout">
+          <div class="table-responsive" style="background:white; border-radius:12px; padding:10px;">
+              <table class="custom-table">
+                  <thead><tr><th>区块高度 (Slot)</th><th>出块见证人</th><th>区块哈希</th><th>总难度</th><th>交易数</th><th>时间</th></tr></thead>
+                  <tbody id="table-blocks-body">{{BLOCK_EXPLORER_ROWS}}</tbody>
+              </table>
+          </div>
+          <div class="rich-list-card">
+              <h3>🏆 Cycle 财富英雄榜</h3>
+              <table class="custom-table"><tbody id="ajax-richlist">{{RICH_LIST_ROWS}}</tbody></table>
+          </div>
+      </div>
+    </div>
+    
+    {{FOOTER_HTML}}
+  </div>
+
+  <div id="txTraceModal" class="modal">
+      <div class="modal-content">
+          <h3>🔗 区块交易流水</h3>
+          <div id="txTraceList" style="max-height:400px; overflow-y:auto; margin-bottom:15px;"></div>
+          <button class="btn btn-blue" onclick="document.getElementById('txTraceModal').style.display='none'">关闭</button>
+      </div>
+  </div>
+  
+  <div id="rankModal" class="modal">
+    <div class="modal-content" style="width: 800px; max-width: 95%;">
+      <h3 style="margin-top:0;">🏆 全网权重节点排名 (Beacon Nodes)</h3>
+      <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+        <table class="custom-table">
+          <thead><tr><th>排名</th><th>节点域名</th><th>探针数</th><th>资产重力(CNY)</th><th>Cycle 余额</th><th>最后活跃</th></tr></thead>
+          <tbody id="table-rank-body">{{RANK_TABLE_HTML}}</tbody>
+        </table>
+      </div>
+      <div style="text-align:right; margin-top:15px;">
+        <button class="btn btn-blue" onclick="document.getElementById('rankModal').style.display='none'">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <script>
+    // ---------------------------------------------
+    // 前端初始化逻辑
+    // ---------------------------------------------
+    document.addEventListener('DOMContentLoaded', () => {
+        const sys = window.SYS || {};
+        document.title = sys.site_title || 'Server Monitor Pro';
+        document.getElementById('site-title').innerText = sys.site_title || 'Server Monitor Pro';
+        document.getElementById('admin-link').innerText = sys.admin_title || '后台管理';
+        
+        // 挂载动态主题 CSS 类名
+        document.getElementById('body-tag').className = sys.theme || 'theme1';
+        
+        // 执行自定义脚本 (如果有)
+        if(sys.custom_head) {
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = sys.custom_head;
+            Array.from(tempDiv.childNodes).forEach(node => document.head.appendChild(node));
+        }
+    });
+
+    // ---------------------------------------------
+    // 区块链共识倒计时器
+    // ---------------------------------------------
+    const EPOCH_START = 1780320600000; 
+    const SLOT_TIME = 10000;
+    setInterval(() => {
+        const now = Date.now(); 
+        const elapsed = Math.max(0, now - EPOCH_START); 
+        const remMs = SLOT_TIME - (elapsed % SLOT_TIME);
+        document.getElementById('ui-ticker').innerText = (remMs / 1000).toFixed(1);
+        document.getElementById('ui-ticker-bar').style.width = (remMs / SLOT_TIME * 100) + '%';
+    }, 100);
+
+    // ---------------------------------------------
+    // 视图切换与过滤器逻辑
+    // ---------------------------------------------
+    let mapInitialized = false; 
+    window.currentFilter = 'all';
+
+    function switchView(viewName) {
+      document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active')); 
+      document.getElementById('btn-' + viewName).classList.add('active');
+      document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active')); 
+      document.getElementById('view-' + viewName).classList.add('active');
+      
+      if (viewName === 'map') { 
+          if (!mapInitialized) { initMap(); mapInitialized = true; } 
+          else { window.myMap.invalidateSize(); } 
+      }
+    }
+    
+    function setFilter(code) { 
+        window.currentFilter = code; 
+        applyFilter(); 
+    }
+    
+    function applyFilter() {
+        document.querySelectorAll('.vps-card').forEach(el => el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? 'flex' : 'none');
+        document.querySelectorAll('#ajax-table tr').forEach(el => el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? '' : 'none');
+        
+        // 更新 Filter 按钮状态
+        document.querySelectorAll('.filter-tag').forEach(tag => {
+            if(tag.dataset.code === window.currentFilter) tag.classList.add('active');
+            else tag.classList.remove('active');
+        });
+    }
+
+    // ---------------------------------------------
+    // 钱包查询与区块交互
+    // ---------------------------------------------
+    function searchBalance(addr) {
+        document.getElementById('radar-input').value = addr;
+        executeSearch();
+    }
+
+    async function executeSearch() {
+        const addr = document.getElementById('radar-input').value.trim(); if(!addr) return;
+        const resDiv = document.getElementById('ui-balance-result'); resDiv.style.display = 'block';
+        resDiv.innerHTML = "正在查询...";
+        try {
+            const res = await fetch('/?action=balance&address=' + addr + '&t=' + Date.now()); 
+            const data = await res.json();
+            resDiv.innerHTML = `账户地址 <b style="font-family:monospace;">${addr}</b> 持有资产：<b style="color:#10b981;">${data.balance.toFixed(2)} Cycle</b>`;
+        } catch(e) { resDiv.innerHTML = `❌ 查询失败，网络超时或地址无效`; }
+    }
+    
+    function showBlockTxs(txsStr) {
+        const txs = JSON.parse(txsStr); let html = '<ul style="list-style-type:none; padding:0;">';
+        txs.forEach(tx => { 
+            html += tx.type === 'COINBASE' 
+                ? `<li style="padding:10px; border-bottom:1px solid #eee;">⛏️ <b>挖矿奖励</b> &rarr; <span style="font-family:monospace; color:#3b82f6;">${tx.to}</span> <span style="color:#10b981; float:right;">+ ${tx.amount} Cycle</span></li>` 
+                : `<li style="padding:10px; border-bottom:1px solid #eee;">💸 <b>转账</b>: <span style="font-family:monospace; color:#8b5cf6;">${tx.from.substring(0,6)}...</span> &rarr; <span style="font-family:monospace; color:#3b82f6;">${tx.to.substring(0,6)}...</span> <span style="color:#ef4444; float:right;">- ${tx.amount} Cycle</span></li>`; 
+        });
+        document.getElementById('txTraceList').innerHTML = html + '</ul>'; 
+        document.getElementById('txTraceModal').style.display = 'block';
+    }
+
+    // ---------------------------------------------
+    // Leaflet.js 地图渲染逻辑
+    // ---------------------------------------------
+    let markersLayer; 
+    let geoJsonLayer; 
+    let worldGeoJson = null; 
+    let currentMapDataStr = "";
+    
+    const countryCoords = { 'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'SG': [1.35, 103.81], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 'NL': [52.13, 5.29], 'KR': [35.90, 127.76], 'AU': [-25.27, 133.77], 'FR': [46.22, 2.21], 'TW': [23.69, 120.96] };
+    
+    async function initMap() {
+      window.myMap = L.map('map-container', { attributionControl: false }).setView([30, 10], 2);
+      try { 
+          const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json'); 
+          worldGeoJson = await res.json(); 
+          drawMarkers(); 
+      } catch (e) { console.error("Map JSON Load Failed", e); }
+    }
+    
+    function drawMarkers() {
+      if(!window.myMap || !worldGeoJson) return; 
+      
+      const mapDataEl = document.getElementById('map-data');
+      if(!mapDataEl) return;
+      const newDataStr = mapDataEl.textContent; 
+      
+      if (currentMapDataStr === newDataStr) return; 
+      currentMapDataStr = newDataStr;
+      
+      if(geoJsonLayer) window.myMap.removeLayer(geoJsonLayer); 
+      if(markersLayer) markersLayer.clearLayers(); 
+      else markersLayer = L.layerGroup().addTo(window.myMap);
+      
+      try {
+          const data = JSON.parse(newDataStr);
+          geoJsonLayer = L.geoJSON(worldGeoJson, { style: function() { return { fillColor: '#d5dce2', weight: 1, color: '#ffffff' }; } }).addTo(window.myMap);
+          for (const [code, count] of Object.entries(data)) { 
+              if(countryCoords[code]) { 
+                  L.marker(countryCoords[code], {icon: L.divIcon({ className: 'custom-map-badge', html: `<div>${count}</div>` })}).addTo(markersLayer); 
+              } 
+          }
+      } catch(e) {}
+    }
+
+    // ---------------------------------------------
+    // AJAX 大盘无刷新数据热更新 (每15秒拉取)
+    // ---------------------------------------------
+    setInterval(async () => {
+      try {
+        const res = await fetch(location.href + (location.href.includes('?') ? '&' : '?') + 'ajax=1'); 
+        const htmlText = await res.text();
+        
+        // 使用 DOMParser 解析后端的片段代码
+        const parser = new DOMParser(); 
+        const newDoc = parser.parseFromString(htmlText, 'text/html');
+        
+        // 1. 更新顶部网络状态面板数据
+        const payloadData = newDoc.getElementById('ajax-stats-payload');
+        if (payloadData) {
+            document.getElementById('ui-rank').innerText = payloadData.getAttribute('data-rank'); 
+            document.getElementById('ui-net-asset').innerText = payloadData.getAttribute('data-net-asset'); 
+            document.getElementById('ui-proposer').innerText = payloadData.getAttribute('data-proposer'); 
+            document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height'); 
+            document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons'); 
+            document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes'); 
+            document.getElementById('ui-pending-txs').innerText = payloadData.getAttribute('data-pending-txs');
+        }
+        
+        // 2. 更新页面主体组件
+        const componentsToUpdate = [
+            { sourceId: 'ajax-stats', targetId: 'ajax-stats' },
+            { sourceId: 'ajax-cards', targetId: 'ajax-cards' },
+            { sourceId: 'ajax-table', targetId: 'ajax-table' },
+            { sourceId: 'ajax-blocks', targetId: 'table-blocks-body' },
+            { sourceId: 'ajax-filters', targetId: 'ajax-filters' },
+            { sourceId: 'map-data', targetId: 'map-data' },
+            { sourceId: 'ajax-richlist', targetId: 'ajax-richlist' },
+            { sourceId: 'ajax-ranklist', targetId: 'table-rank-body' }
+        ];
+
+        componentsToUpdate.forEach(comp => {
+            const newEl = newDoc.getElementById(comp.sourceId);
+            const targetEl = document.getElementById(comp.targetId);
+            if (newEl && targetEl) { 
+                if (comp.targetId === 'map-data') {
+                    targetEl.textContent = newEl.textContent; 
+                } else {
+                    targetEl.innerHTML = newEl.innerHTML; 
+                }
+            }
+        });
+        
+        // 3. 重新应用渲染副作用
+        drawMarkers(); 
+        applyFilter(); 
+      } catch (e) {
+          console.error("AJAX Update Failed", e);
+      }
+    }, 15000); 
+  </script>
+</body>
+</html>
