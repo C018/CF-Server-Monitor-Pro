@@ -2,6 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const host = url.origin;
+    const myDomain = url.hostname;
 
     // ==========================================
     // 0. 数据库自动化热创建与无缝升级 (Auto Migration)
@@ -22,6 +23,17 @@ export default {
           )
         `).run();
 
+        // 引入 Gossip 网络节点注册表
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS peers (
+            domain TEXT PRIMARY KEY,
+            server_count INTEGER DEFAULT 0,
+            total_asset REAL DEFAULT 0,
+            version INTEGER DEFAULT 0,
+            last_seen INTEGER DEFAULT 0
+          )
+        `).run();
+
         const { results: columns } = await env.DB.prepare(`PRAGMA table_info(servers)`).all();
         const existingCols = columns.map(c => c.name);
         
@@ -38,6 +50,18 @@ export default {
           if (!existingCols.includes(colName)) {
             await env.DB.prepare(`ALTER TABLE servers ADD COLUMN ${colName} ${colDef}`).run();
           }
+        }
+
+        // 首次部署自动拉取 Github JSON 到数据库缓存中
+        const checkNodes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cached_nodes_data'").first();
+        if (!checkNodes) {
+           try {
+               const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
+               if (res.ok) {
+                   const dataText = await res.text();
+                   await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run();
+               }
+           } catch(e) { console.error("Fetch nodes JSON failed:", e); }
         }
         
         globalThis.dbInitialized = true;
@@ -86,10 +110,8 @@ export default {
       show_expire: 'true',
       show_bw: 'true',
       show_tf: 'true',
-      show_asset: 'false',
       asset_currency: '元',
-      enable_ranking: 'false',
-      ranking_api: '',
+      seed_nodes: '',
       tg_notify: 'false',
       tg_bot_token: '',
       tg_chat_id: '',
@@ -106,6 +128,24 @@ export default {
         results.forEach(r => sys[r.key] = r.value);
       }
     } catch (e) {}
+
+    // 解析缓存的节点 JSON，提取测速节点和默认种子节点
+    let cachedNodes = null;
+    try {
+        if (sys.cached_nodes_data) {
+            cachedNodes = JSON.parse(sys.cached_nodes_data);
+        }
+    } catch(e) {}
+    
+    let defaultPeersStr = 'tanzhen.kejikkk.com';
+    if (cachedNodes && Array.isArray(cachedNodes.peers)) {
+        defaultPeersStr = cachedNodes.peers.map(p => p.replace('https://','').replace('http://','').replace(/\/$/,'')).join(',');
+    }
+    if (!sys.seed_nodes) sys.seed_nodes = defaultPeersStr;
+
+    // 强制锁死核心去中心化功能 (覆盖数据库读取)
+    sys.show_asset = 'true';
+    sys.enable_ranking = 'true';
 
     // ==========================================
     // Telegram 离线检测与通知机制
@@ -159,7 +199,7 @@ export default {
             <span style="margin-right: 15px;">👁️ 历史总访问：<b style="color: #3b82f6;">${sys.visits_total || 0}</b> 次</span>
             <span>🔥 今日访问：<b style="color: #10b981;">${sys.visits_today || 0}</b> 次</span>
         </div>
-        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro</a> | 
+        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a> | 
         <a href="https://www.youtube.com/@%E7%A7%91%E6%8A%80KKK" target="_blank" style="color: #ef4444; text-decoration: none; font-weight: 600;">▶️ 小K分享频道</a>
       </div>
     `;
@@ -267,7 +307,83 @@ export default {
       
       .stat-bar { width: 100%; height: 4px; background: #e5e7eb; border-radius: 2px; overflow: hidden; }
       .stat-bar > div { height: 100%; border-radius: 2px; transition: width 0.3s; }
+
+      /* 上下两行自适应 Grid CSS */
+      .global-stats { display: flex; flex-direction: column; gap: 15px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; }
+      .stats-row { display: flex; justify-content: center; width: 100%; align-items: center; }
+      .stats-row.bottom-row { border-top: 1px dashed rgba(150,150,150,0.2); padding-top: 15px; }
+      .stats-row .g-item { flex: 1; border-right: 1px dashed rgba(150,150,150,0.2); min-width: 0; box-sizing: border-box; position: relative; padding: 0 10px; }
+      .stats-row .g-item:last-child { border-right: none; }
+      .theme2 .stats-row .g-item, .theme5 .stats-row .g-item, .theme2 .stats-row.bottom-row, .theme5 .stats-row.bottom-row { border-color: rgba(255,255,255,0.1); }
+      @media (max-width: 768px) { .stats-row { flex-direction: column; gap: 15px; } .stats-row.bottom-row { border-top: none; padding-top: 0; } .stats-row .g-item { border-right: none !important; border-bottom: 1px dashed rgba(150,150,150,0.2); padding-bottom: 15px; } .stats-row .g-item:last-child { border-bottom: none; padding-bottom: 0; } }
     `;
+
+    // ==========================================
+    // 去中心化 API 接口：接收 Gossip 同步数据 (/api/gossip)
+    // ==========================================
+    if (request.method === 'POST' && url.pathname === '/api/gossip') {
+      try {
+        const payload = await request.json();
+        if (!payload.domain || !payload.version) return new Response('Bad Request', {status: 400});
+        
+        await env.DB.prepare(`
+          INSERT INTO peers (domain, server_count, total_asset, version, last_seen)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(domain) DO UPDATE SET
+            server_count = excluded.server_count,
+            total_asset = excluded.total_asset,
+            version = excluded.version,
+            last_seen = excluded.last_seen
+          WHERE excluded.version > peers.version
+        `).bind(payload.domain, payload.server_count || 0, payload.total_asset || 0, payload.version, Date.now()).run();
+
+        if (Array.isArray(payload.known_peers)) {
+            for (const peerDomain of payload.known_peers.slice(0, 10)) {
+                if (peerDomain !== myDomain) {
+                     await env.DB.prepare('INSERT OR IGNORE INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, 0, 0, 0, 0)').bind(peerDomain).run();
+                }
+            }
+        }
+        return new Response('Gossip Synced', {status: 200});
+      } catch (e) {
+        return new Response('Gossip Error', {status: 500});
+      }
+    }
+
+    // ==========================================
+    // 内部排行 API (/api/rank) 供前端异步调用
+    // ==========================================
+    if (request.method === 'GET' && url.pathname === '/api/rank') {
+      try {
+        const { results: rankData } = await env.DB.prepare('SELECT domain, server_count as servers, total_asset as assets FROM peers ORDER BY total_asset DESC, server_count DESC LIMIT 100').all();
+        
+        let asset_rank = 0;
+        let server_rank = 0;
+        let global_servers = 0;
+        let global_assets = 0;
+        
+        rankData.forEach(r => {
+            global_servers += parseInt(r.servers) || 0;
+            global_assets += parseFloat(r.assets) || 0;
+        });
+
+        const sortedByAsset = [...rankData].sort((a,b) => b.assets - a.assets);
+        const sortedByServer = [...rankData].sort((a,b) => b.servers - a.servers);
+        
+        asset_rank = sortedByAsset.findIndex(r => r.domain === myDomain) + 1;
+        server_rank = sortedByServer.findIndex(r => r.domain === myDomain) + 1;
+        
+        return new Response(JSON.stringify({ 
+            list: rankData, 
+            server_rank: server_rank > 0 ? server_rank : '-', 
+            asset_rank: asset_rank > 0 ? asset_rank : '-',
+            global_servers: global_servers,
+            global_assets: global_assets
+        }), { headers: { 'Content-Type': 'application/json' } });
+      } catch(e) {
+        return new Response(JSON.stringify({error: true}), { status: 500 });
+      }
+    }
 
     // ==========================================
     // 后台管理 API (/admin/api)
@@ -347,16 +463,10 @@ export default {
       }
 
       let pingOpts = { ct: [], cu: [], cm: [] };
-      try {
-        const nodesRes = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
-        if (nodesRes.ok) {
-          const nodesData = await nodesRes.json();
-          if (nodesData.ct) pingOpts.ct = nodesData.ct;
-          if (nodesData.cu) pingOpts.cu = nodesData.cu;
-          if (nodesData.cm) pingOpts.cm = nodesData.cm;
-        }
-      } catch (e) {
-        console.error('动态拉取节点 JSON 失败:', e);
+      if (cachedNodes) {
+          if (cachedNodes.ct) pingOpts.ct = cachedNodes.ct;
+          if (cachedNodes.cu) pingOpts.cu = cachedNodes.cu;
+          if (cachedNodes.cm) pingOpts.cm = cachedNodes.cm;
       }
 
       const buildOpts = (group, selectedVal) => {
@@ -481,8 +591,8 @@ export default {
 
               <hr style="margin: 15px 0; border: none; border-top: 1px dashed #ccc;">
               <div class="checkbox-group">
-                <input type="checkbox" id="cfg_show_asset" ${sys.show_asset === 'true' ? 'checked' : ''}>
-                <label for="cfg_show_asset">在前台和卡片显示 <b>数字资产价值</b> (总价与剩余价值，强制换算为CNY)</label>
+                <input type="checkbox" id="cfg_show_asset" checked disabled>
+                <label for="cfg_show_asset">在前台和卡片显示 <b>数字资产价值</b></label>
               </div>
               <div class="form-group" style="margin-left: 28px; margin-top: -5px; margin-bottom: 5px;">
                 <label style="font-size: 12px;">资产货币展示单位 (默认：元)</label>
@@ -490,13 +600,13 @@ export default {
               </div>
               
               <div class="checkbox-group" style="margin-top: 10px;">
-                <input type="checkbox" id="cfg_enable_ranking" onchange="toggleRankingApi()" ${sys.enable_ranking === 'true' ? 'checked' : ''}>
-                <label for="cfg_enable_ranking">开启前台 <b>全网排名 UI 组件</b></label>
+                <input type="checkbox" id="cfg_enable_ranking" checked disabled>
+                <label for="cfg_enable_ranking">开启去中心化 <b>全网排行榜 (Gossip Protocol)</b></label>
               </div>
-              <div class="form-group" id="ranking_api_group" style="display: ${sys.enable_ranking === 'true' ? 'block' : 'none'}; margin-left: 28px; margin-top: -5px; margin-bottom: 15px;">
-                <label style="font-size: 12px;">排行聚合中心 API 地址 (留空则仅展示本地排名)</label>
-                <input type="text" id="cfg_ranking_api" value="${sys.ranking_api || ''}" placeholder="如: https://api.yoursite.com/rank" style="width: 250px; padding: 6px;">
-                <span style="font-size:12px; color:#888;">* Worker 彼此物理隔离，真正的全网排名必须依赖中心化 KV 汇总 API。填写 API 接入互联，留空则展示当前实例本地总额。</span>
+              <div class="form-group" id="ranking_api_group" style="display: block; margin-left: 28px; margin-top: -5px; margin-bottom: 15px;">
+                <label style="font-size: 12px; color:#f59e0b;">Gossip 初始种子节点 (多域名以逗号分隔)</label>
+                <input type="text" id="cfg_seed_nodes" value="${sys.seed_nodes}" placeholder="如: tanzhen.kejikkk.com" style="width: 250px; padding: 6px;">
+                <span style="font-size:12px; color:#888;">* 默认为极客分享官方节点。新部署的探针通过它来联络其他探针，裂变出整个去中心化网络。</span>
               </div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
@@ -530,8 +640,6 @@ export default {
               <div class="form-group">
                 <label>移动 (CM) 测速节点</label>
                 <select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select>
-                <span style="font-size:12px; color:#ef4444; margin-top:5px; display:block; font-weight:bold;">* 注意：如果 VPS 的 IPv4 被墙（或网络不通），三网延迟会直接超时，显示为 2000ms（或 2001ms）。</span>
-                <span style="font-size:12px; color:#888; margin-top:5px; display:block;">* 提示：修改节点或上报间隔后无需重启或重装，探针会在下一次心跳自动热更新配置。节点列表由 JSON 动态获取。</span>
               </div>
 
             </div>
@@ -591,7 +699,7 @@ export default {
             document.getElementById('custom_css_group').style.display = theme === 'theme6' ? 'flex' : 'none';
           }
           function toggleRankingApi() {
-            document.getElementById('ranking_api_group').style.display = document.getElementById('cfg_enable_ranking').checked ? 'block' : 'none';
+            // Already forced on, no action needed for this UI
           }
 
           function uploadBg(input) {
@@ -626,10 +734,10 @@ export default {
                 show_expire: document.getElementById('cfg_show_expire').checked ? 'true' : 'false',
                 show_bw: document.getElementById('cfg_show_bw').checked ? 'true' : 'false',
                 show_tf: document.getElementById('cfg_show_tf').checked ? 'true' : 'false',
-                show_asset: document.getElementById('cfg_show_asset').checked ? 'true' : 'false',
+                show_asset: 'true',
                 asset_currency: document.getElementById('cfg_asset_currency').value || '元',
-                enable_ranking: document.getElementById('cfg_enable_ranking').checked ? 'true' : 'false',
-                ranking_api: document.getElementById('cfg_ranking_api').value,
+                enable_ranking: 'true',
+                seed_nodes: document.getElementById('cfg_seed_nodes').value,
                 tg_notify: document.getElementById('cfg_tg_notify').value,
                 tg_bot_token: document.getElementById('cfg_tg_bot_token').value,
                 tg_chat_id: document.getElementById('cfg_tg_chat_id').value,
@@ -1047,364 +1155,168 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
     }
 
     // ==========================================
-    // 单个服务器详情 JSON API
+    // 大盘主程序、聚合渲染及 Gossip 路由分发
     // ==========================================
-    if (request.method === 'GET' && url.pathname === '/api/server') {
-      if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
-      
-      const id = url.searchParams.get('id');
-      if (!id) return new Response('Miss ID', { status: 400 });
-      const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
-      if (!server || server.is_hidden === 'true') return new Response('Not Found', { status: 404 });
-      return new Response(JSON.stringify(server), { headers: { 'Content-Type': 'application/json' } });
+    let { results } = await env.DB.prepare('SELECT * FROM servers').all();
+    results = results.filter(s => s.is_hidden !== 'true');
+
+    const now = Date.now();
+    let globalOnline = 0; let globalOffline = 0;
+    let globalSpeedIn = 0; let globalSpeedOut = 0;
+    let globalNetTx = 0; let globalNetRx = 0;
+    let totalAsset = 0; let remAsset = 0;
+    const groups = {};
+    const countryStats = {}; 
+
+    if (results && results.length > 0) {
+      for (const server of results) {
+        const isOnline = (now - server.last_updated) < 30000;
+        if (isOnline) {
+          globalOnline++;
+          globalSpeedIn += parseFloat(server.net_in_speed) || 0;
+          globalSpeedOut += parseFloat(server.net_out_speed) || 0;
+        } else { globalOffline++; }
+        
+        const rx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0);
+        const tx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0);
+        globalNetTx += tx_val; globalNetRx += rx_val;
+
+        // 资产转换
+        let amount = 0; let remValue = 0;
+        if (server.price && server.price.match(/[\d.]+/)) {
+            let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
+            let rate = 1;
+            const pUpper = server.price.toUpperCase();
+            if (pUpper.includes('USD') || pUpper.includes('$')) rate = 7.23;
+            else if (pUpper.includes('EUR') || pUpper.includes('€')) rate = 7.85;
+            else if (pUpper.includes('GBP') || pUpper.includes('£')) rate = 9.12;
+            else if (pUpper.includes('HKD')) rate = 0.92;
+            else if (pUpper.includes('JPY')) rate = 0.048;
+            else if (pUpper.includes('TWD')) rate = 0.22;
+            else if (pUpper.includes('RUB')) rate = 0.078;
+            else if (pUpper.includes('CAD')) rate = 5.25;
+            else if (pUpper.includes('AUD')) rate = 4.75;
+            amount = rawAmount * rate;
+            
+            let cycleDays = 365;
+            const priceStr = server.price.toLowerCase();
+            if (priceStr.includes('月') || priceStr.includes('mo') || priceStr.includes('month')) cycleDays = 30;
+            else if (priceStr.includes('季') || priceStr.includes('qu')) cycleDays = 90;
+            else if (priceStr.includes('半年') || priceStr.includes('half')) cycleDays = 180;
+            else if (priceStr.includes('天') || priceStr.includes('day')) cycleDays = 1;
+            
+            let expDays = -1;
+            if (server.expire_date) {
+                const expTime = new Date(server.expire_date).getTime();
+                if (!isNaN(expTime)) {
+                    const diff = expTime - now;
+                    expDays = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) : 0;
+                }
+            }
+            remValue = expDays === -1 ? amount : (amount / cycleDays) * expDays;
+        }
+        totalAsset += amount; remAsset += remValue;
+        server._remValue = remValue; server._amount = amount;
+
+        const grpName = server.server_group || '默认分组';
+        if (!groups[grpName]) groups[grpName] = [];
+        groups[grpName].push(server);
+
+        let cCodeMap = (server.country || 'xx').toUpperCase();
+        if (cCodeMap === 'TW') cCodeMap = 'CN';
+        if (cCodeMap !== 'XX') countryStats[cCodeMap] = (countryStats[cCodeMap] || 0) + 1;
+      }
     }
 
-    // ==========================================
-    // 前台探针首页 & 详情页 (/ )
-    // ==========================================
     if (request.method === 'GET' && url.pathname === '/') {
-      if (sys.is_public !== 'true' && !checkAuth(request)) {
-        return authResponse(sys.site_title);
-      }
+      if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
 
       const isAjax = url.searchParams.get('ajax') === '1';
+      
       if (!isAjax) {
+        // 访问量统计
         const nowTime = new Date();
         const tzOffset = 8 * 60 * 60000; 
         const localNow = new Date(nowTime.getTime() + tzOffset);
         const todayStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}-${localNow.getDate()}`;
         
-        let vTotal = parseInt(sys.visits_total || '0');
+        let vTotal = parseInt(sys.visits_total || '0') + 1;
         let vToday = parseInt(sys.visits_today || '0');
         let vDate = sys.visits_date || '';
-        
-        vTotal++;
-        if (vDate !== todayStr) {
-            vToday = 1; 
-            vDate = todayStr;
-        } else {
-            vToday++;
-        }
+        if (vDate !== todayStr) { vToday = 1; vDate = todayStr; } else { vToday++; }
         
         sys.visits_total = vTotal.toString();
         sys.visits_today = vToday.toString();
         sys.visits_date = todayStr;
 
-        const updateVisits = async () => {
-            try {
-                await env.DB.prepare(`
-                    INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                `).bind(vTotal.toString(), vToday.toString(), todayStr).run();
-            } catch(e) {}
+        ctx.waitUntil(env.DB.prepare(`
+            INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `).bind(vTotal.toString(), vToday.toString(), todayStr).run());
+
+        // ==========================================
+        // 核心 Gossip 后台触发机制
+        // ==========================================
+        const runGossip = async () => {
+           const nowMs = Date.now();
+           let seedList = sys.seed_nodes ? sys.seed_nodes.split(',').map(s => s.trim()).filter(s => s) : [defaultPeersStr];
+           
+           // 获取本地已知节点去分享
+           let { results: dbPeers } = await env.DB.prepare('SELECT domain FROM peers WHERE domain != ? ORDER BY RANDOM() LIMIT 3').bind(myDomain).all();
+           let targetDomains = dbPeers.map(p => p.domain);
+           
+           // 如果当前孤岛找不到别人，启用种子节点强行连接
+           if (targetDomains.length === 0) targetDomains = seedList;
+           
+           // 准备全网已知的通讯录 (告诉别人我认识哪些人)
+           const { results: allPeers } = await env.DB.prepare('SELECT domain FROM peers ORDER BY RANDOM() LIMIT 10').all();
+           const known_peers = allPeers.map(p => p.domain);
+           
+           const payload = {
+               domain: myDomain,
+               server_count: results.length,
+               total_asset: totalAsset,
+               version: nowMs,
+               known_peers: known_peers
+           };
+           
+           for (const peer of targetDomains) {
+               if (peer === myDomain) continue;
+               try {
+                   await fetch(`https://${peer}/api/gossip`, {
+                       method: 'POST',
+                       body: JSON.stringify(payload),
+                       headers: {'Content-Type': 'application/json'},
+                       cf: { cacheTtl: 0 }
+                   });
+               } catch(e) {} // 如果别人挂了，Gossip 容错跳过
+           }
+           
+           // 更新自身的数据，防止被遗忘
+           await env.DB.prepare(`
+              INSERT INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, ?, ?, ?, ?) 
+              ON CONFLICT(domain) DO UPDATE SET server_count=excluded.server_count, total_asset=excluded.total_asset, version=excluded.version, last_seen=excluded.last_seen
+           `).bind(myDomain, results.length, totalAsset, nowMs, nowMs).run();
         };
-        ctx.waitUntil(updateVisits());
+        ctx.waitUntil(runGossip());
       }
       
-      const viewId = url.searchParams.get('id');
-
-      if (viewId) {
-        // ... (保持详情页代码不变，已在上面的原始代码中)
-        const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(viewId).first();
-        if (!server || server.is_hidden === 'true') return new Response('Server not found', { status: 404 });
-        
-        const rxField = sys.auto_reset_traffic === 'true' ? 'monthly_rx' : 'net_rx';
-        const txField = sys.auto_reset_traffic === 'true' ? 'monthly_tx' : 'net_tx';
-
-        const detailHtml = `<!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>${server.name} - ${sys.site_title}</title>
-          <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-          ${sys.custom_head || ''}
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f9fafb; color: #333; margin: 0; padding: 20px; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            .header-card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }
-            .title-row { display: flex; align-items: center; margin-bottom: 16px; }
-            .title-row h2 { margin: 0; font-size: 24px; margin-right: 12px; display: flex; align-items: center;}
-            .status-badge { background: #10b981; color: white; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-            .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; font-size: 14px; }
-            .info-item { display: flex; flex-direction: column; }
-            .info-label { color: #6b7280; font-size: 12px; margin-bottom: 4px; white-space: nowrap; }
-            .info-value { font-weight: 500; }
-            .charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; }
-            .chart-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-            .chart-card h3 { margin-top: 0; font-size: 16px; color: #374151; display: flex; justify-content: space-between; align-items: center; }
-            .chart-val { font-size: 18px; font-weight: bold; }
-            canvas { max-height: 150px; }
-            .back-btn { display: inline-block; margin-bottom: 15px; color: #3b82f6; text-decoration: none; font-weight: 500; }
-            ${themeStyles}
-          </style>
-        </head>
-        <body class="${sys.theme || 'theme1'}">
-          <div class="container">
-            <a href="/" class="back-btn">⬅ 返回大盘</a>
-            <div class="header-card">
-              <div class="title-row">
-                <h2><span id="head-flag"></span> ${server.name}</h2>
-                <span class="status-badge" id="head-status">在线</span>
-              </div>
-              <div class="info-grid">
-                <div class="info-item"><span class="info-label">运行时间</span><span class="info-value" id="val-uptime">...</span></div>
-                <div class="info-item"><span class="info-label">架构</span><span class="info-value" id="val-arch">...</span></div>
-                <div class="info-item"><span class="info-label">系统</span><span class="info-value" id="val-os">...</span></div>
-                <div class="info-item"><span class="info-label">虚拟化</span><span class="info-value" id="val-virt">...</span></div>
-                <div class="info-item"><span class="info-label">CPU</span><span class="info-value" id="val-cpuinfo">...</span></div>
-                <div class="info-item"><span class="info-label">Load</span><span class="info-value" id="val-load">...</span></div>
-                <div class="info-item"><span class="info-label">上传 / 下载</span><span class="info-value" id="val-traffic">...</span></div>
-                <div class="info-item"><span class="info-label">启动时间</span><span class="info-value" id="val-boot">...</span></div>
-              </div>
-            </div>
-            <div class="charts-grid">
-              <div class="chart-card"><h3>CPU <span class="chart-val" id="text-cpu">0%</span></h3><canvas id="chartCPU"></canvas></div>
-              <div class="chart-card"><h3>内存 <span class="chart-val" id="text-ram">0%</span></h3><div style="font-size:12px; color:#6b7280; margin-bottom:5px;" id="text-swap">Swap: 0 / 0</div><canvas id="chartRAM"></canvas></div>
-              <div class="chart-card"><h3>磁盘 <span class="chart-val" id="text-disk">0%</span></h3><div style="width:100%; height:20px; background:#e5e7eb; border-radius:10px; overflow:hidden; margin-top:40px;"><div id="disk-bar" style="height:100%; width:0%; background:#34d399; transition:width 0.5s;"></div></div><p style="text-align:right; font-size:12px; color:#6b7280; margin-top:8px;" id="text-disk-detail">0 / 0</p></div>
-              <div class="chart-card"><h3>进程数 <span class="chart-val" id="text-proc">0</span></h3><canvas id="chartProc"></canvas></div>
-              <div class="chart-card"><h3>网络速度 <span class="chart-val" style="font-size:14px;"><span style="color:#10b981">↓</span> <span id="text-net-in">0</span> | <span style="color:#3b82f6">↑</span> <span id="text-net-out">0</span></span></h3><canvas id="chartNet"></canvas></div>
-              <div class="chart-card"><h3>TCP / UDP <span class="chart-val" style="font-size:14px;">TCP <span id="text-tcp">0</span> | UDP <span id="text-udp">0</span></span></h3><canvas id="chartConn"></canvas></div>
-              
-              <div class="chart-card chart-full">
-                <h3>国内延迟追踪 (24小时) <span class="chart-val" style="font-size:12px; font-weight:normal;">电信 <b id="t-ct">0</b> | 联通 <b id="t-cu">0</b> | 移动 <b id="t-cm">0</b> | 字节 <b id="t-bd">0</b></span></h3>
-                <canvas id="chartPing"></canvas>
-              </div>
-            </div>
-            ${getFooterHtml(sys)}
-          </div>
-          <script>
-            const serverId = "${viewId}";
-            const formatBytes = (bytes) => { const b = parseInt(bytes); if (isNaN(b) || b === 0) return '0 B'; const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]; };
-            
-            const commonOptions = { 
-              responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, 
-              scales: { x: { display: false }, y: { beginAtZero: true, border: { display: false } } }, 
-              plugins: { legend: { display: false }, tooltip: { enabled: false } }, 
-              elements: { point: { radius: 0 }, line: { tension: 0.4, borderWidth: 2 } } 
-            };
-            
-            const createChart = (ctxId, color, bgColor) => { 
-                const ctx = document.getElementById(ctxId).getContext('2d'); 
-                return new Chart(ctx, { 
-                    type: 'line', 
-                    data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: bgColor, fill: true }] }, 
-                    options: commonOptions 
-                }); 
-            };
-            
-            const charts = { 
-                cpu: createChart('chartCPU', '#3b82f6', 'rgba(59, 130, 246, 0.1)'), 
-                ram: createChart('chartRAM', '#8b5cf6', 'rgba(139, 92, 246, 0.1)'), 
-                proc: createChart('chartProc', '#ec4899', 'rgba(236, 72, 153, 0.1)') 
-            };
-            
-            charts.net = new Chart(document.getElementById('chartNet').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: 'In', data: [], borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: 0 }, 
-                    { label: 'Out', data: [], borderColor: '#3b82f6', borderWidth: 2, tension: 0.4, pointRadius: 0 } 
-                ]}, options: commonOptions 
-            });
-            
-            charts.conn = new Chart(document.getElementById('chartConn').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: 'TCP', data: [], borderColor: '#6366f1', borderWidth: 2, tension: 0.4, pointRadius: 0 }, 
-                    { label: 'UDP', data: [], borderColor: '#d946ef', borderWidth: 2, tension: 0.4, pointRadius: 0 } 
-                ]}, options: commonOptions 
-            });
-            
-            const pingOptions = { 
-                responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, 
-                scales: { x: { display: true, ticks: { maxTicksLimit: 15, color: '#9ca3af', font: { size: 10 } } }, y: { beginAtZero: true, border: { display: false } } }, 
-                plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { enabled: true, mode: 'index', intersect: false } }, 
-                elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 }, line: { tension: 0.3, borderWidth: 2 } } 
-            };
-            
-            charts.ping = new Chart(document.getElementById('chartPing').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: '电信', data: [], borderColor: '#10b981', backgroundColor: 'transparent' }, 
-                    { label: '联通', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent' }, 
-                    { label: '移动', data: [], borderColor: '#3b82f6', backgroundColor: 'transparent' }, 
-                    { label: '字节', data: [], borderColor: '#8b5cf6', backgroundColor: 'transparent' } 
-                ] }, 
-                options: pingOptions 
-            });
-
-            async function fetchData() {
-              try {
-                const res = await fetch('/api/server?id=' + serverId); const data = await res.json();
-                const cCode = (data.country || 'xx').toLowerCase();
-                document.getElementById('head-flag').innerHTML = cCode !== 'xx' ? \`<img src="https://flagcdn.com/24x18/\${cCode}.png" alt="\${cCode}" style="vertical-align: middle; margin-right: 8px; border-radius: 2px;">\` : '🏳️ ';
-                document.getElementById('val-uptime').innerText = data.uptime || 'N/A'; document.getElementById('val-arch').innerText = data.arch || 'N/A'; document.getElementById('val-os').innerText = data.os || 'N/A'; document.getElementById('val-virt').innerText = data.virt || 'N/A'; document.getElementById('val-cpuinfo').innerText = data.cpu_info || 'N/A'; document.getElementById('val-load').innerText = data.load_avg || '0.00'; document.getElementById('val-boot').innerText = data.boot_time || 'N/A'; 
-                document.getElementById('val-traffic').innerText = formatBytes(data.${txField} || 0) + ' / ' + formatBytes(data.${rxField} || 0);
-
-                const isOnline = (Date.now() - data.last_updated) < 30000;
-                const badge = document.getElementById('head-status'); badge.innerText = isOnline ? '在线' : '离线'; badge.style.background = isOnline ? '#10b981' : '#ef4444';
-                if(!isOnline) return;
-                
-                document.getElementById('text-cpu').innerText = data.cpu + '%'; document.getElementById('text-ram').innerText = data.ram + '%'; document.getElementById('text-swap').innerText = 'Swap: ' + data.swap_used + ' MiB / ' + data.swap_total + ' MiB'; document.getElementById('text-proc').innerText = data.processes || '0'; document.getElementById('text-net-in').innerText = formatBytes(data.net_in_speed) + '/s'; document.getElementById('text-net-out').innerText = formatBytes(data.net_out_speed) + '/s'; document.getElementById('text-tcp').innerText = data.tcp_conn || '0'; document.getElementById('text-udp').innerText = data.udp_conn || '0';
-                let diskTotal = parseFloat(data.disk_total) || 0; let diskUsed = parseFloat(data.disk_used) || 0; let diskPct = parseInt(data.disk) || 0;
-                document.getElementById('text-disk').innerText = diskPct + '%'; document.getElementById('disk-bar').style.width = diskPct + '%'; document.getElementById('text-disk-detail').innerText = (diskUsed/1024).toFixed(2) + ' GiB / ' + (diskTotal/1024).toFixed(2) + ' GiB';
-                document.getElementById('t-ct').innerText = data.ping_ct + 'ms'; document.getElementById('t-cu').innerText = data.ping_cu + 'ms'; document.getElementById('t-cm').innerText = data.ping_cm + 'ms'; document.getElementById('t-bd').innerText = data.ping_bd + 'ms';
-
-                let hist = {};
-                try { if(data.history) hist = JSON.parse(data.history); } catch(e) {}
-                
-                if (hist.time && hist.time.length > 0) {
-                    const nowTime = new Date(); 
-                    const timeLabel = nowTime.getHours().toString().padStart(2, '0') + ':' + String(nowTime.getMinutes()).padStart(2, '0');
-                    const rtLabels = [...hist.time, timeLabel];
-
-                    const updateChartSync = (chart, histArray, rtValue) => {
-                        chart.data.labels = rtLabels;
-                        chart.data.datasets[0].data = histArray ? [...histArray, rtValue] : [];
-                        chart.update('none');
-                    };
-
-                    const updateMultiChartSync = (chart, histArrays, rtValues) => {
-                        chart.data.labels = rtLabels;
-                        histArrays.forEach((hArr, i) => {
-                            chart.data.datasets[i].data = hArr ? [...hArr, rtValues[i]] : [];
-                        });
-                        chart.update('none');
-                    };
-
-                    updateChartSync(charts.cpu, hist.cpu, parseFloat(data.cpu) || 0);
-                    updateChartSync(charts.ram, hist.ram, parseFloat(data.ram) || 0);
-                    updateChartSync(charts.proc, hist.proc, parseInt(data.processes) || 0);
-
-                    updateMultiChartSync(charts.net, [hist.net_in, hist.net_out], [parseFloat(data.net_in_speed) || 0, parseFloat(data.net_out_speed) || 0]);
-                    updateMultiChartSync(charts.conn, [hist.tcp, hist.udp], [parseInt(data.tcp_conn) || 0, parseInt(data.udp_conn) || 0]);
-                    updateMultiChartSync(charts.ping, [hist.ping_ct, hist.ping_cu, hist.ping_cm, hist.ping_bd], [parseInt(data.ping_ct) || 0, parseInt(data.ping_cu) || 0, parseInt(data.ping_cm) || 0, parseInt(data.ping_bd) || 0]);
-                }
-              } catch (e) {}
-            }
-            setInterval(fetchData, 3000); fetchData();
-          </script>
-          ${sys.custom_script || ''}
-        </body>
-        </html>`;
-        return new Response(detailHtml, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-      }
-
-      // ----------------------------------------
-      // 大盘聚合首页 (包含卡片、表格、地图功能)
-      // ----------------------------------------
-      let { results } = await env.DB.prepare('SELECT * FROM servers').all();
-      results = results.filter(s => s.is_hidden !== 'true');
-
-      const now = Date.now();
-
-      let globalOnline = 0; let globalOffline = 0;
-      let globalSpeedIn = 0; let globalSpeedOut = 0;
-      let globalNetTx = 0; let globalNetRx = 0;
-      let totalAsset = 0; let remAsset = 0;
-      
-      const groups = {};
-      const countryStats = {}; 
-
-      const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
-
-      if (results && results.length > 0) {
-        for (const server of results) {
-          const isOnline = (now - server.last_updated) < 30000;
-          if (isOnline) {
-            globalOnline++;
-            globalSpeedIn += parseFloat(server.net_in_speed) || 0;
-            globalSpeedOut += parseFloat(server.net_out_speed) || 0;
-          } else {
-            globalOffline++;
-          }
-          
-          const rx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0);
-          const tx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0);
-
-          globalNetTx += tx_val;
-          globalNetRx += rx_val;
-
-          // 资产转换
-          let amount = 0;
-          let remValue = 0;
-          if (server.price && server.price.match(/[\d.]+/)) {
-              let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
-              let rate = 1;
-              const pUpper = server.price.toUpperCase();
-              
-              if (pUpper.includes('USD') || pUpper.includes('$')) rate = 7.23;
-              else if (pUpper.includes('EUR') || pUpper.includes('€')) rate = 7.85;
-              else if (pUpper.includes('GBP') || pUpper.includes('£')) rate = 9.12;
-              else if (pUpper.includes('HKD')) rate = 0.92;
-              else if (pUpper.includes('JPY')) rate = 0.048;
-              else if (pUpper.includes('TWD')) rate = 0.22;
-              else if (pUpper.includes('RUB')) rate = 0.078;
-              else if (pUpper.includes('CAD')) rate = 5.25;
-              else if (pUpper.includes('AUD')) rate = 4.75;
-
-              amount = rawAmount * rate;
-              
-              let cycleDays = 365;
-              const priceStr = server.price.toLowerCase();
-              if (priceStr.includes('月') || priceStr.includes('mo') || priceStr.includes('month')) cycleDays = 30;
-              else if (priceStr.includes('季') || priceStr.includes('qu')) cycleDays = 90;
-              else if (priceStr.includes('半年') || priceStr.includes('half')) cycleDays = 180;
-              else if (priceStr.includes('天') || priceStr.includes('day')) cycleDays = 1;
-              
-              let expDays = -1;
-              if (server.expire_date) {
-                  const expTime = new Date(server.expire_date).getTime();
-                  if (!isNaN(expTime)) {
-                      const diff = expTime - now;
-                      expDays = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) : 0;
-                  }
-              }
-              
-              if (expDays === -1) {
-                  remValue = amount;
-              } else {
-                  remValue = (amount / cycleDays) * expDays;
-              }
-          }
-          totalAsset += amount;
-          remAsset += remValue;
-          server._remValue = remValue;
-          server._amount = amount;
-
-          const grpName = server.server_group || '默认分组';
-          if (!groups[grpName]) groups[grpName] = [];
-          groups[grpName].push(server);
-
-          let cCodeMap = (server.country || 'xx').toUpperCase();
-          if (cCodeMap === 'TW') cCodeMap = 'CN';
-          if (cCodeMap !== 'XX') {
-              countryStats[cCodeMap] = (countryStats[cCodeMap] || 0) + 1;
-          }
-        }
-      }
-
-      let rankHtmlServer = '';
-      let rankHtmlAsset = '';
-      if (sys.enable_ranking === 'true') {
-          rankHtmlServer = `<span id="ajax-rank-server" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
-          rankHtmlAsset = `<span id="ajax-rank-asset" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
-      }
+      let rankHtmlServer = `<span id="ajax-rank-server" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
+      let rankHtmlAsset = `<span id="ajax-rank-asset" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${results.length}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
           filterTagsHtml += `<span class="filter-tag" data-code="${code.toLowerCase()}" onclick="setFilter('${code.toLowerCase()}')"><img src="https://flagcdn.com/16x12/${code.toLowerCase()}.png" alt="${code}"> ${code} ${count}</span>`;
       }
 
-      let cardContentHtml = '';
-      let tableBodyHtml = '';
+      let cardContentHtml = ''; let tableBodyHtml = '';
+      const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
 
       if (Object.keys(groups).length === 0) {
         cardContentHtml = '<p style="text-align:center; width: 100%; color:#888;">暂无公开服务器</p>';
       } else {
         for (const [grpName, grpServers] of Object.entries(groups)) {
           cardContentHtml += `<div class="group-header">${grpName}</div><div class="grid-container">`;
-          
           for (const server of grpServers) {
             const isOnline = (now - server.last_updated) < 30000;
             const statusColor = isOnline ? '#10b981' : '#ef4444'; 
@@ -1421,9 +1333,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             let metaHtml = '';
             if (sys.show_price === 'true') {
               let priceHtml = `价格: ${server.price || '免费'}`;
-              if (sys.show_asset === 'true' && server._amount > 0) {
-                  priceHtml += ` <span style="color:#8b5cf6;font-weight:600;margin-left:8px;">剩余价值: ${server._remValue.toFixed(2)}${sys.asset_currency || '元'}</span>`;
-              }
+              if (server._amount > 0) priceHtml += ` <span style="color:#8b5cf6;font-weight:600;margin-left:8px;">剩余价值: ${server._remValue.toFixed(2)}${sys.asset_currency || '元'}</span>`;
               metaHtml += `<div class="card-meta" style="margin-top:8px;">${priceHtml}</div>`;
             }
             if (sys.show_expire === 'true') {
@@ -1431,8 +1341,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               if (server.expire_date) {
                 const expTime = new Date(server.expire_date).getTime();
                 if (!isNaN(expTime)) {
-                  const diff = expTime - now;
-                  expireText = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) + ' 天' : '已过期';
+                  const diff = expTime - now; expireText = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) + ' 天' : '已过期';
                 }
               }
               metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' ? 'margin-top:8px;' : ''}">剩余天数: ${expireText}</div>`;
@@ -1551,13 +1460,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
           .container { max-width: 1200px; margin: 0 auto; }
           
-          .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; align-items: center; }
-          .g-item { min-width: 0; box-sizing: border-box; }
-          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
-          .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
-          .g-sub { font-size: 12px; color: #999; white-space: normal; line-height: 1.4; }
-          @media (max-width: 768px) { .global-stats { grid-template-columns: 1fr; } }
-          
           .group-header { font-size: 18px; font-weight: 600; color: #444; margin: 25px 0 15px 5px; border-left: 4px solid #3b82f6; padding-left: 10px; }
           .grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 15px; }
           
@@ -1580,7 +1482,24 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           .modal-content { background: white; padding: 20px; border-radius: 12px; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
           .theme2 .modal-content, .theme5 .modal-content { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; }
           
-          @media (max-width: 800px) { .grid-container { grid-template-columns: 1fr; } .vps-card { flex-direction: column; } .card-right { padding-left: 0; border-left: none; border-top: 1px solid #f0f0f0; margin-top: 15px; padding-top: 15px; } .header { flex-direction: column; align-items: flex-start; gap: 15px;} .header-right { width:100%; justify-content: space-between;} }
+          /* 上下两行自适应 Grid CSS */
+          .global-stats { display: flex; flex-direction: column; gap: 15px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; }
+          .stats-row { display: flex; justify-content: center; width: 100%; align-items: center; }
+          .stats-row.bottom-row { border-top: 1px dashed rgba(150,150,150,0.2); padding-top: 15px; }
+          .stats-row .g-item { flex: 1; border-right: 1px dashed rgba(150,150,150,0.2); min-width: 0; box-sizing: border-box; position: relative; padding: 0 10px; }
+          .stats-row .g-item:last-child { border-right: none; }
+          .theme2 .stats-row .g-item, .theme5 .stats-row .g-item, .theme2 .stats-row.bottom-row, .theme5 .stats-row.bottom-row { border-color: rgba(255,255,255,0.1); }
+          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
+          .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
+          .g-sub { font-size: 12px; color: #999; white-space: normal; line-height: 1.4; }
+          
+          @media (max-width: 800px) { 
+            .grid-container { grid-template-columns: 1fr; } .vps-card { flex-direction: column; } .card-right { padding-left: 0; border-left: none; border-top: 1px solid #f0f0f0; margin-top: 15px; padding-top: 15px; } .header { flex-direction: column; align-items: flex-start; gap: 15px;} .header-right { width:100%; justify-content: space-between;} 
+            .stats-row { flex-direction: column; gap: 15px; } 
+            .stats-row .g-item { border-right: none !important; border-bottom: 1px dashed rgba(150,150,150,0.2); padding-bottom: 15px; } 
+            .stats-row .g-item:last-child { border-bottom: none; padding-bottom: 0; }
+            .stats-row.bottom-row { border-top: none; padding-top: 0; }
+          }
           
           ${themeStyles}
         </style>
@@ -1593,7 +1512,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
               <div class="view-controls">
-                <button class="toggle-btn" onclick="openRankModal()">🏆 全网资产排名</button>
+                <button class="toggle-btn" onclick="openRankModal()">🏆 Gossip 全网排行</button>
                 <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片
                 </button>
@@ -1613,10 +1532,36 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           </div>
 
           <div class="global-stats" id="ajax-stats">
-            <div class="g-item"><div class="g-label">服务器总数</div><div class="g-val">${results.length} ${rankHtmlServer}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
-            ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div></div>` : ''}
-            <div class="g-item"><div class="g-label">总计流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
-            <div class="g-item"><div class="g-label">实时网速 (入 | 出)</div><div class="g-val"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="g-in" data-val="${globalSpeedIn}">0 B/s</span> | <span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="g-out" data-val="${globalSpeedOut}">0 B/s</span></div></div>
+            <div class="stats-row top-row">
+              <div class="g-item">
+                <div class="g-label">本机服务器总数</div>
+                <div class="g-val">${results.length} ${rankHtmlServer}</div>
+                <div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div>
+              </div>
+              
+              <div class="g-item" style="border-left: 3px solid #f59e0b; padding-left:15px; border-radius: 0;">
+                <div class="g-label">🌐 全网节点汇总 (Gossip)</div>
+                <div class="g-val"><span id="ajax-global-servers">0</span> 台 <button class="toggle-btn" style="display:inline-flex; font-size:12px; padding:2px 8px; margin-left:5px; vertical-align:middle;" onclick="openRankModal()">🏆 排名详情</button></div>
+                <div class="g-sub">全网总资产: <span id="ajax-global-assets">0.00</span> ${sys.asset_currency || '元'}</div>
+              </div>
+
+              <div class="g-item">
+                <div class="g-label">本机数字资产 (${sys.asset_currency || '元'})</div>
+                <div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div>
+              </div>
+            </div>
+            
+            <div class="stats-row bottom-row">
+              <div class="g-item">
+                <div class="g-label">实时网速 (入 | 出)</div>
+                <div class="g-val"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="g-in" data-val="${globalSpeedIn}">0 B/s</span> | <span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="g-out" data-val="${globalSpeedOut}">0 B/s</span></div>
+              </div>
+
+              <div class="g-item">
+                <div class="g-label">本机流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div>
+                <div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div>
+              </div>
+            </div>
           </div>
 
           <div id="view-card" class="view-panel active">
@@ -1642,12 +1587,14 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           
           <div id="rankModal" class="modal">
             <div class="modal-content" style="max-width: 800px;">
-               <h3 style="margin-top:0; color:#f59e0b;">🏆 全网节点与资产综合排名</h3>
-               <p style="font-size:12px; color:#888; margin-bottom:20px;">* 跨实例的数据排行必须依赖中心化汇总 API。此列表展示已加入互联网络的面板实例情况。</p>
-               <table class="custom-table">
-                 <thead><tr><th>排名</th><th>面板节点 (Domain)</th><th>VPS 数量</th><th>探针总资产</th></tr></thead>
-                 <tbody id="rank-tbody"><tr><td colspan="4" style="text-align:center;">加载中...</td></tr></tbody>
-               </table>
+               <h3 style="margin-top:0; color:#f59e0b;">🏆 去中心化网络 (Gossip) 资产与探针排行</h3>
+               <p style="font-size:12px; color:#888; margin-bottom:20px;">* 数据由分布在各地的 Cloudflare Workers 节点通过弱共识自主计算得出。<br>当前全网共记录互联 VPS <b id="modal-global-servers" style="color:#3b82f6;">0</b> 台，汇总资产总额 <b id="modal-global-assets" style="color:#10b981;">0</b>。</p>
+               <div class="table-responsive">
+                 <table class="custom-table">
+                   <thead><tr><th>排名</th><th>网络节点 (Domain)</th><th>VPS 数量</th><th>探针总资产</th></tr></thead>
+                   <tbody id="rank-tbody"><tr><td colspan="4" style="text-align:center;">加载中...</td></tr></tbody>
+                 </table>
+               </div>
                <div style="text-align:right; margin-top:20px;"><button onclick="closeRankModal()" class="btn btn-gray" style="padding: 8px 20px;">关闭</button></div>
             </div>
           </div>
@@ -1667,14 +1614,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
           };
 
-          // 核心动画缓存与函数
           window.speedCache = {};
           function animateBytes(el, start, end, duration) {
               let startTimestamp = null;
               const step = (timestamp) => {
                   if (!startTimestamp) startTimestamp = timestamp;
                   const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-                  const easeProgress = 1 - Math.pow(1 - progress, 3); // easeOutCubic
+                  const easeProgress = 1 - Math.pow(1 - progress, 3);
                   const currentBytes = start + (end - start) * easeProgress;
                   el.innerText = formatBytesJs(currentBytes) + '/s';
                   if (progress < 1) window.requestAnimationFrame(step);
@@ -1688,70 +1634,71 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                   const newVal = parseFloat(el.dataset.val) || 0;
                   const oldVal = window.speedCache[id] !== undefined ? window.speedCache[id] : 0;
                   window.speedCache[id] = newVal;
-                  
-                  // 只有数值变化时才执行动画
-                  if (oldVal !== newVal) {
-                      animateBytes(el, oldVal, newVal, 1200);
-                  } else {
-                      el.innerText = formatBytesJs(newVal) + '/s';
-                  }
+                  if (oldVal !== newVal) { animateBytes(el, oldVal, newVal, 1200); } 
+                  else { el.innerText = formatBytesJs(newVal) + '/s'; }
               });
           }
 
-          // 全网排名中心逻辑
-          async function openRankModal() {
+          window.latestRankList = [];
+          window.currentGlobalServers = '0';
+          window.currentGlobalAssets = '0.00';
+          let currentServerRank = '';
+          let currentAssetRank = '';
+
+          function openRankModal() {
               document.getElementById('rankModal').style.display = 'block';
-              try {
-                  let apiUrl = '${sys.ranking_api}';
-                  let html = '';
-                  if (apiUrl) {
-                      let res = await fetch(apiUrl, {method:'GET'}); 
-                      let list = await res.json();
-                      // 如果配置了API，这里渲染真实的跨部署聚合数据
-                      if(list && list.length > 0) {
-                          list.forEach((item, index) => {
-                              html += \`<tr><td>\${index + 1}</td><td>\${item.domain}</td><td>\${item.servers} 台</td><td>\${item.assets} \${'${sys.asset_currency}'}</td></tr>\`;
-                          });
-                      }
-                  } else {
-                      // 未配置时回退展示本地孤岛统计
-                      html = '<tr><td>1</td><td>👑 本机实例 (当前面板)</td><td>${results.length} 台</td><td>${totalAsset.toFixed(2)} ${sys.asset_currency}</td></tr>';
-                      html += '<tr><td colspan="4" style="text-align:center; color:#888; font-size:12px; padding-top:20px;">(⚠️ 未配置中心聚合 API，当前仅展示本地数据。跨账号的 Worker 物理隔离，无法在无 API 时互相发现)</td></tr>';
-                  }
-                  document.getElementById('rank-tbody').innerHTML = html;
-              } catch(e) {
-                  document.getElementById('rank-tbody').innerHTML = '<tr><td colspan="4" style="text-align:center; color:red;">获取排名数据失败，请检查 API 或网络。</td></tr>';
+              const list = window.latestRankList || [];
+              let html = '';
+              if(list.length > 0) {
+                  list.forEach((item, index) => {
+                      const isMe = item.domain === window.location.hostname;
+                      const nameLabel = isMe ? '👑 ' + item.domain + ' (本机)' : item.domain;
+                      const tdStyle = isMe ? 'font-weight:bold; color:#10b981;' : '';
+                      html += \`<tr><td style="\${tdStyle}">\${index + 1}</td><td style="\${tdStyle}">\${nameLabel}</td><td style="\${tdStyle}">\${item.servers} 台</td><td style="\${tdStyle}">\${parseFloat(item.assets).toFixed(2)} \${'${sys.asset_currency}'}</td></tr>\`;
+                  });
+              } else {
+                  html = '<tr><td colspan="4" style="text-align:center;">本地尚未拉取到其他节点的数据，系统正在后台握手互联中...</td></tr>';
               }
+              document.getElementById('rank-tbody').innerHTML = html;
           }
           function closeRankModal() { document.getElementById('rankModal').style.display = 'none'; }
 
           let mapInitialized = false;
           window.currentFilter = 'all';
 
-          let currentServerRank = '';
-          let currentAssetRank = '';
+          // 核心：异步拉取内部汇聚的全网数据
+          const fetchRank = async () => {
+              try {
+                  const res = await fetch('/api/rank');
+                  const data = await res.json();
+                  
+                  window.currentGlobalServers = data.global_servers || '0';
+                  window.currentGlobalAssets = parseFloat(data.global_assets || 0).toFixed(2);
+                  
+                  const elGs = document.getElementById('ajax-global-servers');
+                  if (elGs) elGs.innerText = window.currentGlobalServers;
+                  const elGa = document.getElementById('ajax-global-assets');
+                  if (elGa) elGa.innerText = window.currentGlobalAssets;
+                  
+                  const mGs = document.getElementById('modal-global-servers');
+                  if (mGs) mGs.innerText = window.currentGlobalServers;
+                  const mGa = document.getElementById('modal-global-assets');
+                  if (mGa) mGa.innerText = window.currentGlobalAssets + ' ' + '${sys.asset_currency}';
 
-          if ('${sys.enable_ranking}' === 'true' && '${sys.ranking_api}') {
-              const fetchRank = async () => {
-                  try {
-                      const res = await fetch('${sys.ranking_api}', {
-                          method: 'POST',
-                          headers: {'Content-Type': 'application/json'},
-                          body: JSON.stringify({ domain: window.location.hostname, servers: ${results.length}, assets: ${totalAsset} })
-                      });
-                      const data = await res.json();
-                      if(data.server_rank) currentServerRank = '🏆 第 ' + data.server_rank + ' 名';
-                      if(data.asset_rank) currentAssetRank = '🏆 第 ' + data.asset_rank + ' 名';
-                      
-                      const elS = document.getElementById('ajax-rank-server');
-                      if(elS && currentServerRank) elS.innerHTML = currentServerRank;
-                      
-                      const elA = document.getElementById('ajax-rank-asset');
-                      if(elA && currentAssetRank) elA.innerHTML = currentAssetRank;
-                  } catch(e) {}
-              };
-              fetchRank();
-          }
+                  if(data.server_rank !== '-') currentServerRank = '🏆 本机排第 ' + data.server_rank + ' 名';
+                  if(data.asset_rank !== '-') currentAssetRank = '🏆 本机排第 ' + data.asset_rank + ' 名';
+                  
+                  const elS = document.getElementById('ajax-rank-server');
+                  if(elS && currentServerRank) elS.innerHTML = currentServerRank;
+                  
+                  const elA = document.getElementById('ajax-rank-asset');
+                  if(elA && currentAssetRank) elA.innerHTML = currentAssetRank;
+                  
+                  window.latestRankList = data.list || [];
+              } catch(e) {}
+          };
+          fetchRank();
+          setInterval(fetchRank, 12000); // 定时刷新全网排名数据
 
           function switchView(viewName) {
             document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
@@ -1763,44 +1710,28 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             localStorage.setItem('monitor_preferred_view', viewName);
 
             if (viewName === 'map') {
-              if (!mapInitialized) {
-                initMap();
-                mapInitialized = true;
-              } else {
-                window.myMap.invalidateSize(); 
-              }
+              if (!mapInitialized) { initMap(); mapInitialized = true; } 
+              else { window.myMap.invalidateSize(); }
             }
           }
 
           function setFilter(code) {
-              window.currentFilter = code;
-              applyFilter();
+              window.currentFilter = code; applyFilter();
           }
 
           function applyFilter() {
               if(!window.currentFilter) window.currentFilter = 'all';
-              
               document.querySelectorAll('.filter-tag').forEach(el => {
-                  if (el.dataset.code === window.currentFilter) el.classList.add('active');
-                  else el.classList.remove('active');
+                  if (el.dataset.code === window.currentFilter) el.classList.add('active'); else el.classList.remove('active');
               });
-              
               document.querySelectorAll('.vps-card').forEach(el => {
-                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) {
-                      el.style.display = 'flex';
-                  } else {
-                      el.style.display = 'none';
-                  }
+                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) el.style.display = 'flex';
+                  else el.style.display = 'none';
               });
-              
               document.querySelectorAll('#ajax-table tr').forEach(el => {
-                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) {
-                      el.style.display = '';
-                  } else {
-                      el.style.display = 'none';
-                  }
+                  if (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) el.style.display = '';
+                  else el.style.display = 'none';
               });
-
               document.querySelectorAll('.group-header').forEach(header => {
                   const grid = header.nextElementSibling;
                   if (grid && grid.classList.contains('grid-container')) {
@@ -1810,30 +1741,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               });
           }
 
-          let markersLayer;
-          let geoJsonLayer;
-          let worldGeoJson = null;
-          let currentMapDataStr = "";
+          let markersLayer; let geoJsonLayer; let worldGeoJson = null; let currentMapDataStr = "";
 
           const countryCoords = {
-            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16],
-            'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43],
-            'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77],
-            'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93],
-            'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22],
-            'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46],
-            'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24],
-            'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27],
-            'PH': [12.87, 121.77], 'ID': [-0.78, 113.92]
+            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 'PH': [12.87, 121.77], 'ID': [-0.78, 113.92]
           };
 
-          const iso2To3 = {
-            "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR",
-            "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF",
-            "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR",
-            "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM",
-            "PH":"PHL","ID":"IDN"
-          };
+          const iso2To3 = { "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR", "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF", "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR", "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM", "PH":"PHL","ID":"IDN" };
 
           async function initMap() {
             window.myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
@@ -1851,14 +1765,12 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             currentMapDataStr = newDataStr;
 
             if(geoJsonLayer) window.myMap.removeLayer(geoJsonLayer);
-            if(markersLayer) markersLayer.clearLayers();
-            else markersLayer = L.layerGroup().addTo(window.myMap);
+            if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(window.myMap);
 
             const data = JSON.parse(newDataStr);
             const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5');
 
-            const activeIso3 = {};
-            for (const code in data) { if (iso2To3[code]) activeIso3[iso2To3[code]] = true; }
+            const activeIso3 = {}; for (const code in data) { if (iso2To3[code]) activeIso3[iso2To3[code]] = true; }
 
             geoJsonLayer = L.geoJSON(worldGeoJson, {
                 style: function(feature) {
@@ -1877,9 +1789,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
           document.addEventListener('DOMContentLoaded', () => {
              const savedView = localStorage.getItem('monitor_preferred_view') || 'card';
-             switchView(savedView);
-             applyFilter();
-             applySpeedAnimations(); // 首次加载触发动画
+             switchView(savedView); applyFilter(); applySpeedAnimations();
           });
 
           setInterval(async () => {
@@ -1895,30 +1805,18 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               document.getElementById('ajax-cards').innerHTML = newDoc.getElementById('ajax-cards').innerHTML;
               document.getElementById('ajax-table').innerHTML = newDoc.getElementById('ajax-table').innerHTML;
               document.getElementById('ajax-filters').innerHTML = newDoc.getElementById('ajax-filters').innerHTML;
-              
               document.getElementById('map-data').textContent = newDoc.getElementById('map-data').textContent;
               
-              if (currentServerRank) {
-                  const elS = document.getElementById('ajax-rank-server');
-                  if (elS) elS.innerHTML = currentServerRank;
-              }
-              if (currentAssetRank) {
-                  const elA = document.getElementById('ajax-rank-asset');
-                  if (elA) elA.innerHTML = currentAssetRank;
-              }
+              // 状态回填保护 (防止 AJAX 替换覆盖掉异步拉取的数据)
+              if (currentServerRank) { const elS = document.getElementById('ajax-rank-server'); if (elS) elS.innerHTML = currentServerRank; }
+              if (currentAssetRank) { const elA = document.getElementById('ajax-rank-asset'); if (elA) elA.innerHTML = currentAssetRank; }
+              const elGs = document.getElementById('ajax-global-servers'); if (elGs) elGs.innerText = window.currentGlobalServers;
+              const elGa = document.getElementById('ajax-global-assets'); if (elGa) elGa.innerText = window.currentGlobalAssets;
 
-              drawMarkers();
-              applyFilter(); 
-              
-              // 关键：在 DOM 替换完毕后，立刻触发新一轮网速数值跳动特效
-              applySpeedAnimations();
-
-            } catch (e) {
-              console.log('Ajax Refresh Failed', e);
-            }
+              drawMarkers(); applyFilter(); applySpeedAnimations();
+            } catch (e) {}
           }, 4000);
         </script>
-        
         ${sys.custom_script || ''}
       </body>
       </html>`;
