@@ -1,18 +1,18 @@
 // ==========================================
 // 创世时间戳与网络参数 (Genesis Setup)
 // ==========================================
-const PROTOCOL_VERSION = 'v16_hardfork'; // 🚀 V16 硬分叉：统一签名哈希顺序，彻底解决信息孤岛与分叉问题
-const EPOCH_START = 1780320600000; // 2026年6月1日北京时间21:30:00
-const GENESIS_NODE = 'https://odd-art-043f.a68561918.workers.dev'; // 以你的主站为锚点
+const PROTOCOL_VERSION = 'v16_hardfork'; 
+const EPOCH_START = 1780320600000; 
+const GENESIS_NODE = 'https://odd-art-043f.a68561918.workers.dev'; 
 const DEFAULT_SEEDS = [
     GENESIS_NODE,
     'https://odd-art-043f.a68561918.workers.dev',
     'https://still-cell-000f.a6856191801.workers.dev'
 ]; 
-const SLOT_TIME = 10000; // 10秒出块
-const OFFLINE_THRESHOLD = 300000; // 5分钟离线判定
-const FINALITY_DEPTH = 6; // 终局确认深度
-const CHECKPOINT_INTERVAL = 500; // 每 500 块生成一个确定性检查点
+const SLOT_TIME = 10000; 
+const OFFLINE_THRESHOLD = 300000; 
+const FINALITY_DEPTH = 6; 
+const CHECKPOINT_INTERVAL = 500; 
 
 export default {
   async fetch(request, env, ctx) {
@@ -31,7 +31,6 @@ export default {
           isDbReady = true;
         }
       } catch(e) {
-        // 说明 settings 表尚未初始化，继续向下执行完整创世建表
       }
     }
 
@@ -59,7 +58,7 @@ export default {
           ping_ct: "TEXT DEFAULT '0'", ping_cu: "TEXT DEFAULT '0'", ping_cm: "TEXT DEFAULT '0'", ping_bd: "TEXT DEFAULT '0'",
           monthly_rx: "TEXT DEFAULT '0'", monthly_tx: "TEXT DEFAULT '0'", last_rx: "TEXT DEFAULT '0'", last_tx: "TEXT DEFAULT '0'", reset_month: "TEXT DEFAULT ''",
           agent_os: "TEXT DEFAULT 'debian'",
-          history: "TEXT DEFAULT '{}'",
+          history: "TEXT DEFAULT '{\"cpu\":[],\"ram\":[],\"proc\":[],\"net_in\":[],\"net_out\":[],\"tcp\":[],\"udp\":[],\"ping_ct\":[],\"ping_cu\":[],\"ping_cm\":[],\"ping_bd\":[],\"time\":[]}'",
           is_hidden: "TEXT DEFAULT 'false'",
           virt: "TEXT DEFAULT ''",
           hist_updated: "INTEGER DEFAULT 0" 
@@ -146,7 +145,6 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
-        // D1 数据库高性能索引初始化 (防御全表扫描)
         try {
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_servers_visibility_updated ON servers (is_hidden, last_updated)`).run();
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ledger_status_slot ON blockchain_ledger (status, slot_id DESC)`).run();
@@ -309,7 +307,6 @@ export default {
         if (!batchStmts || batchStmts.length === 0) return true;
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
-                // 如果单次 BATCH 超过了 D1 单批次 100 条的限制，切片分发
                 for (let i = 0; i < batchStmts.length; i += 100) {
                     await env.DB.batch(batchStmts.slice(i, i + 100));
                 }
@@ -1218,8 +1215,8 @@ export default {
           await env.DB.prepare(`
             INSERT INTO servers 
             (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, hist_updated) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false').run();
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{"cpu":[],"ram":[],"proc":[],"net_in":[],"net_out":[],"tcp":[],"udp":[],"ping_ct":[],"ping_cu":[],"ping_cm":[],"ping_bd":[],"time":[]}', 'false', 0)
+          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian').run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
         else if (data.action === 'delete') {
@@ -1827,7 +1824,8 @@ export default {
       let bashScript = `#!${sh_bin}
 SERVER_ID=$1
 SECRET=$2
-WORKER_URL="${host}/update"
+# 🚀 极致优化：把 ID 压入请求参数，让 Worker 入口直接进行 Cache API GET 匹配，彻底免除 JSON parse 的 CPU 开销！
+WORKER_URL="${host}/update?id=\\$SERVER_ID"
 STATIC_URL="${CACHE_CONFIG_URL}"
 
 if [ -z "$SERVER_ID" ] || [ -z "$SECRET" ]; then echo "错误: 缺少参数。"; exit 1; fi
@@ -2037,174 +2035,162 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
     }
 
     // ==========================================
-    // API 接收数据 (/update) —— 🚀 终极内存 BATCH 缓冲池 + 瘦身查询
+    // API 接收数据 (/update) —— 🚀 Cache API "GET" 欺骗 & 无序列化原子入库
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/update') {
       try {
-        const clonedReq = request.clone();
+        let id = url.searchParams.get('id');
+        const timeWindow = Math.floor(Date.now() / 15000);
+        const cache = caches.default;
+        let cacheReq;
+
+        // 🚀 终极极速防抖：只要探测到旧探针已替换为带 ?id= 的新探针
+        // 直接绕过 JSON 解析体！直接生成虚拟 GET 并在 Edge 节点拦截，CPU 消耗 0.1ms 内！
+        if (id) {
+            const cacheUrl = new URL(request.url);
+            cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
+            cacheReq = new Request(cacheUrl.toString(), { method: 'GET' });
+            const cachedRes = await cache.match(cacheReq);
+            if (cachedRes) return cachedRes;
+        }
+
         let data;
         try {
-            data = await clonedReq.json();
+            data = await request.json(); // 只有当 Cache Miss 且穿透到核心业务时才会解析
         } catch(e) {
             return new Response('Invalid JSON', { status: 400 });
         }
         
-        const { id, secret, metrics, type } = data;
-        if (secret !== env.API_SECRET) return new Response('Unauthorized', { status: 401 });
+        id = id || data.id; // 如果上文没有拿到 id（老版本不带参数的探针），进行 fallback 获取
+        const { secret, metrics, type } = data;
 
-        const timeWindow = Math.floor(Date.now() / 15000);
-        const cacheUrl = new URL(request.url);
-        cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
-        const cacheReq = new Request(cacheUrl.toString(), { method: 'GET' });
-        const cache = caches.default;
-
-        let cachedRes = await cache.match(cacheReq);
-        if (cachedRes) {
-            return cachedRes;
+        // 针对老版本探针在解析完 JSON 后补查一次防御缓存
+        if (!cacheReq) {
+            const cacheUrl = new URL(request.url);
+            cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
+            cacheReq = new Request(cacheUrl.toString(), { method: 'GET' });
+            const cachedRes = await cache.match(cacheReq);
+            if (cachedRes) return cachedRes;
         }
+
+        if (secret !== env.API_SECRET) return new Response('Unauthorized', { status: 401 });
 
         let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX';
         if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
 
-        // 🚀 核心优化 1：异步聚合落库。改为 Map 级内存缓冲合并
         const processMetricsAndBuffer = async () => {
-            if (!globalThis.pendingUpdates) globalThis.pendingUpdates = new Map();
-            if (!globalThis.serverStateCache) globalThis.serverStateCache = new Map();
+            if (!globalThis.dbUpdateBuffer) globalThis.dbUpdateBuffer = [];
             if (!globalThis.lastDbFlushTime) globalThis.lastDbFlushTime = Date.now();
+            if (!globalThis.histCache) globalThis.histCache = {}; // Edge 缓存：跟踪每个节点最后写入 history 的时间戳
 
-            let state = globalThis.serverStateCache.get(id);
-            if (!state) {
-                const serverExists = await env.DB.prepare('SELECT monthly_rx, monthly_tx, last_rx, last_tx, reset_month, hist_updated, history FROM servers WHERE id = ?').bind(id).first();
-                state = serverExists || { monthly_rx: '0', monthly_tx: '0', last_rx: '0', last_tx: '0', reset_month: '', hist_updated: 0, history: '{}' };
-                globalThis.serverStateCache.set(id, state);
-            }
+            const nowMs = Date.now();
 
             if (type === 'ping') {
-                globalThis.pendingUpdates.set(id, { type: 'ping', last_updated: Date.now() });
+                globalThis.dbUpdateBuffer.push(env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(nowMs, id));
             } else {
-                const nowTime = new Date();
-                const tzOffset = 8 * 60 * 60000; 
-                const localNow = new Date(nowTime.getTime() + tzOffset);
-                const currentMonthStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}`;
-                
-                let monthly_rx = parseFloat(state.monthly_rx || '0');
-                let monthly_tx = parseFloat(state.monthly_tx || '0');
-                let last_rx = parseFloat(state.last_rx || '0');
-                let last_tx = parseFloat(state.last_tx || '0');
-                let reset_month = state.reset_month || currentMonthStr;
+                const timeLabel = new Date(nowMs + 8 * 3600000).getHours().toString().padStart(2, '0') + ':' + new Date(nowMs + 8 * 3600000).getMinutes().toString().padStart(2, '0');
+                const resetMonthStr = new Date(nowMs + 8 * 3600000).getFullYear() + '-' + (new Date(nowMs + 8 * 3600000).getMonth() + 1);
 
-                if (sys.auto_reset_traffic === 'true' && currentMonthStr !== reset_month) {
-                    monthly_rx = 0; monthly_tx = 0; reset_month = currentMonthStr;
+                const lastHistUpdate = globalThis.histCache[id] || 0;
+
+                // 1. 轻量化基线更新 (高频，绝不修改 history)
+                const baseStmt = env.DB.prepare(`
+                  UPDATE servers
+                  SET
+                    cpu = ?1, ram = ?2, disk = ?3, load_avg = ?4, uptime = ?5, last_updated = ?6,
+                    ram_total = ?7, net_in_speed = ?8, net_out_speed = ?9,
+                    os = ?10, cpu_info = ?11, arch = ?12, boot_time = ?13,
+                    ram_used = ?14, swap_total = ?15, swap_used = ?16,
+                    disk_total = ?17, disk_used = ?18, processes = ?19,
+                    tcp_conn = ?20, udp_conn = ?21, country = ?22,
+                    ip_v4 = ?23, ip_v6 = ?24, ping_ct = ?25, ping_cu = ?26, ping_cm = ?27, ping_bd = ?28, virt = ?29,
+                    monthly_rx = CASE
+                        WHEN reset_month != ?30 THEN (CASE WHEN CAST(?31 AS REAL) < CAST(last_rx AS REAL) THEN CAST(?31 AS REAL) ELSE CAST(?31 AS REAL) - CAST(last_rx AS REAL) END)
+                        WHEN CAST(?31 AS REAL) < CAST(last_rx AS REAL) THEN CAST(monthly_rx AS REAL) + CAST(?31 AS REAL)
+                        ELSE CAST(monthly_rx AS REAL) + (CAST(?31 AS REAL) - CAST(last_rx AS REAL))
+                    END,
+                    monthly_tx = CASE
+                        WHEN reset_month != ?30 THEN (CASE WHEN CAST(?32 AS REAL) < CAST(last_tx AS REAL) THEN CAST(?32 AS REAL) ELSE CAST(?32 AS REAL) - CAST(last_tx AS REAL) END)
+                        WHEN CAST(?32 AS REAL) < CAST(last_tx AS REAL) THEN CAST(monthly_tx AS REAL) + CAST(?32 AS REAL)
+                        ELSE CAST(monthly_tx AS REAL) + (CAST(?32 AS REAL) - CAST(last_tx AS REAL))
+                    END,
+                    reset_month = ?30,
+                    net_rx = ?31,
+                    net_tx = ?32,
+                    last_rx = ?31,
+                    last_tx = ?32
+                  WHERE id = ?33
+                `).bind(
+                    metrics.cpu || '0', metrics.ram || '0', metrics.disk || '0', metrics.load || '0', metrics.uptime || '', nowMs,
+                    metrics.ram_total || '0', metrics.net_in_speed || '0', metrics.net_out_speed || '0',
+                    metrics.os || '', metrics.cpu_info || '', metrics.arch || '', metrics.boot_time || '',
+                    metrics.ram_used || '0', metrics.swap_total || '0', metrics.swap_used || '0',
+                    metrics.disk_total || '0', metrics.disk_used || '0', metrics.processes || '0',
+                    metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode,
+                    metrics.ip_v4 || '0', metrics.ip_v6 || '0',
+                    metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', metrics.virt || '',
+                    resetMonthStr, metrics.net_rx || '0', metrics.net_tx || '0', id
+                );
+                globalThis.dbUpdateBuffer.push(baseStmt);
+
+                // 2. Conditional Settlement：依靠内存校验进行阻断，并在 SQL 中加注 WHERE 作为双重保险
+                if (nowMs - lastHistUpdate >= 300000) {
+                    const histStmt = env.DB.prepare(`
+                        UPDATE servers
+                        SET
+                            history = json_insert(
+                                CASE WHEN history = '{}' OR history IS NULL OR history = '' THEN '{"cpu":[],"ram":[],"proc":[],"net_in":[],"net_out":[],"tcp":[],"udp":[],"ping_ct":[],"ping_cu":[],"ping_cm":[],"ping_bd":[],"time":[]}' ELSE history END,
+                                '$.cpu[#]', CAST(?1 AS REAL),
+                                '$.ram[#]', CAST(?2 AS REAL),
+                                '$.proc[#]', CAST(?3 AS INTEGER),
+                                '$.net_in[#]', CAST(?4 AS REAL),
+                                '$.net_out[#]', CAST(?5 AS REAL),
+                                '$.tcp[#]', CAST(?6 AS INTEGER),
+                                '$.udp[#]', CAST(?7 AS INTEGER),
+                                '$.ping_ct[#]', CAST(?8 AS INTEGER),
+                                '$.ping_cu[#]', CAST(?9 AS INTEGER),
+                                '$.ping_cm[#]', CAST(?10 AS INTEGER),
+                                '$.ping_bd[#]', CAST(?11 AS INTEGER),
+                                '$.time[#]', ?12
+                            ),
+                            hist_updated = ?13
+                        WHERE id = ?14 AND ?13 - hist_updated >= 300000
+                    `).bind(
+                        metrics.cpu || '0', metrics.ram || '0', metrics.processes || '0',
+                        metrics.net_in_speed || '0', metrics.net_out_speed || '0',
+                        metrics.tcp_conn || '0', metrics.udp_conn || '0',
+                        metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0',
+                        timeLabel, nowMs, id
+                    );
+                    globalThis.dbUpdateBuffer.push(histStmt);
+                    globalThis.histCache[id] = nowMs; // 更新当前 Edge 实例内存记录
                 }
-
-                const current_rx = parseFloat(metrics.net_rx || '0');
-                const current_tx = parseFloat(metrics.net_tx || '0');
-                if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
-                if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
-                last_rx = current_rx; last_tx = current_tx;
-
-                const nowMs = Date.now();
-                const lastHistTime = state.hist_updated || 0;
-                let historyStr = state.history || '{}';
-                let newHistTime = lastHistTime;
-                
-                if (nowMs - lastHistTime >= 300000 || !state.history || state.history === '{}') {
-                    let history = {};
-                    try { history = JSON.parse(historyStr); } catch(e) {}
-                    
-                    const maxPoints = 288; 
-                    const updateArr = (arr, val) => {
-                        if (!Array.isArray(arr)) arr = [];
-                        arr.push(val);
-                        if (arr.length > maxPoints) arr.shift();
-                        return arr;
-                    };
-                    const updateLabels = (arr) => {
-                        if (!Array.isArray(arr)) arr = [];
-                        const d = new Date(nowMs + 8 * 60 * 60000); 
-                        const timeLabel = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
-                        arr.push(timeLabel);
-                        if (arr.length > maxPoints) arr.shift();
-                        return arr;
-                    };
-
-                    history.cpu = updateArr(history.cpu, parseFloat(metrics.cpu) || 0);
-                    history.ram = updateArr(history.ram, parseFloat(metrics.ram) || 0);
-                    history.proc = updateArr(history.proc, parseInt(metrics.processes) || 0);
-                    history.net_in = updateArr(history.net_in, parseFloat(metrics.net_in_speed) || 0);
-                    history.net_out = updateArr(history.net_out, parseFloat(metrics.net_out_speed) || 0);
-                    history.tcp = updateArr(history.tcp, parseInt(metrics.tcp_conn) || 0);
-                    history.udp = updateArr(history.udp, parseInt(metrics.udp_conn) || 0);
-                    history.ping_ct = updateArr(history.ping_ct, parseInt(metrics.ping_ct) || 0);
-                    history.ping_cu = updateArr(history.ping_cu, parseInt(metrics.ping_cu) || 0);
-                    history.ping_cm = updateArr(history.ping_cm, parseInt(metrics.ping_cm) || 0);
-                    history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
-                    history.time = updateLabels(history.time);
-                    history.last_time = nowMs;
-                    
-                    historyStr = JSON.stringify(history);
-                    newHistTime = nowMs;
-                }
-
-                state.monthly_rx = monthly_rx.toString();
-                state.monthly_tx = monthly_tx.toString();
-                state.last_rx = last_rx.toString();
-                state.last_tx = last_tx.toString();
-                state.reset_month = reset_month;
-                state.history = historyStr;
-                state.hist_updated = newHistTime;
-
-                globalThis.pendingUpdates.set(id, {
-                    type: 'metrics',
-                    data: metrics,
-                    state: state,
-                    last_updated: nowMs,
-                    countryCode: countryCode
-                });
             }
 
-            // 🚀 BATCH 核心条件：队列满 15 条 或 超过 10 秒即强刷入库
             const nowMsForThrottle = Date.now();
-            if ((globalThis.pendingUpdates.size >= 15 || (nowMsForThrottle - globalThis.lastDbFlushTime > 10000)) && !globalThis.isFlushing) {
+            if ((globalThis.dbUpdateBuffer.length >= 15 || (nowMsForThrottle - globalThis.lastDbFlushTime > 10000)) && !globalThis.isFlushing) {
                 globalThis.isFlushing = true;
                 try {
-                    const entriesToFlush = Array.from(globalThis.pendingUpdates.entries());
-                    globalThis.pendingUpdates.clear();
+                    const batchToFlush = globalThis.dbUpdateBuffer.splice(0, globalThis.dbUpdateBuffer.length);
                     globalThis.lastDbFlushTime = nowMsForThrottle;
-                    
-                    if (entriesToFlush.length > 0) {
-                        let batchStmts = [];
-                        for (const [serverId, update] of entriesToFlush) {
-                            if (update.type === 'ping') {
-                                batchStmts.push(env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(update.last_updated, serverId));
-                            } else {
-                                const m = update.data;
-                                const s = update.state;
-                                batchStmts.push(env.DB.prepare(`
-                                    UPDATE servers 
-                                    SET cpu = ?, ram = ?, disk = ?, load_avg = ?, uptime = ?, last_updated = ?,
-                                        ram_total = ?, net_rx = ?, net_tx = ?, net_in_speed = ?, net_out_speed = ?,
-                                        os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
-                                        swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
-                                        country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
-                                        monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?, hist_updated = ?
-                                    WHERE id = ?
-                                `).bind(
-                                    m.cpu, m.ram, m.disk, m.load, m.uptime, update.last_updated,
-                                    m.ram_total || '0', m.net_rx || '0', m.net_tx || '0', 
-                                    m.net_in_speed || '0', m.net_out_speed || '0', 
-                                    m.os || '', m.cpu_info || '', m.arch || '', m.boot_time || '',
-                                    m.ram_used || '0', m.swap_total || '0', m.swap_used || '0',
-                                    m.disk_total || '0', m.disk_used || '0', m.processes || '0',
-                                    m.tcp_conn || '0', m.udp_conn || '0', update.countryCode, 
-                                    m.ip_v4 || '0', m.ip_v6 || '0', 
-                                    m.ping_ct || '0', m.ping_cu || '0', m.ping_cm || '0', m.ping_bd || '0', 
-                                    s.monthly_rx, s.monthly_tx, s.last_rx, s.last_tx, s.reset_month, s.history, m.virt || '', s.hist_updated,
-                                    serverId
-                                ));
-                            }
+
+                    if (batchToFlush.length > 0) {
+                        await executeBatchWithRetry(batchToFlush);
+
+                        if (Math.random() < 0.1) {
+                             const { results } = await env.DB.prepare(`SELECT id, history FROM servers WHERE json_valid(history) = 1 AND json_array_length(history, '$.cpu') > 300 LIMIT 5`).all();
+                             if (results && results.length > 0) {
+                                 let trimBatch = [];
+                                 for (const row of results) {
+                                     try {
+                                         let h = JSON.parse(row.history);
+                                         for (const k in h) { if (Array.isArray(h[k]) && h[k].length > 288) h[k] = h[k].slice(-288); }
+                                         trimBatch.push(env.DB.prepare('UPDATE servers SET history = ? WHERE id = ?').bind(JSON.stringify(h), row.id));
+                                     } catch(e){}
+                                 }
+                                 if (trimBatch.length > 0) await executeBatchWithRetry(trimBatch);
+                             }
                         }
-                        try { await executeBatchWithRetry(batchStmts); } catch (err) {}
                     }
 
                     if (!globalThis.lastOfflineCheck || nowMsForThrottle - globalThis.lastOfflineCheck > 60000) {
@@ -2222,10 +2208,9 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             }
         };
 
-        // 异步丢后台排队处理，不阻塞 Worker 响应
+        // 异步后台排队处理，不阻塞 Worker，马上给响应
         ctx.waitUntil(processMetricsAndBuffer());
 
-        // 极速返回 OK，探针秒级脱钩
         const finalOkRes = new Response("OK", { status: 200, headers: {'Cache-Control': 's-maxage=15, max-age=15'} });
         ctx.waitUntil(cache.put(cacheReq, finalOkRes.clone()));
         return finalOkRes;
@@ -2278,7 +2263,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         ctx.waitUntil(env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(vTotal.toString(), vToday.toString(), todayStr).run().catch(()=>{}));
       }
       
-      // 🚀 核心优化 2：大盘列表严格裁剪，抛弃读取无用的 `history` (数组 JSON) 等沉重数据，瘦身 95%
       let { results } = await env.DB.prepare(`
           SELECT id, name, cpu, ram, disk, last_updated, net_in_speed, net_out_speed, 
                  monthly_rx, monthly_tx, net_rx, net_tx, server_group, country, price, 
