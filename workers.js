@@ -2035,7 +2035,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
     }
 
     // ==========================================
-    // API 接收数据 (/update) —— 🚀 Cache API "GET" 欺骗 & 无序列化原子入库
+    // API 接收数据 (/update) —— 🚀 Cache API "GET" 欺骗 & 纯内存去重 (Map 映射)
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/update') {
       try {
@@ -2044,8 +2044,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         const cache = caches.default;
         let cacheReq;
 
-        // 🚀 终极极速防抖：只要探测到旧探针已替换为带 ?id= 的新探针
-        // 直接绕过 JSON 解析体！直接生成虚拟 GET 并在 Edge 节点拦截，CPU 消耗 0.1ms 内！
         if (id) {
             const cacheUrl = new URL(request.url);
             cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
@@ -2056,15 +2054,14 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
 
         let data;
         try {
-            data = await request.json(); // 只有当 Cache Miss 且穿透到核心业务时才会解析
+            data = await request.json(); 
         } catch(e) {
             return new Response('Invalid JSON', { status: 400 });
         }
         
-        id = id || data.id; // 如果上文没有拿到 id（老版本不带参数的探针），进行 fallback 获取
+        id = id || data.id; 
         const { secret, metrics, type } = data;
 
-        // 针对老版本探针在解析完 JSON 后补查一次防御缓存
         if (!cacheReq) {
             const cacheUrl = new URL(request.url);
             cacheUrl.pathname = `/update-cache/${id}/${timeWindow}`;
@@ -2079,21 +2076,21 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
 
         const processMetricsAndBuffer = async () => {
-            if (!globalThis.dbUpdateBuffer) globalThis.dbUpdateBuffer = [];
+            // 🚀 收官核心：升级缓冲池为 Map，同一机器的同一类型操作直接在内存发生「状态覆盖」
+            if (!globalThis.dbUpdateMap) globalThis.dbUpdateMap = new Map();
             if (!globalThis.lastDbFlushTime) globalThis.lastDbFlushTime = Date.now();
-            if (!globalThis.histCache) globalThis.histCache = {}; // Edge 缓存：跟踪每个节点最后写入 history 的时间戳
+            if (!globalThis.histCache) globalThis.histCache = {};
 
             const nowMs = Date.now();
 
             if (type === 'ping') {
-                globalThis.dbUpdateBuffer.push(env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(nowMs, id));
+                globalThis.dbUpdateMap.set(id + '_ping', env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(nowMs, id));
             } else {
                 const timeLabel = new Date(nowMs + 8 * 3600000).getHours().toString().padStart(2, '0') + ':' + new Date(nowMs + 8 * 3600000).getMinutes().toString().padStart(2, '0');
                 const resetMonthStr = new Date(nowMs + 8 * 3600000).getFullYear() + '-' + (new Date(nowMs + 8 * 3600000).getMonth() + 1);
 
                 const lastHistUpdate = globalThis.histCache[id] || 0;
 
-                // 1. 轻量化基线更新 (高频，绝不修改 history)
                 const baseStmt = env.DB.prepare(`
                   UPDATE servers
                   SET
@@ -2131,9 +2128,8 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
                     metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', metrics.virt || '',
                     resetMonthStr, metrics.net_rx || '0', metrics.net_tx || '0', id
                 );
-                globalThis.dbUpdateBuffer.push(baseStmt);
+                globalThis.dbUpdateMap.set(id + '_base', baseStmt);
 
-                // 2. Conditional Settlement：依靠内存校验进行阻断，并在 SQL 中加注 WHERE 作为双重保险
                 if (nowMs - lastHistUpdate >= 300000) {
                     const histStmt = env.DB.prepare(`
                         UPDATE servers
@@ -2162,16 +2158,17 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
                         metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0',
                         timeLabel, nowMs, id
                     );
-                    globalThis.dbUpdateBuffer.push(histStmt);
-                    globalThis.histCache[id] = nowMs; // 更新当前 Edge 实例内存记录
+                    globalThis.dbUpdateMap.set(id + '_hist', histStmt);
+                    globalThis.histCache[id] = nowMs;
                 }
             }
 
             const nowMsForThrottle = Date.now();
-            if ((globalThis.dbUpdateBuffer.length >= 15 || (nowMsForThrottle - globalThis.lastDbFlushTime > 10000)) && !globalThis.isFlushing) {
+            if ((globalThis.dbUpdateMap.size >= 15 || (nowMsForThrottle - globalThis.lastDbFlushTime > 10000)) && !globalThis.isFlushing) {
                 globalThis.isFlushing = true;
                 try {
-                    const batchToFlush = globalThis.dbUpdateBuffer.splice(0, globalThis.dbUpdateBuffer.length);
+                    const batchToFlush = Array.from(globalThis.dbUpdateMap.values());
+                    globalThis.dbUpdateMap.clear();
                     globalThis.lastDbFlushTime = nowMsForThrottle;
 
                     if (batchToFlush.length > 0) {
@@ -2208,7 +2205,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             }
         };
 
-        // 异步后台排队处理，不阻塞 Worker，马上给响应
         ctx.waitUntil(processMetricsAndBuffer());
 
         const finalOkRes = new Response("OK", { status: 200, headers: {'Cache-Control': 's-maxage=15, max-age=15'} });
@@ -2228,7 +2224,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
     }
 
     // ==========================================
-    // 前台探针首页 & 详情页
+    // 前台探针首页 & 详情页 —— 🚀 完全免读库的全量 HTML 内存快照缓冲
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/') {
       if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
@@ -2237,12 +2233,25 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
       const viewId = url.searchParams.get('id');
       
       const nowSec = Math.floor(Date.now() / 15000); 
+      const nowSecIndex = Math.floor(Date.now() / 30000); // 🚀 补全此处声明
+
+      // 1. Ajax 异步获取数据拦截（切断无脑轮询 D1）
       if (isAjax && globalThis.ajaxCacheSec === nowSec && globalThis.ajaxCacheData) {
           return new Response(globalThis.ajaxCacheData, { headers: { 'Content-Type': 'text/html' } });
       }
 
-      const nowSecIndex = Math.floor(Date.now() / 30000); 
+      // 2. 首页静态刷新拦截（切断疯狂 F5 重刷 D1）
       if (!isAjax && !viewId && globalThis.indexCacheSec === nowSecIndex && globalThis.indexCacheData) {
+          ctx.waitUntil((async () => {
+             // 利用 ctx.waitUntil 在后台异步增加访问统计，保证缓存极速命中同时不丢数据
+             let vTotal = parseInt(sys.visits_total || '0') + 1;
+             let vToday = parseInt(sys.visits_today || '0') + 1;
+             let vDate = sys.visits_date || '';
+             const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
+             if (vDate !== todayStr) { vToday = 1; vDate = todayStr; }
+             sys.visits_total = vTotal.toString(); sys.visits_today = vToday.toString(); sys.visits_date = todayStr;
+             await env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(vTotal.toString(), vToday.toString(), todayStr).run().catch(()=>{});
+          })());
           return new Response(globalThis.indexCacheData, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
       
