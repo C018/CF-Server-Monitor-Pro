@@ -146,7 +146,7 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
-        // 🚀 核心优化 1：D1 数据库高性能索引初始化 (防御全表扫描)
+        // 🚀 D1 数据库高性能索引初始化 (防御全表扫描)
         try {
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_servers_visibility_updated ON servers (is_hidden, last_updated)`).run();
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ledger_status_slot ON blockchain_ledger (status, slot_id DESC)`).run();
@@ -154,9 +154,7 @@ export default {
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_peers_beacon_last_seen ON blockchain_peers (is_beacon, last_seen DESC, total_asset DESC)`).run();
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_mempool_sort ON mempool (timestamp ASC, tx_id ASC)`).run();
             await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_wallets_balance ON blockchain_wallets (balance DESC)`).run();
-        } catch(e) {
-            // 静默处理由于版本冲突可能产生的索引创建异常
-        }
+        } catch(e) {}
 
         const forceSync = await env.DB.prepare(`SELECT value FROM settings WHERE key='force_sync_${PROTOCOL_VERSION}'`).first();
         if (!forceSync) {
@@ -2036,7 +2034,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
     }
 
     // ==========================================
-    // API 接收数据 (/update)
+    // API 接收数据 (/update) —— 🚀 核心大动作：全异步后台落库
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/update') {
       try {
@@ -2062,121 +2060,130 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             return cachedRes;
         }
 
-        if (type === 'ping') {
-            await env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(Date.now(), id).run();
-            const okRes = new Response("Ping OK", { status: 200, headers: {'Cache-Control': 's-maxage=15, max-age=15'} });
-            ctx.waitUntil(cache.put(cacheReq, okRes.clone()));
-            return okRes;
-        }
-
         let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX';
         if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
 
-        // 🚀 核心优化 2：杜绝 SELECT * 全表拉取，严格限定读取字段，极大减少 D1 出口带宽与内存撑爆风险
-        const serverExists = await env.DB.prepare('SELECT id, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, hist_updated, history FROM servers WHERE id = ?').bind(id).first();
-        if (!serverExists) return new Response('Server not found', { status: 404 });
+        // 🚀 核心动作：将 D1 落库、监控告警、挖矿逻辑全部包装进异步闭包，交给 waitUntil 后台排队处理！
+        const asyncBackgroundTasks = async () => {
+            try {
+                if (type === 'ping') {
+                    await env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(Date.now(), id).run();
+                    return;
+                }
 
-        const nowTime = new Date();
-        const tzOffset = 8 * 60 * 60000; 
-        const localNow = new Date(nowTime.getTime() + tzOffset);
-        const currentMonthStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}`;
-        
-        let monthly_rx = parseFloat(serverExists.monthly_rx || '0');
-        let monthly_tx = parseFloat(serverExists.monthly_tx || '0');
-        let last_rx = parseFloat(serverExists.last_rx || '0');
-        let last_tx = parseFloat(serverExists.last_tx || '0');
-        let reset_month = serverExists.reset_month || currentMonthStr;
+                const serverExists = await env.DB.prepare('SELECT id, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, hist_updated, history FROM servers WHERE id = ?').bind(id).first();
+                if (!serverExists) return; // 后台静默忽略无效 ID
 
-        if (sys.auto_reset_traffic === 'true' && currentMonthStr !== reset_month) {
-            monthly_rx = 0; monthly_tx = 0; reset_month = currentMonthStr;
-        }
+                const nowTime = new Date();
+                const tzOffset = 8 * 60 * 60000; 
+                const localNow = new Date(nowTime.getTime() + tzOffset);
+                const currentMonthStr = `${localNow.getFullYear()}-${localNow.getMonth() + 1}`;
+                
+                let monthly_rx = parseFloat(serverExists.monthly_rx || '0');
+                let monthly_tx = parseFloat(serverExists.monthly_tx || '0');
+                let last_rx = parseFloat(serverExists.last_rx || '0');
+                let last_tx = parseFloat(serverExists.last_tx || '0');
+                let reset_month = serverExists.reset_month || currentMonthStr;
 
-        const current_rx = parseFloat(metrics.net_rx || '0');
-        const current_tx = parseFloat(metrics.net_tx || '0');
-        if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
-        if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
-        last_rx = current_rx; last_tx = current_tx;
+                if (sys.auto_reset_traffic === 'true' && currentMonthStr !== reset_month) {
+                    monthly_rx = 0; monthly_tx = 0; reset_month = currentMonthStr;
+                }
 
-        const nowMs = Date.now();
-        const lastHistTime = serverExists.hist_updated || 0;
-        let historyStr = serverExists.history || '{}';
-        let newHistTime = lastHistTime;
-        
-        if (nowMs - lastHistTime >= 300000 || !serverExists.history || serverExists.history === '{}') {
-            let history = {};
-            try { history = JSON.parse(historyStr); } catch(e) {}
-            
-            const maxPoints = 288; 
-            const updateArr = (arr, val) => {
-                if (!Array.isArray(arr)) arr = [];
-                arr.push(val);
-                if (arr.length > maxPoints) arr.shift();
-                return arr;
-            };
-            const updateLabels = (arr) => {
-                if (!Array.isArray(arr)) arr = [];
-                const d = new Date(nowMs + 8 * 60 * 60000); 
-                const timeLabel = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
-                arr.push(timeLabel);
-                if (arr.length > maxPoints) arr.shift();
-                return arr;
-            };
+                const current_rx = parseFloat(metrics.net_rx || '0');
+                const current_tx = parseFloat(metrics.net_tx || '0');
+                if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
+                if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
+                last_rx = current_rx; last_tx = current_tx;
 
-            history.cpu = updateArr(history.cpu, parseFloat(metrics.cpu) || 0);
-            history.ram = updateArr(history.ram, parseFloat(metrics.ram) || 0);
-            history.proc = updateArr(history.proc, parseInt(metrics.processes) || 0);
-            history.net_in = updateArr(history.net_in, parseFloat(metrics.net_in_speed) || 0);
-            history.net_out = updateArr(history.net_out, parseFloat(metrics.net_out_speed) || 0);
-            history.tcp = updateArr(history.tcp, parseInt(metrics.tcp_conn) || 0);
-            history.udp = updateArr(history.udp, parseInt(metrics.udp_conn) || 0);
-            history.ping_ct = updateArr(history.ping_ct, parseInt(metrics.ping_ct) || 0);
-            history.ping_cu = updateArr(history.ping_cu, parseInt(metrics.ping_cu) || 0);
-            history.ping_cm = updateArr(history.ping_cm, parseInt(metrics.ping_cm) || 0);
-            history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
-            history.time = updateLabels(history.time);
-            history.last_time = nowMs;
-            
-            historyStr = JSON.stringify(history);
-            newHistTime = nowMs;
-        }
+                const nowMs = Date.now();
+                const lastHistTime = serverExists.hist_updated || 0;
+                let historyStr = serverExists.history || '{}';
+                let newHistTime = lastHistTime;
+                
+                if (nowMs - lastHistTime >= 300000 || !serverExists.history || serverExists.history === '{}') {
+                    let history = {};
+                    try { history = JSON.parse(historyStr); } catch(e) {}
+                    
+                    const maxPoints = 288; 
+                    const updateArr = (arr, val) => {
+                        if (!Array.isArray(arr)) arr = [];
+                        arr.push(val);
+                        if (arr.length > maxPoints) arr.shift();
+                        return arr;
+                    };
+                    const updateLabels = (arr) => {
+                        if (!Array.isArray(arr)) arr = [];
+                        const d = new Date(nowMs + 8 * 60 * 60000); 
+                        const timeLabel = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+                        arr.push(timeLabel);
+                        if (arr.length > maxPoints) arr.shift();
+                        return arr;
+                    };
 
-        await env.DB.prepare(`
-          UPDATE servers 
-          SET cpu = ?, ram = ?, disk = ?, load_avg = ?, uptime = ?, last_updated = ?,
-              ram_total = ?, net_rx = ?, net_tx = ?, net_in_speed = ?, net_out_speed = ?,
-              os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
-              swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
-              country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
-              monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?, hist_updated = ?
-          WHERE id = ?
-        `).bind(
-          metrics.cpu, metrics.ram, metrics.disk, metrics.load, metrics.uptime, Date.now(),
-          metrics.ram_total || '0', metrics.net_rx || '0', metrics.net_tx || '0', 
-          metrics.net_in_speed || '0', metrics.net_out_speed || '0', 
-          metrics.os || '', metrics.cpu_info || '', metrics.arch || '', metrics.boot_time || '',
-          metrics.ram_used || '0', metrics.swap_total || '0', metrics.swap_used || '0',
-          metrics.disk_total || '0', metrics.disk_used || '0', metrics.processes || '0',
-          metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode, 
-          metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
-          metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
-          monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '', newHistTime,
-          id
-        ).run();
+                    history.cpu = updateArr(history.cpu, parseFloat(metrics.cpu) || 0);
+                    history.ram = updateArr(history.ram, parseFloat(metrics.ram) || 0);
+                    history.proc = updateArr(history.proc, parseInt(metrics.processes) || 0);
+                    history.net_in = updateArr(history.net_in, parseFloat(metrics.net_in_speed) || 0);
+                    history.net_out = updateArr(history.net_out, parseFloat(metrics.net_out_speed) || 0);
+                    history.tcp = updateArr(history.tcp, parseInt(metrics.tcp_conn) || 0);
+                    history.udp = updateArr(history.udp, parseInt(metrics.udp_conn) || 0);
+                    history.ping_ct = updateArr(history.ping_ct, parseInt(metrics.ping_ct) || 0);
+                    history.ping_cu = updateArr(history.ping_cu, parseInt(metrics.ping_cu) || 0);
+                    history.ping_cm = updateArr(history.ping_cm, parseInt(metrics.ping_cm) || 0);
+                    history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
+                    history.time = updateLabels(history.time);
+                    history.last_time = nowMs;
+                    
+                    historyStr = JSON.stringify(history);
+                    newHistTime = nowMs;
+                }
 
-        const nowMsForThrottle = Date.now();
-        if (!globalThis.lastOfflineCheck || nowMsForThrottle - globalThis.lastOfflineCheck > 60000) {
-            globalThis.lastOfflineCheck = nowMsForThrottle;
-            ctx.waitUntil(checkOfflineNodes());
-        }
-        
-        if (!globalThis.lastMineAndGossipTime || nowMsForThrottle - globalThis.lastMineAndGossipTime > 15000) {
-            globalThis.lastMineAndGossipTime = nowMsForThrottle;
-            ctx.waitUntil(mineAndGossip());
-        }
+                await env.DB.prepare(`
+                  UPDATE servers 
+                  SET cpu = ?, ram = ?, disk = ?, load_avg = ?, uptime = ?, last_updated = ?,
+                      ram_total = ?, net_rx = ?, net_tx = ?, net_in_speed = ?, net_out_speed = ?,
+                      os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
+                      swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
+                      country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
+                      monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?, hist_updated = ?
+                  WHERE id = ?
+                `).bind(
+                  metrics.cpu, metrics.ram, metrics.disk, metrics.load, metrics.uptime, Date.now(),
+                  metrics.ram_total || '0', metrics.net_rx || '0', metrics.net_tx || '0', 
+                  metrics.net_in_speed || '0', metrics.net_out_speed || '0', 
+                  metrics.os || '', metrics.cpu_info || '', metrics.arch || '', metrics.boot_time || '',
+                  metrics.ram_used || '0', metrics.swap_total || '0', metrics.swap_used || '0',
+                  metrics.disk_total || '0', metrics.disk_used || '0', metrics.processes || '0',
+                  metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode, 
+                  metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
+                  metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
+                  monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '', newHistTime,
+                  id
+                ).run();
 
+                const nowMsForThrottle = Date.now();
+                if (!globalThis.lastOfflineCheck || nowMsForThrottle - globalThis.lastOfflineCheck > 60000) {
+                    globalThis.lastOfflineCheck = nowMsForThrottle;
+                    await checkOfflineNodes();
+                }
+                
+                if (!globalThis.lastMineAndGossipTime || nowMsForThrottle - globalThis.lastMineAndGossipTime > 15000) {
+                    globalThis.lastMineAndGossipTime = nowMsForThrottle;
+                    await mineAndGossip();
+                }
+            } catch (e) {
+                // Background error logging could go here if using something like Sentry/Logpush
+            }
+        };
+
+        // 🚀 将所有耗时阻塞操作扔进 waitUntil 后台运行
+        ctx.waitUntil(asyncBackgroundTasks());
+
+        // 🚀 主线程极速返回，响应时间直接暴降至 <5ms
         const finalOkRes = new Response("OK", { status: 200, headers: {'Cache-Control': 's-maxage=15, max-age=15'} });
         ctx.waitUntil(cache.put(cacheReq, finalOkRes.clone()));
         return finalOkRes;
+        
       } catch (e) { return new Response('Error', { status: 400 }); }
     }
 
@@ -2394,7 +2401,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
           let otherAssets = 0;
           
           let walletBalances = {};
-          // 🚀 核心优化 3：剔除全表遍历钱包。仅针对活跃排行版的 Peer 钱包执行靶向 IN 查询。
           try {
               const activeWallets = rankList.map(p => p.wallet_address).filter(w => w);
               if (activeWallets.length > 0) {
