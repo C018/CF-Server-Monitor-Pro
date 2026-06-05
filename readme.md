@@ -1,7 +1,12 @@
+# 功能越来越多了可以按需开启   只想简单探针可以不用个性化的CSS代码，直接用默认主题就行，个性化CSS设置才是本探针创建的初心，功能可以不用，但必须要有
 
-# 一键极速部署
+# 新人一键极速部署
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a63414262/CF-Server-Monitor-Pro)
+
+新用户GitHub 页面点击一键极速部署即可
+老用户worker.js 代码覆盖完成更新，属于是大版本更新，所有老用户的vps需要重新挂载agent命令
+先运行底部卸载命令！！！不然不卸载会导致显示离线错乱！！！卸载后再运行新的挂载命令
 
 ## 📸 界面预览
 
@@ -207,7 +212,7 @@ body.theme6 {
 *   🌸 **樱花飘落**：使用纯数学贝塞尔曲线动态绘制花瓣。
 *   ✨ **星光拖尾**：随鼠标移动生成的炫彩粒子跟随拖尾。
 *   ❤️ **爱心浮动**：鼠标点击页面任意位置，生成随机颜色的爱心并上浮。
-*   ❤️ **背景音乐播放**：实现网易云外链作为背景音乐自动单曲播放。https://music.163.com/song/media/outer/url?id=2614307770.mp3  id=你想替换的网易云音乐的ID即可
+*   ❤️ **背景音乐播放**：实现网易云外链作为背景音乐自动单曲播放。https://music.163.com/song/media/outer/url?id=2614307770.mp3  id=你想替换的网易云音乐的ID即可,删除ID播放背景音乐不开启
 ```html
 <audio id="bgm" autoplay loop preload="auto" style="display:none;">
     <source src="https://music.163.com/song/media/outer/url?id=2614307770.mp3" type="audio/mpeg">
