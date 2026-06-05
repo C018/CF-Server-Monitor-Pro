@@ -9,20 +9,16 @@
 
 已添加支持alpine系统挂载探针，已个性化CSS设置，已添加网易云外链单曲循环，可通过CSS代码实现个性化探针主题实现
 
-### 1. 前台多节点大盘与全局统计
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/0cd9b65a-ff8e-43b2-8a5f-8a3e6e424359" />
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/d341b70b-0131-4b3e-aeda-59ae36091c89" />
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/9c5283b5-05cc-4fae-9e10-8f70fe81381c" />
+### 1. 前台多节点大盘与单节点实时性能折线图
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/6230258f-321e-4807-80d8-7a5b44c8c914" />
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/084d95c1-2f8b-44a0-87ff-ed43a8accc09" />
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/31803b80-ffa5-4a3e-a589-c972d24836cc" />
 
+### 2. 后台管理与全局设置
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/272b6683-fe67-4c4c-806b-fde6ff66ec14" />
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/8cb999d0-ca82-4b2c-a9a9-c8b403bf1e9b" />
+<img width="3840" height="1765" alt="image" src="https://github.com/user-attachments/assets/bc0f8735-46ec-4cb7-831d-c9a4b9dc555c" />
 
-### 2. 单节点实时性能折线图
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/81ce19c3-7554-4dd1-818a-7ca478d3eb0d" />
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/7024bd65-7ec2-4912-8c7a-38af36796cf3" />
-
-### 3. 后台管理与全局设置
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/9d4d21de-6f2a-4980-9b0c-c9850f1e1223" />
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/d8bdd200-20bb-42dd-83d2-6810a59f03c8" />
-<img width="3840" height="1738" alt="image" src="https://github.com/user-attachments/assets/c6989909-0ce7-4cc1-87e6-65d87e4ea48b" />
 
 ---
 ## 🤝 参与贡献 (Contributing)
