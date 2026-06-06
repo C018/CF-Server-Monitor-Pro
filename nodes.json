@@ -31,8 +31,26 @@
       "css": "body.theme5 { background-color: #050505; color: #0ff; font-family: 'Courier New', Courier, monospace; } .theme5 .vps-card, .theme5 .global-stats, .theme5 .header-card, .theme5 .chart-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; } .theme5 .vps-card:hover { box-shadow: 0 0 20px rgba(0, 255, 255, 0.5); border-color: #0ff; } .theme5 .group-header { color: #f0f; border-left: 5px solid #0ff; text-shadow: 0 0 5px #f0f; } .theme5 .stat-val, .theme5 .g-val, .theme5 .card-title { color: #0ff; text-shadow: 0 0 5px #0ff; } .theme5 .stat-label, .theme5 .g-label, .theme5 .g-sub, .theme5 .card-meta { color: #f0f; } .theme5 .stat-bar, .theme5 .stat-bar-full { background: #222; border: 1px solid #f0f; border-radius: 0; } .theme5 .stat-bar > div, .theme5 .stat-bar-full > div { background: #0ff !important; box-shadow: 0 0 10px #0ff; border-radius: 0; } .theme5 .divider { background: #333; } .theme5 .badge-bw { background: #f0f; box-shadow: 0 0 5px #f0f; } .theme5 .badge-tf { background: #0ff; color:#000; box-shadow: 0 0 5px #0ff; } .theme5 .custom-table, .theme5 .filter-tag { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; } .theme5 .custom-table th { background: #111; color: #f0f; border-color: #333; } .theme5 .custom-table td { border-color: #333; } .theme5 .custom-table tr:hover { background: #222; } body.theme5 #map-container { background-color: #0d1117; background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px); border-color: #30363d; } .theme5 .stat-subtext { color: rgba(255,255,255,0.6); } .theme5 .stats-row .g-item, .theme5 .stats-row.bottom-row { border-color: rgba(255,255,255,0.1); }"
     },
     {
+      "id": "theme7",
+      "name": "7. 哪吒探针默认风格 (Nezha Default)",
+      "is_dark": false,
+      "css": "body.theme7 { background-color: #f8f9fa; color: #212529; } .theme7 .vps-card, .theme7 .global-stats, .theme7 .header-card, .theme7 .chart-card { background: #ffffff; border-radius: 12px; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); border: 1px solid rgba(0,0,0,0.125); transition: box-shadow 0.3s ease-in-out; } .theme7 .vps-card:hover { box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15); } .theme7 .group-header { border-left: 4px solid #0d6efd; color: #212529; font-weight: bold; } .theme7 .stat-bar, .theme7 .stat-bar-full { background: #e9ecef; } .theme7 .custom-table { border: 1px solid rgba(0,0,0,0.125); box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); border-radius: 12px; }"
+    },
+    {
+      "id": "theme8",
+      "name": "8. 哪吒探针 Hotaru (Nezha Hotaru)",
+      "is_dark": true,
+      "css": "body.theme8 { background: url('https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=1920&auto=format&fit=crop') no-repeat center center fixed; background-size: cover; color: #fff; } .theme8 .vps-card, .theme8 .global-stats, .theme8 .header-card, .theme8 .chart-card { background: rgba(30, 30, 30, 0.6); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); color: #fff; transition: all 0.3s ease; } .theme8 .vps-card:hover { background: rgba(40, 40, 40, 0.8); border-color: rgba(255, 255, 255, 0.3); transform: translateY(-3px); } .theme8 .group-header { color: #fff; border-left: 4px solid #ff79c6; text-shadow: 1px 1px 3px rgba(0,0,0,0.8); } .theme8 .stat-val, .theme8 .g-val, .theme8 .card-title { color: #fff; } .theme8 .stat-label, .theme8 .g-label, .theme8 .g-sub, .theme8 .card-meta, .theme8 .stat-subtext, .theme8 .os-text { color: rgba(255, 255, 255, 0.7); } .theme8 .stat-bar, .theme8 .stat-bar-full { background: rgba(0,0,0,0.5); } .theme8 .custom-table, .theme8 .filter-tag { background: rgba(30, 30, 30, 0.6); backdrop-filter: blur(10px); color: #fff; border: 1px solid rgba(255,255,255,0.1); } .theme8 .custom-table th, .theme8 .custom-table tr:hover { background: rgba(255, 255, 255, 0.1); color: #fff; } .theme8 #map-container { background-color: rgba(30,30,30,0.6); border-color: rgba(255,255,255,0.1); }"
+    },
+    {
+      "id": "theme9",
+      "name": "9. 哪吒经典列表 (Nezha ServerStatus)",
+      "is_dark": false,
+      "css": "body.theme9 { background-color: #f7f9fa; color: #333; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; } .theme9 .vps-card { border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e1e4e8; background: #fff; } .theme9 .group-header { border-left: none; border-bottom: 2px solid #e1e4e8; padding-bottom: 5px; color: #24292e; font-size: 16px; margin-bottom: 20px; } .theme9 .stat-bar, .theme9 .stat-bar-full { border-radius: 2px; } .theme9 .vps-card:hover { transform: none; border-color: #0366d6; box-shadow: 0 1px 3px rgba(0,0,0,0.1); } .theme9 .card-title { font-size: 16px; color: #0366d6; }"
+    },
+    {
       "id": "theme6",
-      "name": "6. 完全自定义 CSS (Custom Theme)",
+      "name": "10. 完全自定义 CSS (Custom Theme)",
       "is_dark": true,
       "has_custom_css": true,
       "css": ""
