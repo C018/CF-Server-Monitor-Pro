@@ -1,4 +1,43 @@
 {
+  "themes": [
+    {
+      "id": "theme1",
+      "name": "1. 默认清爽白 (Classic White)",
+      "is_dark": false,
+      "css": ""
+    },
+    {
+      "id": "theme2",
+      "name": "2. 暗黑极客 (Dark Mode)",
+      "is_dark": true,
+      "css": "body.theme2 { background-color: #0d1117; color: #c9d1d9; } .theme2 .vps-card, .theme2 .global-stats, .theme2 .header-card, .theme2 .chart-card { background: #161b22; color: #c9d1d9; box-shadow: 0 4px 6px rgba(0,0,0,0.4); border: 1px solid #30363d; } .theme2 .vps-card:hover { border-color: #8b949e; } .theme2 .group-header { color: #58a6ff; border-left-color: #58a6ff; } .theme2 .stat-val, .theme2 .g-val { color: #fff; } .theme2 .stat-label, .theme2 .g-label, .theme2 .g-sub, .theme2 .card-meta { color: #8b949e; } .theme2 .stat-bar, .theme2 .stat-bar-full { background: #21262d; } .theme2 .divider { background: #30363d; } .theme2 .card-title { color: #fff; } .theme2 .view-controls { background: #0d1117; border: 1px solid #30363d; } .theme2 .toggle-btn { color: #8b949e; } .theme2 .toggle-btn:hover { color: #c9d1d9; } .theme2 .toggle-btn.active { background: #21262d; color: #58a6ff; border: 1px solid #30363d; } .theme2 .custom-table { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; box-shadow: none; } .theme2 .custom-table th { background: #0d1117; color: #8b949e; border-bottom-color: #30363d; } .theme2 .custom-table td { border-bottom-color: #30363d; } .theme2 .custom-table tr:hover { background: #21262d; } .theme2 .filter-tag { background: #161b22; color: #c9d1d9; border-color: #30363d; } body.theme2 #map-container { background-color: #0d1117; background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px); border-color: #30363d; } .theme2 .stat-subtext { color: rgba(255,255,255,0.6); } .theme2 .stats-row .g-item, .theme2 .stats-row.bottom-row { border-color: rgba(255,255,255,0.1); }"
+    },
+    {
+      "id": "theme3",
+      "name": "3. 新粗野主义 (Brutalism)",
+      "is_dark": false,
+      "css": "body.theme3 { background-color: #fef08a; color: #000; font-weight: 500; } .theme3 .vps-card, .theme3 .global-stats, .theme3 .header-card, .theme3 .chart-card { background: #fff; border: 3px solid #000; border-radius: 0; box-shadow: 6px 6px 0px #000; transition: transform 0.1s, box-shadow 0.1s; } .theme3 .vps-card:hover { transform: translate(2px, 2px); box-shadow: 4px 4px 0px #000; border-color: #000; } .theme3 .group-header { color: #000; border-left: none; border-bottom: 4px solid #000; padding-left: 0; display: inline-block; font-size: 22px; font-weight: 900; text-transform: uppercase; } .theme3 .stat-bar, .theme3 .stat-bar-full { background: #e5e5e5; border: 1px solid #000; } .theme3 .stat-bar > div, .theme3 .stat-bar-full > div { border-right: 1px solid #000; } .theme3 .badge { border: 1px solid #000; border-radius: 0; } .theme3 .stat-val, .theme3 .g-val, .theme3 .card-title { font-weight: 900; color: #000; } .theme3 .custom-table, .theme3 .filter-tag { background: #fff; border: 3px solid #000; border-radius: 0; box-shadow: 6px 6px 0px #000; }"
+    },
+    {
+      "id": "theme4",
+      "name": "4. 动态渐变毛玻璃 (Glassmorphism)",
+      "is_dark": true,
+      "css": "body.theme4 { background: linear-gradient(45deg, #4facfe 0%, #00f2fe 100%); background-attachment: fixed; color: #fff; } .theme4 .vps-card, .theme4 .global-stats, .theme4 .header-card, .theme4 .chart-card { background: rgba(255, 255, 255, 0.2); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.4); box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.1); color: #fff; } .theme4 .vps-card:hover { background: rgba(255, 255, 255, 0.3); border-color: rgba(255, 255, 255, 0.8); } .theme4 .group-header { color: #fff; border-left-color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,0.2); } .theme4 .stat-val, .theme4 .g-val, .theme4 .card-title { color: #fff; } .theme4 .stat-label, .theme4 .g-label, .theme4 .g-sub, .theme4 .card-meta { color: rgba(255,255,255,0.8); } .theme4 .stat-bar, .theme4 .stat-bar-full { background: rgba(0,0,0,0.2); } .theme4 .divider { background: rgba(255,255,255,0.2); } .theme4 .custom-table, .theme4 .filter-tag { background: rgba(255, 255, 255, 0.2); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.4); box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.1); color: #fff; } .theme4 .custom-table th, .theme4 .custom-table tr:hover { background: rgba(0,0,0,0.1); color:#fff;} .theme4 .os-text { color: #eee; } .theme4 .stat-subtext { color: rgba(255,255,255,0.6); }"
+    },
+    {
+      "id": "theme5",
+      "name": "5. 赛博朋克 (Cyberpunk)",
+      "is_dark": true,
+      "css": "body.theme5 { background-color: #050505; color: #0ff; font-family: 'Courier New', Courier, monospace; } .theme5 .vps-card, .theme5 .global-stats, .theme5 .header-card, .theme5 .chart-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; } .theme5 .vps-card:hover { box-shadow: 0 0 20px rgba(0, 255, 255, 0.5); border-color: #0ff; } .theme5 .group-header { color: #f0f; border-left: 5px solid #0ff; text-shadow: 0 0 5px #f0f; } .theme5 .stat-val, .theme5 .g-val, .theme5 .card-title { color: #0ff; text-shadow: 0 0 5px #0ff; } .theme5 .stat-label, .theme5 .g-label, .theme5 .g-sub, .theme5 .card-meta { color: #f0f; } .theme5 .stat-bar, .theme5 .stat-bar-full { background: #222; border: 1px solid #f0f; border-radius: 0; } .theme5 .stat-bar > div, .theme5 .stat-bar-full > div { background: #0ff !important; box-shadow: 0 0 10px #0ff; border-radius: 0; } .theme5 .divider { background: #333; } .theme5 .badge-bw { background: #f0f; box-shadow: 0 0 5px #f0f; } .theme5 .badge-tf { background: #0ff; color:#000; box-shadow: 0 0 5px #0ff; } .theme5 .custom-table, .theme5 .filter-tag { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; box-shadow: 0 0 10px rgba(255, 0, 255, 0.2); color: #fff; } .theme5 .custom-table th { background: #111; color: #f0f; border-color: #333; } .theme5 .custom-table td { border-color: #333; } .theme5 .custom-table tr:hover { background: #222; } body.theme5 #map-container { background-color: #0d1117; background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px); border-color: #30363d; } .theme5 .stat-subtext { color: rgba(255,255,255,0.6); } .theme5 .stats-row .g-item, .theme5 .stats-row.bottom-row { border-color: rgba(255,255,255,0.1); }"
+    },
+    {
+      "id": "theme6",
+      "name": "6. 完全自定义 CSS (Custom Theme)",
+      "is_dark": true,
+      "has_custom_css": true,
+      "css": ""
+    }
+  ],
   "ct": [
     { "name": "北京电信", "host": "bj-ct-dualstack.ip.zstaticcdn.com" },
     { "name": "天津电信", "host": "tj-ct-dualstack.ip.zstaticcdn.com" },
