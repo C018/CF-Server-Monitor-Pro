@@ -14,7 +14,7 @@
 
 ## 📸 界面预览
 
-演示站点：https://still-cell-000f.a6856191801.workers.dev
+演示站点：https://still-cell-000f.a6856191801.workers.dev   https://tanzhen.kejikkk.com
 
 演示站点已经使用本页提供的CSS个性化代码美化设置，只想简单探针可以不用个性化的CSS代码，直接用默认主题就行
 
