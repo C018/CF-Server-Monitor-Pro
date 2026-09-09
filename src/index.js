@@ -98,8 +98,17 @@ export default {
       return safeEqual(username, 'admin') && safeEqual(password, env.API_SECRET);
     };
 
+    const safeRealm = (t) => { const s = String(t || '').replace(/[^\x20-\x7E]/g, '').trim(); return s || 'Monitor'; };
+
     const authResponse = (realmTitle) => new Response('Unauthorized', {
-      status: 401, headers: { 'WWW-Authenticate': `Basic realm="${realmTitle}"` }
+      status: 401,
+      headers: {
+        // realm 必须是纯 ASCII：标题里的中文/emoji 会造成非法 header，Chrome 会丢弃整行导致不弹密码窗
+        'WWW-Authenticate': `Basic realm="${safeRealm(realmTitle)}"`,
+        // 禁止缓存 401，避免浏览器/边缘命中旧响应而不重新弹窗
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'X-Content-Type-Options': 'nosniff'
+      }
     });
 
     let sys = {
