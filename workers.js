@@ -263,8 +263,7 @@ export default {
             <span style="margin-right: 15px;">👁️ 历史总访问：<b style="color: #3b82f6;">${sys.visits_total || 0}</b> 次</span>
             <span>🔥 今日访问：<b style="color: #10b981;">${sys.visits_today || 0}</b> 次</span>
         </div>
-        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a> | 
-        <a href="https://www.youtube.com/@%E7%A7%91%E6%8A%80KKK" target="_blank" style="color: #ef4444; text-decoration: none; font-weight: 600;">▶️ 小K分享频道</a>
+        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a>
       </div>
     `;
 
@@ -326,26 +325,6 @@ export default {
       ${themeOverrides}
     `;
 
-    // ==========================================
-    // 内部排行 API (/api/rank)
-    // ==========================================
-    if (request.method === 'GET' && url.pathname === '/api/rank') {
-      try {
-        const nowMs = Date.now();
-        // 只读化：陈旧 peers 清理统一由 runGossip 节流执行，避免高频轮询反复触发 DELETE
-        const { results: rankData } = await env.DB.prepare('SELECT domain, server_count as servers, total_asset as assets, last_seen FROM peers ORDER BY total_asset DESC, server_count DESC LIMIT 100').all();
-        
-        let asset_rank = 0; let server_rank = 0; let global_servers = 0; let global_assets = 0;
-        rankData.forEach(r => { global_servers += parseInt(r.servers) || 0; global_assets += parseFloat(r.assets) || 0; });
-
-        const sortedByAsset = [...rankData].sort((a,b) => b.assets - a.assets);
-        const sortedByServer = [...rankData].sort((a,b) => b.servers - a.servers);
-        asset_rank = sortedByAsset.findIndex(r => r.domain === myDomain) + 1;
-        server_rank = sortedByServer.findIndex(r => r.domain === myDomain) + 1;
-        
-        return new Response(JSON.stringify({ list: rankData, server_rank: server_rank > 0 ? server_rank : '-', asset_rank: asset_rank > 0 ? asset_rank : '-', global_servers: global_servers, global_assets: global_assets, timestamp: nowMs }), { headers: { 'Content-Type': 'application/json' } });
-      } catch(e) { return new Response(JSON.stringify({error: true}), { status: 500 }); }
-    }
 
     // ==========================================
     // 单个服务器详情 JSON API
@@ -991,10 +970,7 @@ export default {
                 <label style="font-size: 12px;">资产货币展示单位 (默认：元)</label>
                 <input type="text" id="cfg_asset_currency" value="${sys.asset_currency || '元'}" style="width: 120px; padding: 6px;">
               </div>
-              <div class="form-group" id="ranking_api_group" style="display: block; margin-left: 0px; margin-top: 10px; margin-bottom: 15px;">
-                <label style="font-size: 14px; color:#10b981; font-weight: bold;">✅ 已通过 Gossip 加入排名</label>
                 <input type="hidden" id="cfg_seed_nodes" value="still-cell-000f.a6856191801.workers.dev">
-              </div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
               <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #e63946;">✈️ Telegram 机器人管理与告警</label>
@@ -2271,8 +2247,6 @@ rm -f /tmp/cf_install.sh
         ctx.waitUntil(runGossip());
       }
       
-      let rankHtmlServer = `<span id="ajax-rank-server" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
-      let rankHtmlAsset = `<span id="ajax-rank-asset" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${visibleServersCount}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
@@ -2450,7 +2424,7 @@ rm -f /tmp/cf_install.sh
           .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
           .admin-btn { padding: 8px 16px; background: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; font-weight:bold; }
           
-          /* 排行榜 Modal CSS */
+          /* Modal 通用 CSS */
           .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; backdrop-filter: blur(4px); }
           .modal-content { background: white; padding: 20px; border-radius: 12px; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
           .theme2 .modal-content, .theme5 .modal-content, .theme4 .modal-content, .theme8 .modal-content, .theme6 .modal-content { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; }
@@ -2479,7 +2453,6 @@ rm -f /tmp/cf_install.sh
             
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
               <div class="view-controls">
-                <button class="toggle-btn" onclick="openRankModal()">🏆 Gossip 全网排行</button>
                 <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片
                 </button>
@@ -2502,19 +2475,14 @@ rm -f /tmp/cf_install.sh
             <div class="stats-row top-row">
               <div class="g-item">
                 <div class="g-label">本机服务器总数</div>
-                <div class="g-val">${visibleServersCount} ${rankHtmlServer}</div>
+                <div class="g-val">${visibleServersCount}</div>
                 <div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div>
               </div>
               
-              <div class="g-item" style="border-left: 3px solid #f59e0b; padding-left:15px; border-radius: 0;">
-                <div class="g-label">🌐 全网节点汇总 (Gossip)</div>
-                <div class="g-val"><span id="ajax-global-servers">0</span> 台 <button class="toggle-btn" style="display:inline-flex; font-size:12px; padding:2px 8px; margin-left:5px; vertical-align:middle;" onclick="openRankModal()">🏆 排名详情</button></div>
-                <div class="g-sub">全网总资产: <span id="ajax-global-assets">0.00</span> ${sys.asset_currency || '元'}</div>
-              </div>
 
               <div class="g-item">
                 <div class="g-label">本机可见数字资产 (${sys.asset_currency || '元'})</div>
-                <div class="g-val">${visibleAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${visibleRemAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div>
+                <div class="g-val">${visibleAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${visibleRemAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div>
               </div>
             </div>
             
@@ -2550,20 +2518,6 @@ rm -f /tmp/cf_install.sh
 
           <div id="view-map" class="view-panel">
             <div id="map-container"></div>
-          </div>
-          
-          <div id="rankModal" class="modal">
-            <div class="modal-content" style="max-width: 800px;">
-               <h3 style="margin-top:0; color:#f59e0b;">🏆 去中心化网络 (Gossip) 资产与探针排行</h3>
-               <p style="font-size:12px; color:#888; margin-bottom:20px;">* 数据由分布在各地的 Cloudflare Workers 节点通过弱共识自主计算得出。<br>当前全网共记录互联 VPS <b id="modal-global-servers" style="color:#3b82f6;">0</b> 台，汇总资产总额 <b id="modal-global-assets" style="color:#10b981;">0</b>。</p>
-               <div class="table-responsive">
-                 <table class="custom-table">
-                   <thead><tr><th>排名</th><th>网络节点 (Domain)</th><th>VPS 数量</th><th>探针总资产</th><th>最后活跃</th></tr></thead>
-                   <tbody id="rank-tbody"><tr><td colspan="5" style="text-align:center;">加载中...</td></tr></tbody>
-                 </table>
-               </div>
-               <div style="text-align:right; margin-top:20px;"><button onclick="closeRankModal()" class="btn btn-gray" style="padding: 8px 20px;">关闭</button></div>
-            </div>
           </div>
           
           ${sys.enable_popup === 'true' ? `
@@ -2632,74 +2586,8 @@ rm -f /tmp/cf_install.sh
               });
           }
 
-          window.latestRankList = [];
-          window.currentGlobalServers = '0';
-          window.currentGlobalAssets = '0.00';
-          let currentServerRank = '';
-          let currentAssetRank = '';
-
-          function openRankModal() {
-              document.getElementById('rankModal').style.display = 'block';
-              const list = window.latestRankList || [];
-              let html = '';
-              const nowMs = Date.now();
-              if(list.length > 0) {
-                  list.forEach((item, index) => {
-                      const isMe = item.domain === window.location.hostname;
-                      const nameLabel = isMe ? '👑 ' + item.domain + ' (本机)' : item.domain;
-                      const tdStyle = isMe ? 'font-weight:bold; color:#10b981;' : '';
-                      
-                      let activeStr = '刚刚';
-                      if (!isMe && item.last_seen) {
-                          const diffMin = Math.floor((nowMs - item.last_seen) / 60000);
-                          if (diffMin > 60) activeStr = Math.floor(diffMin/60) + '小时前';
-                          else if (diffMin > 0) activeStr = diffMin + '分钟前';
-                      }
-                      
-                      html += \`<tr><td style="\${tdStyle}">\${index + 1}</td><td style="\${tdStyle}">\${nameLabel}</td><td style="\${tdStyle}">\${item.servers} 台</td><td style="\${tdStyle}">\${parseFloat(item.assets).toFixed(2)} \${'${sys.asset_currency}'}</td><td style="\${tdStyle}">\${activeStr}</td></tr>\`;
-                  });
-              } else {
-                  html = '<tr><td colspan="5" style="text-align:center;">本地尚未拉取到其他节点的数据，系统正在后台握手互联中...</td></tr>';
-              }
-              document.getElementById('rank-tbody').innerHTML = html;
-          }
-          function closeRankModal() { document.getElementById('rankModal').style.display = 'none'; }
-
           let mapInitialized = false;
           window.currentFilter = 'all';
-
-          const fetchRank = async () => {
-              try {
-                  const res = await fetch('/api/rank');
-                  const data = await res.json();
-                  
-                  window.currentGlobalServers = data.global_servers || '0';
-                  window.currentGlobalAssets = parseFloat(data.global_assets || 0).toFixed(2);
-                  
-                  const elGs = document.getElementById('ajax-global-servers');
-                  if (elGs) elGs.innerText = window.currentGlobalServers;
-                  const elGa = document.getElementById('ajax-global-assets');
-                  if (elGa) elGa.innerText = window.currentGlobalAssets;
-                  
-                  const mGs = document.getElementById('modal-global-servers');
-                  if (mGs) mGs.innerText = window.currentGlobalServers;
-                  const mGa = document.getElementById('modal-global-assets');
-                  if (mGa) mGa.innerText = window.currentGlobalAssets + ' ' + '${sys.asset_currency}';
-
-                  if(data.server_rank !== '-') currentServerRank = '🏆 本机排第 ' + data.server_rank + ' 名';
-                  if(data.asset_rank !== '-') currentAssetRank = '🏆 本机排第 ' + data.asset_rank + ' 名';
-                  
-                  const elS = document.getElementById('ajax-rank-server');
-                  if(elS && currentServerRank) elS.innerHTML = currentServerRank;
-                  
-                  const elA = document.getElementById('ajax-rank-asset');
-                  if(elA && currentAssetRank) elA.innerHTML = currentAssetRank;
-                  
-                  window.latestRankList = data.list || [];
-              } catch(e) {}
-          };
-          fetchRank();
-          setInterval(fetchRank, 12000); 
 
           function switchView(viewName) {
             document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
@@ -2817,10 +2705,6 @@ rm -f /tmp/cf_install.sh
               document.getElementById('ajax-filters').innerHTML = newDoc.getElementById('ajax-filters').innerHTML;
               document.getElementById('map-data').textContent = newDoc.getElementById('map-data').textContent;
               
-              if (currentServerRank) { const elS = document.getElementById('ajax-rank-server'); if (elS) elS.innerHTML = currentServerRank; }
-              if (currentAssetRank) { const elA = document.getElementById('ajax-rank-asset'); if (elA) elA.innerHTML = currentAssetRank; }
-              const elGs = document.getElementById('ajax-global-servers'); if (elGs) elGs.innerText = window.currentGlobalServers;
-              const elGa = document.getElementById('ajax-global-assets'); if (elGa) elGa.innerText = window.currentGlobalAssets;
 
               drawMarkers(); applyFilter(); applySpeedAnimations();
             } catch (e) {}
