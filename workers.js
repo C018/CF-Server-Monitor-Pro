@@ -1375,19 +1375,13 @@ $PING_GG = "0"; $PING_CF = "0"
 
 function Get-HttpPing {
     param([string]$node)
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+    # ICMP ping: 单包 2 秒超时(2000ms)，解析往返毫秒；失败记 0
     try {
-        $req = [System.Net.WebRequest]::Create("http://" + $node)
-        $req.Timeout = 2000; $req.Method = "HEAD"
-        $res = $req.GetResponse(); $res.Close()
-        $sw.Stop()
-        return [math]::Round($sw.Elapsed.TotalMilliseconds)
+        $raw = (& ping.exe -n 1 -w 2000 $node 2>$null) | Out-String
+        if ($raw -match 'time[=<]([0-9]+)ms') { return [int]$Matches[1] }
+        if ($raw -match '时间[=<]([0-9]+)ms') { return [int]$Matches[1] }
+        return 0
     } catch {
-        if ($_.Exception.Response) {
-            $_.Exception.Response.Close()
-            $sw.Stop()
-            return [math]::Round($sw.Elapsed.TotalMilliseconds)
-        }
         return 0
     }
 }
@@ -1617,7 +1611,7 @@ WORKER_URL="\$WORKER_URL"
 
 get_net_bytes() { grep -vE '^[ 	]*(lo|docker|veth|br-|virbr|tun[0-9]*|tap[0-9]*|kube|vxlan|wg[0-9]*|tailscale[0-9]*|zt[0-9]*|sit[0-9]*|ip6tnl|vboxnet[0-9]*|vmnet[0-9]*|vmbr[0-9]*|utun[0-9]*|awdl[0-9]*|gif[0-9]*):' /proc/net/dev | awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}'; }
 get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
-get_http_ping() { rtt=\\$(curl -o /dev/null -s -m 2 -w "%{time_total}" "http://\\$1" 2>/dev/null | awk '{printf "%.0f", \\$1*1000}'); echo "\\\${rtt:-0}"; }
+get_http_ping() { out=\\$(ping -c 1 -W 2 "\\$1" 2>/dev/null); [ -z "\\$out" ] && echo 0 || { rtt=\\$(printf '%s' "\\$out" | awk '{for(i=1;i<=NF;i++){if(\\$i ~ /^time[=<]/){gsub(/[^0-9.]/,"",\\$i); printf "%.0f",\\$i+0; exit}}}'); [ -n "\\$rtt" ] && echo "\\$rtt" || echo 0; }; }
 
 NET_STAT=\\$(get_net_bytes)
 RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
@@ -2497,11 +2491,10 @@ rm -f /tmp/cf_install.sh
             const tx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
             metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' && sys.show_expire !== 'true' ? 'margin-top:8px;' : ''}">流量: <span style="color:#10b981">↓</span> ${rx_val_str} | <span style="color:#3b82f6">↑</span> ${tx_val_str}</div>`;
             
-            const diffSec = Math.max(0, Math.round((now - server.last_updated) / 1000));
             let upTimeFormat = (server.uptime || '-').replace('days', '天').replace('day', '天');
             const lastUpdAbs = server.last_updated ? fmtBJ(server.last_updated) : '-';
-            metaHtml += `<div class="card-meta" style="margin-top:2px;" title="最后更新(北京时间): ${lastUpdAbs}">在线: ${upTimeFormat} | 更新: ${diffSec}s前</div>`;
-            metaHtml += `<div class="card-meta" style="margin-top:1px; font-size:11px; color:#9ca3af; line-height:1.5;" title="最后更新(北京时间): ${lastUpdAbs}">最后更新: ${diffSec}s前 · ${lastUpdAbs}</div>`;
+            metaHtml += `<div class="card-meta" style="margin-top:2px;">在线: ${upTimeFormat}</div>`;
+            metaHtml += `<div class="card-meta" style="margin-top:1px; font-size:11px; color:#9ca3af; line-height:1.5;">最后更新: ${lastUpdAbs}</div>`;
 
             let badgesHtml = '';
             if (sys.show_bw === 'true' && server.bandwidth) badgesHtml += `<span class="badge badge-bw">${server.bandwidth}</span>`;
@@ -2509,7 +2502,7 @@ rm -f /tmp/cf_install.sh
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-group"><div class="ping-group-title">国内延迟</div><div class="ping-group-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span></div></div><div class="ping-group"><div class="ping-group-title">海外延迟</div><div class="ping-group-box"><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div></div>`;
+            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
@@ -2588,7 +2581,7 @@ rm -f /tmp/cf_install.sh
                 <td style="color:#64748b; font-size:12px; white-space: nowrap;">${rx_val_str} | ${tx_val_str}</td>
                 <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-in-${server.id}" data-val="${netInSpeedRaw}">0 B/s</span></td>
                 <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-out-${server.id}" data-val="${netOutSpeedRaw}">0 B/s</span></td>
-                <td style="color:#64748b; font-size:12px; white-space: nowrap;" title="最后更新(北京时间): ${server.last_updated ? fmtBJ(server.last_updated) : '-'}">${Math.max(0, Math.round((now - server.last_updated)/1000))} 秒前</td>
+                <td style="color:#64748b; font-size:12px; white-space: nowrap;">${server.last_updated ? fmtBJ(server.last_updated) : '-'}</td>
               </tr>
             `;
           }
