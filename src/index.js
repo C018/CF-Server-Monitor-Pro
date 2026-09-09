@@ -19,7 +19,8 @@ export default {
             swap_used TEXT, disk_total TEXT, disk_used TEXT, processes TEXT, tcp_conn TEXT, udp_conn TEXT, 
             country TEXT, ip_v4 TEXT, ip_v6 TEXT,
             server_group TEXT DEFAULT '默认分组', price TEXT DEFAULT '', expire_date TEXT DEFAULT '', 
-            bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian'
+            bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
+            sort_order INTEGER DEFAULT 0
           )
         `).run();
 
@@ -35,7 +36,8 @@ export default {
           history: "TEXT DEFAULT '{}'",
           is_hidden: "TEXT DEFAULT 'false'",
           virt: "TEXT DEFAULT ''",
-          reset_day: "TEXT DEFAULT '1'"
+          reset_day: "TEXT DEFAULT '1'",
+          sort_order: "INTEGER DEFAULT 0"
         };
 
         for (const [colName, colDef] of Object.entries(newCols)) {
@@ -68,6 +70,19 @@ export default {
     };
 
     // ==========================================
+    // 0. 通用安全工具：输出编码 / 常量时间比较
+    // ==========================================
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const escJs = (s) => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '\\u003c').replace(/\r/g, '').replace(/\n/g, '\\n');
+    const safeEqual = (a, b) => {
+      const la = String(a || ''), lb = String(b || '');
+      let res = la.length === lb.length ? 0 : 1;
+      const n = Math.max(la.length, lb.length);
+      for (let i = 0; i < n; i++) res |= (la.charCodeAt(i) || 0) ^ (lb.charCodeAt(i) || 0);
+      return res === 0;
+    };
+
+    // ==========================================
     // 1. 认证机制与全局设置加载
     // ==========================================
     const checkAuth = (req) => {
@@ -76,8 +91,11 @@ export default {
       const [scheme, encoded] = authHeader.split(' ');
       if (scheme !== 'Basic' || !encoded) return false;
       const decoded = atob(encoded);
-      const [username, password] = decoded.split(':');
-      return username === 'admin' && password === env.API_SECRET;
+      const sepIdx = decoded.indexOf(':');
+      const username = sepIdx >= 0 ? decoded.slice(0, sepIdx) : decoded;
+      const password = sepIdx >= 0 ? decoded.slice(sepIdx + 1) : '';
+      // 恒定时间比较，避免时序侧信道；用户名为非机密值，保持相同比较路径即可
+      return safeEqual(username, 'admin') && safeEqual(password, env.API_SECRET);
     };
 
     const authResponse = (realmTitle) => new Response('Unauthorized', {
@@ -88,7 +106,7 @@ export default {
       site_title: '⚡ Server Monitor Pro', admin_title: '⚙️ 探针管理后台', theme: 'theme1', 
       custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
       is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', show_admin_btn: 'true',
-      admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
+      admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '', tg_webhook_secret: '',
       auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
       offline_threshold: '30', alert_threshold: '120',
       enable_popup: 'false', popup_content: '<h3>📢 公告</h3><p>欢迎来到 Server Monitor Pro！<br>这是自定义弹窗内容，支持 HTML 排版。</p>'
@@ -128,7 +146,7 @@ export default {
         let cmd = ''; let unCmd = '';
         const osType = s.agent_os === 'alpine' ? 'alpine' : (s.agent_os === 'windows' ? 'windows' : 'debian');
         if (osType === 'windows') {
-            cmd = `i`+'rm' + ` "${host}/install.ps1?id=${s.id}&secret=${env.API_SECRET}" | ` + `i`+'ex';
+            cmd = `i`+'rm' + ` -Headers @{ 'x-cf-secret' = '${env.API_SECRET}' } "${host}/install.ps1?id=${s.id}" | ` + `i`+'ex';
             unCmd = `Stop-ScheduledTask -TaskName CFProbeAgent -EA 0; Unregister-ScheduledTask -TaskName CFProbeAgent -Confirm:$false -EA 0; `+`R`+`emove-Item -Path C:\\ProgramData\\CFProbe -Recurse -Force -EA 0; Write-Host Uninstall_Success`;
         } else {
             const shellType = osType === 'alpine' ? 'sh' : 'bash';
@@ -155,10 +173,15 @@ export default {
     const checkOfflineNodes = async () => {
       if (sys.tg_notify !== 'true') return;
       try {
+        // 节流：全量离线扫描每 30 秒最多执行一次（多节点高频上报场景可显著降低 CPU 消耗）
+        const lastCheckRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_alert_check_at'").first();
+        const lastCheckAt = lastCheckRow ? parseInt(lastCheckRow.value || '0') : 0;
+        if (Date.now() - lastCheckAt < 30000) return;
+
         const { results: allServers } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
         let alertState = {};
         const stateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
-        if (stateRes) alertState = JSON.parse(stateRes.value);
+        if (stateRes) { try { alertState = JSON.parse(stateRes.value) || {}; } catch (e) { alertState = {}; } }
 
         let stateChanged = false;
         const now = Date.now();
@@ -169,14 +192,15 @@ export default {
           const isOffline = diff > alertThresMs; 
 
           if (isOffline && !alertState[s.id]) {
-            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${esc(s.name)}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
             alertState[s.id] = true; stateChanged = true;
           } else if (!isOffline && alertState[s.id]) {
-            await sendTelegram(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+            await sendTelegram(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${esc(s.name)}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
             delete alertState[s.id]; stateChanged = true;
           }
         }
         if (stateChanged) await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
+        await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("last_alert_check_at", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(String(now)).run();
       } catch (e) {}
     };
 
@@ -255,7 +279,7 @@ export default {
     if (request.method === 'GET' && url.pathname === '/api/rank') {
       try {
         const nowMs = Date.now();
-        await env.DB.prepare("DELETE FROM peers WHERE last_seen < ? AND last_seen > 0").bind(nowMs - 86400000).run();
+        // 只读化：陈旧 peers 清理统一由 runGossip 节流执行，避免高频轮询反复触发 DELETE
         const { results: rankData } = await env.DB.prepare('SELECT domain, server_count as servers, total_asset as assets, last_seen FROM peers ORDER BY total_asset DESC, server_count DESC LIMIT 100').all();
         
         let asset_rank = 0; let server_rank = 0; let global_servers = 0; let global_assets = 0;
@@ -288,15 +312,23 @@ export default {
     if (request.method === 'POST' && url.pathname === '/api/gossip') {
       try {
         const payload = await request.json();
-        if (!payload.domain || !payload.version) return new Response('Bad Request', {status: 400});
+        const domainRe = /^(?=.{4,253}$)([a-zA-Z0-9_]([a-zA-Z0-9-_]{0,61}[a-zA-Z0-9_])?\.)+[a-zA-Z]{2,}$/;
+        if (!payload.domain || !payload.version || typeof payload.domain !== 'string' || !domainRe.test(payload.domain)) return new Response('Bad Request', {status: 400});
         await env.DB.prepare(`
           INSERT INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, ?, ?, ?, ?)
           ON CONFLICT(domain) DO UPDATE SET server_count = excluded.server_count, total_asset = excluded.total_asset, version = excluded.version, last_seen = excluded.last_seen WHERE excluded.version > peers.version
         `).bind(payload.domain, payload.server_count || 0, payload.total_asset || 0, payload.version, Date.now()).run();
 
+        // 防恶意灌入：仅接受合法域名，忽略自身与发送者，且 peers 表总量受限
         if (Array.isArray(payload.known_peers)) {
-            for (const peerDomain of payload.known_peers.slice(0, 10)) {
-                if (peerDomain !== myDomain) await env.DB.prepare('INSERT OR IGNORE INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, 0, 0, 0, 0)').bind(peerDomain).run();
+            const cntRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM peers').first();
+            const atLimit = cntRow && parseInt(cntRow.c || '0') >= 1000;
+            if (!atLimit) {
+                for (const peerDomain of payload.known_peers.slice(0, 5)) {
+                    if (typeof peerDomain === 'string' && domainRe.test(peerDomain) && peerDomain !== myDomain && peerDomain !== payload.domain) {
+                        await env.DB.prepare('INSERT OR IGNORE INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, 0, 0, 0, 0)').bind(peerDomain).run();
+                    }
+                }
             }
         }
         return new Response('Gossip Synced', {status: 200});
@@ -307,6 +339,10 @@ export default {
     // Telegram Webhook 接口 (机器人控制核心)
     // ==========================================
     if (request.method === 'POST' && url.pathname === '/api/tg_webhook') {
+      // 校验 setWebhook 配置的 secret_token（纵深防御）；未配置时放行以兼容老版本平滑升级
+      if (sys.tg_webhook_secret && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== sys.tg_webhook_secret) {
+        return new Response('Forbidden', { status: 403 });
+      }
       try {
         const body = await request.json();
         const message = body.message;
@@ -556,10 +592,15 @@ export default {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
           if (data.settings.tg_bot_token) {
+             // 若未显式提供 webhook secret，则自动生成并持久化（接收端据此校验来源）
+             const hookSecret = data.settings.tg_webhook_secret || crypto.randomUUID().replace(/-/g, '');
+             if (!data.settings.tg_webhook_secret) {
+                await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind('tg_webhook_secret', hookSecret).run();
+             }
              try {
                 await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setWebhook`, {
                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({ url: `${host}/api/tg_webhook` })
+                   body: JSON.stringify({ url: `${host}/api/tg_webhook`, secret_token: hookSecret })
                 });
                 await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setMyCommands`, {
                    method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -584,11 +625,13 @@ export default {
         else if (data.action === 'add') {
           const id = crypto.randomUUID();
           const name = data.name || 'New Server';
+          const maxRow = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) AS m FROM servers').first();
+          const newSort = (maxRow && maxRow.m !== undefined ? maxRow.m : -1) + 1;
           await env.DB.prepare(`
             INSERT INTO servers 
-            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false', '1').run();
+            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day, sort_order) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false', '1', newSort).run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
         else if (data.action === 'delete') {
@@ -599,6 +642,24 @@ export default {
           await env.DB.prepare(`
             UPDATE servers SET name = ?, server_group = ?, price = ?, expire_date = ?, bandwidth = ?, traffic_limit = ?, agent_os = ?, is_hidden = ?, reset_day = ? WHERE id = ?
           `).bind(data.name || 'Unnamed', data.server_group || '默认分组', data.price || '', data.expire_date || '', data.bandwidth || '', data.traffic_limit || '', data.agent_os || 'debian', data.is_hidden || 'false', data.reset_day || '1', data.id).run();
+          return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        else if (data.action === 'move') {
+          const listRes = await env.DB.prepare('SELECT id FROM servers ORDER BY sort_order ASC, rowid ASC').all();
+          const ordered = (listRes.results || []).map(r => r.id);
+          const idx = ordered.indexOf(data.id);
+          let target = data.dir === 'up' ? idx - 1 : data.dir === 'down' ? idx + 1 : -1;
+          if (idx >= 0 && target >= 0 && target < ordered.length) {
+            ordered.splice(idx, 1);
+            ordered.splice(target, 0, data.id);
+            // 按新展示顺序为全部节点重编 sort_order，保证相邻行可反复交换
+            await env.DB.batch(ordered.map((sid, i) => env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(i, sid)));
+          }
+          return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        else if (data.action === 'reset_traffic') {
+          // 仅清零当月流量累计；保留 last_rx/last_tx 基准，避免下一次上报把历史累计再次算入
+          await env.DB.prepare("UPDATE servers SET monthly_rx = '0', monthly_tx = '0' WHERE id = ?").bind(data.id).run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         }
         else if (data.action === 'pull_github') {
@@ -621,13 +682,15 @@ export default {
     // ==========================================
     if (request.method === 'GET' && url.pathname === sys.admin_path) {
       if (!checkAuth(request)) return authResponse(sys.admin_title);
-      const { results } = await env.DB.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day FROM servers').all();
+      const { results } = await env.DB.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day, sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
       const now = Date.now();
       const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
       
       let trs = '';
+      let seq = 0;
       if (results && results.length > 0) {
         for (const s of results) {
+          seq++;
           const isOnline = (now - s.last_updated) < offlineThresMs;
           const status = isOnline ? '<span style="color:green; font-weight:bold;">在线</span>' : '<span style="color:red; font-weight:bold;">离线</span>';
           const hiddenBadge = s.is_hidden === 'true' ? '<span style="background:#64748b; color:white; padding:2px 6px; border-radius:4px; font-size:12px; margin-left:5px;">已隐藏</span>' : '';
@@ -637,7 +700,7 @@ export default {
           
           trs += `
             <tr>
-              <td>${s.name} ${hiddenBadge}</td>
+              <td><b style="color:#64748b; font-size:12px;">#${seq}</b> ${s.name} ${hiddenBadge}</td>
               <td>${s.server_group || '默认分组'}</td>
               <td><span style="background:#e2e8f0; color:#475569; padding:2px 6px; border-radius:4px; font-size:12px;">${osType}</span></td>
               <td>${status}</td>
@@ -650,7 +713,10 @@ export default {
                     <button onclick="copyUnCmd('${s.id}')" class="btn btn-gray" style="white-space:nowrap;">一键卸载</button>
                   </div>
                   <div style="display:flex; gap:5px;">
+                    <button onclick="moveServer('${s.id}', 'up')" class="btn btn-gray" style="white-space:nowrap;" title="上移一位">⬆ 上移</button>
+                    <button onclick="moveServer('${s.id}', 'down')" class="btn btn-gray" style="white-space:nowrap;" title="下移一位">⬇ 下移</button>
                     <button onclick="openEditModal('${s.id}', '${s.name}', '${s.server_group||''}', '${s.price||''}', '${s.expire_date||''}', '${s.bandwidth||''}', '${s.traffic_limit||''}', '${osType}', '${s.is_hidden||'false'}', '${s.reset_day||'1'}')" class="btn btn-blue" style="white-space:nowrap;">✏️ 编辑信息</button>
+                    <button onclick="resetTraffic('${s.id}')" class="btn btn-yellow" style="white-space:nowrap;" title="将本月已用流量清零">🔄 流量清零</button>
                     <button onclick="deleteServer('${s.id}')" class="btn btn-red" style="white-space:nowrap;">🗑️ 删除节点</button>
                   </div>
                 </div>
@@ -691,7 +757,7 @@ export default {
           th { background: #f8f9fa; }
           .btn { cursor: pointer; border-radius: 4px; font-size: 13px; transition: opacity 0.2s; border: none; padding: 6px 10px; color: white; margin-left: 5px; }
           .btn:hover { opacity: 0.8; }
-          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; }
+          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; } .btn-yellow { background: #f59e0b; }
           .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
           .form-group { display: flex; flex-direction: column; margin-bottom: 15px; }
           .form-group label { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #555;}
@@ -968,6 +1034,15 @@ export default {
             const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'delete', id }) });
             if (res.ok) location.reload(); else alert('删除失败');
           }
+          async function moveServer(id, dir) {
+            const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'move', id, dir }) });
+            if (res.ok) location.reload(); else alert('调整排序失败');
+          }
+          async function resetTraffic(id) {
+            if (!confirm('确定将该节点本月已用流量清零吗？')) return;
+            const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reset_traffic', id }) });
+            if (res.ok) location.reload(); else alert('清零失败');
+          }
           function copyCmd(id) {
             const input = document.getElementById('cmd-' + id);
             input.select(); document.execCommand('copy');
@@ -1054,7 +1129,8 @@ export default {
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/install.ps1') {
       const serverId = url.searchParams.get('id');
-      const secret = url.searchParams.get('secret');
+      // 密钥优先从请求头读取（不再出现在 URL 与访问日志中）；兼容旧版 URL 携带方式
+      const secret = request.headers.get('x-cf-secret') || url.searchParams.get('secret') || '';
       if (!serverId || !secret) return new Response("Error: Missing id or secret params.", {status: 400});
       const cfg = await getAgentConfig();
 
@@ -1429,8 +1505,13 @@ while true; do
   if [ -z "\\$RX_NOW" ]; then RX_NOW=0; fi
   if [ -z "\\$TX_NOW" ]; then TX_NOW=0; fi
 
-  RX_SPEED=\\$(((RX_NOW - RX_PREV) / 5))
-  TX_SPEED=\\$(((TX_NOW - TX_PREV) / 5))
+  INV_SECS=\\$REPORT_INTERVAL
+  [ -z "\\$INV_SECS" ] && INV_SECS=5
+  if [ "\\$INV_SECS" -lt 1 ] 2>/dev/null; then INV_SECS=5; fi
+  # 无历史基准时（进程重启/状态文件丢失）首轮仅置基准，避免把开机累计当速度
+  if [ -z "\\$RX_PREV" ] || [ "\\$RX_PREV" -eq 0 ] 2>/dev/null; then RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW; fi
+  RX_SPEED=\\$(((RX_NOW - RX_PREV) / INV_SECS))
+  TX_SPEED=\\$(((TX_NOW - TX_PREV) / INV_SECS))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
   
   PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
@@ -1557,13 +1638,18 @@ rm -f /tmp/cf_install.sh
         const current_rx = parseFloat(metrics.net_rx || '0');
         const current_tx = parseFloat(metrics.net_tx || '0');
 
-        if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx);
-        else monthly_rx += current_rx;
+        if (serverExists.last_updated === 0) {
+            // 首次上报：探针上报的是网卡开机累计字节，直接作为流量基准，避免把历史累计误计入当月流量
+            last_rx = current_rx; last_tx = current_tx;
+        } else {
+            if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx);
+            else monthly_rx += current_rx;
 
-        if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx);
-        else monthly_tx += current_tx;
+            if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx);
+            else monthly_tx += current_tx;
 
-        last_rx = current_rx; last_tx = current_tx;
+            last_rx = current_rx; last_tx = current_tx;
+        }
 
         let history = {};
         try { history = JSON.parse(serverExists.history || '{}'); } catch(e) {}
@@ -1639,7 +1725,9 @@ rm -f /tmp/cf_install.sh
     // ==========================================
     // 大盘主程序、聚合渲染及 Gossip 路由分发
     // ==========================================
-    let { results } = await env.DB.prepare('SELECT * FROM servers').all();
+    // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
+    if (!(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
+    let { results } = await env.DB.prepare('SELECT * FROM servers ORDER BY sort_order ASC, rowid ASC').all();
 
     const now = Date.now();
     const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
@@ -2008,6 +2096,13 @@ rm -f /tmp/cf_install.sh
         // ==========================================
         const runGossip = async () => {
            const nowMs = Date.now();
+           // 节流：60 秒内只同步一次，避免每次首页刷新都触发多路出站请求与全表清理
+           try {
+             const lastGRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_gossip_at'").first();
+             const lastGAt = lastGRow ? parseInt(lastGRow.value || '0') : 0;
+             if (nowMs - lastGAt < 60000) return;
+           } catch(e) {}
+
            await env.DB.prepare("DELETE FROM peers WHERE last_seen < ? AND last_seen > 0").bind(nowMs - 86400000).run();
 
            let seedList = sys.seed_nodes ? sys.seed_nodes.split(',').map(s => s.trim()).filter(s => s) : [defaultPeersStr];
@@ -2043,6 +2138,7 @@ rm -f /tmp/cf_install.sh
               INSERT INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, ?, ?, ?, ?) 
               ON CONFLICT(domain) DO UPDATE SET server_count=excluded.server_count, total_asset=excluded.total_asset, version=excluded.version, last_seen=excluded.last_seen
            `).bind(myDomain, totalServersGossip, totalAssetGossip, nowMs, nowMs).run(); 
+           await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("last_gossip_at", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(String(nowMs)).run();
         };
         ctx.waitUntil(runGossip());
       }
