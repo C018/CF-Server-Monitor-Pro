@@ -111,6 +111,50 @@ export default {
       }
     });
 
+    // ---------- 会话 Cookie 登录（替代浏览器 Basic Auth 弹窗，兼容 Chrome） ----------
+    const SESSION_COOKIE = 'sm_admin_session';
+    const SESSION_TTL_MS = 30 * 24 * 3600 * 1000; // 30 天
+    const getCookie = (req, name) => {
+      const h = req.headers.get('Cookie') || '';
+      for (const part of h.split(';')) {
+        const i = part.indexOf('=');
+        if (i > 0 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+      }
+      return null;
+    };
+    const ensureSessions = async (env) => {
+      try { await env.DB.prepare('CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)').run(); } catch (e) {}
+    };
+    const genToken = () => crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+    const createSession = async (env) => {
+      await ensureSessions(env);
+      const token = genToken();
+      const expires = Date.now() + SESSION_TTL_MS;
+      try { await env.DB.prepare('INSERT INTO sessions (token, expires_at) VALUES (?, ?)').bind(token, expires).run(); } catch (e) { return null; }
+      try { await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(Date.now()).run(); } catch (e) {} // 顺手清理过期会话
+      return token;
+    };
+    const validSession = async (req, env) => {
+      const token = getCookie(req, SESSION_COOKIE);
+      if (!token) return false;
+      try {
+        const row = await env.DB.prepare('SELECT expires_at FROM sessions WHERE token = ?').bind(token).first();
+        if (!row) return false;
+        if (row.expires_at < Date.now()) {
+          try { await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run(); } catch (e) {}
+          return false;
+        }
+        return true;
+      } catch (e) { return false; }
+    };
+    const deleteSession = async (req, env) => {
+      const token = getCookie(req, SESSION_COOKIE);
+      if (token) { try { await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run(); } catch (e) {} }
+    };
+    const sessionCookieHeader = (token) => `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000; Secure`;
+    const clearCookieHeader = () => `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+    const isAdminAuthed = async (req, env) => checkAuth(req) || await validSession(req, env);
+
     let sys = {
       site_title: '⚡ Server Monitor Pro', admin_title: '⚙️ 探针管理后台', theme: 'theme1', 
       custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
@@ -307,7 +351,7 @@ export default {
     // 单个服务器详情 JSON API
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/api/server') {
-      if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
+      if (sys.is_public !== 'true' && !(await isAdminAuthed(request, env))) return authResponse(sys.site_title);
       const id = url.searchParams.get('id');
       if (!id) return new Response('Miss ID', { status: 400 });
       const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
@@ -590,10 +634,30 @@ export default {
     }
 
     // ==========================================
+    // 后台登录/退出（页面表单登录，替代浏览器 Basic Auth 弹窗）
+    // ==========================================
+    if (request.method === 'POST' && url.pathname === sys.admin_path + '/login') {
+      let body = null;
+      try { body = await request.json(); } catch (e) {}
+      const pwd = String((body && (body.password || body.pwd)) || '');
+      const usr = String((body && body.username) || 'admin');
+      if (safeEqual(usr, 'admin') && safeEqual(pwd, env.API_SECRET)) {
+        const token = await createSession(env);
+        if (!token) return new Response(JSON.stringify({ success: false, error: '创建会话失败，请检查 D1 数据库' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Set-Cookie': sessionCookieHeader(token) } });
+      }
+      return new Response(JSON.stringify({ success: false, error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
+    if (request.method === 'GET' && url.pathname === sys.admin_path + '/logout') {
+      await deleteSession(request, env);
+      return new Response(null, { status: 302, headers: { 'Location': sys.admin_path, 'Set-Cookie': clearCookieHeader(), 'Cache-Control': 'no-store' } });
+    }
+
+    // ==========================================
     // 后台管理 API
     // ==========================================
     if (request.method === 'POST' && url.pathname === sys.admin_path + '/api') {
-      if (!checkAuth(request)) return authResponse(sys.admin_title);
+      if (!(await isAdminAuthed(request, env))) return authResponse(sys.admin_title);
       try {
         const data = await request.json();
         if (data.action === 'save_settings') {
@@ -690,7 +754,59 @@ export default {
     // 后台管理 UI
     // ==========================================
     if (request.method === 'GET' && url.pathname === sys.admin_path) {
-      if (!checkAuth(request)) return authResponse(sys.admin_title);
+      if (!(await isAdminAuthed(request, env))) {
+        // 页面内登录表单，不再依赖浏览器 Basic Auth 弹窗（兼容 Chrome）
+        const _t = esc(sys.admin_title);
+        const _site = esc(sys.site_title);
+        const _loginUrl = JSON.stringify(sys.admin_path + '/login');
+        const _adminPathJs = JSON.stringify(sys.admin_path);
+        return new Response(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${_t}</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh;}
+  .card{background:#fff;border-radius:12px;padding:40px 36px;width:340px;box-shadow:0 10px 30px rgba(0,0,0,.08);}
+  h1{font-size:18px;text-align:center;color:#1f2937;margin-bottom:6px;}
+  p.sub{font-size:13px;text-align:center;color:#9ca3af;margin-bottom:24px;}
+  input{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;outline:none;margin-bottom:14px;}
+  input:focus{border-color:#3b82f6;}
+  button{width:100%;padding:10px 12px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer;}
+  button:disabled{opacity:.6;cursor:not-allowed;}
+  .err{color:#dc2626;font-size:13px;text-align:center;margin-top:12px;min-height:18px;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${_t}</h1>
+    <p class="sub">${_site}</p>
+    <input type="password" id="pwd" placeholder="请输入管理密码" autocomplete="current-password" autofocus>
+    <button id="btn">登 录</button>
+    <div class="err" id="msg"></div>
+  </div>
+<script>
+(function(){
+  var btn=document.getElementById('btn'), pwd=document.getElementById('pwd'), msg=document.getElementById('msg');
+  async function doLogin(){
+    if(!pwd.value){ msg.textContent='请输入密码'; return; }
+    btn.disabled=true; msg.textContent='';
+    try{
+      var res=await fetch(${_loginUrl}, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd.value})});
+      if(res.ok){ location.href=${_adminPathJs}; return; }
+      var j=await res.json().catch(function(){return {};});
+      msg.textContent=j.error||'登录失败'; btn.disabled=false;
+    }catch(e){ msg.textContent='网络错误，请重试'; btn.disabled=false; }
+  }
+  btn.addEventListener('click',doLogin);
+  pwd.addEventListener('keydown',function(e){ if(e.key==='Enter') doLogin(); });
+})();
+</script>
+</body>
+</html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+      }
       const { results } = await env.DB.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day, sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
       const now = Date.now();
       const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
@@ -781,6 +897,9 @@ export default {
         </style>
       </head>
       <body>
+        <div style="max-width:1100px; margin:0 auto 14px auto; display:flex; justify-content:flex-end;">
+          <a href="${sys.admin_path}/logout" style="color:#6b7280; text-decoration:none; font-size:13px;" title="退出登录后需重新输入密码">退出登录 →</a>
+        </div>
         <div class="card">
           <h2>🛠️ 全局设置与高级自定义</h2>
           <div class="settings-grid">
@@ -1821,7 +1940,7 @@ rm -f /tmp/cf_install.sh
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
-      if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
+      if (sys.is_public !== 'true' && !(await isAdminAuthed(request, env))) return authResponse(sys.site_title);
 
       const clientIP = request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || 'unknown';
       const isAjax = url.searchParams.get('ajax') === '1';
