@@ -1384,7 +1384,15 @@ while ($true) {
     $TCP_CONN = (netstat -ano -p tcp | Measure-Object).Count
     $UDP_CONN = (netstat -ano -p udp | Measure-Object).Count
 
+    # 仅统计物理网卡：排除 Loopback / vEthernet / Hyper-V / WSL / TAP / VPN / Tunnel / 蓝牙等虚拟适配器
+    $physIdx = @()
+    try {
+        $physIdx = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' -and -not $_.Virtual -and ($_.InterfaceDescription -notmatch 'Loopback|Virtual|Hyper-V|WSL|TAP|VPN|Tunnel|vEthernet|Bluetooth') } | Select-Object -ExpandProperty ifIndex)
+    } catch { $physIdx = $null }
     $netStats = Get-NetAdapterStatistics -ErrorAction SilentlyContinue
+    if ($physIdx -ne $null -and $physIdx.Count -gt 0) {
+        $netStats = $netStats | Where-Object { $_.ifIndex -in $physIdx }
+    }
     $RX_NOW = 0; $TX_NOW = 0
     if ($netStats) {
         $RX_NOW = ($netStats | Measure-Object -Property ReceivedBytes -Sum).Sum
@@ -1515,7 +1523,7 @@ SERVER_ID="\$SERVER_ID"
 SECRET="\$SECRET"
 WORKER_URL="\$WORKER_URL"
 
-get_net_bytes() { awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}' /proc/net/dev; }
+get_net_bytes() { grep -vE '^[ 	]*(lo|docker|veth|br-|virbr|tun[0-9]*|tap[0-9]*|kube|vxlan|wg[0-9]*|tailscale[0-9]*|zt[0-9]*|sit[0-9]*|ip6tnl|vboxnet[0-9]*|vmnet[0-9]*|vmbr[0-9]*|utun[0-9]*|awdl[0-9]*|gif[0-9]*):' /proc/net/dev | awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}'; }
 get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
 get_http_ping() { rtt=\\$(curl -o /dev/null -s -m 2 -w "%{time_total}" "http://\\$1" 2>/dev/null | awk '{printf "%.0f", \\$1*1000}'); echo "\\\${rtt:-0}"; }
 
