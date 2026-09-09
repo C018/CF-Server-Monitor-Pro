@@ -1,48 +1,3 @@
-// Telegram 告警专用转义（模块顶层，供 Cron 定时扫描复用）
-const tgEsc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-// 独立定时掉线扫描：不依赖探针上报流量，Cron 每 1 分钟触发一次
-async function scheduledAlertCheck(env) {
-  try {
-    const cfg = {};
-    try { const { results } = await env.DB.prepare('SELECT * FROM settings').all(); if (results) results.forEach(r => cfg[r.key] = r.value); } catch (e) {}
-    if (cfg.tg_notify !== 'true' || !cfg.tg_bot_token || !cfg.tg_chat_id) return;
-    const lastRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_alert_check_at'").first();
-    const lastAt = lastRow ? parseInt(lastRow.value || '0', 10) : 0;
-    if (Date.now() - lastAt < 30000) return;
-    const { results: servers } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
-    if (!servers || servers.length === 0) return;
-    let alertState = {};
-    const stateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
-    if (stateRow) { try { alertState = JSON.parse(stateRow.value) || {}; } catch (e) {} }
-    let changed = false;
-    const now = Date.now();
-    const thresMs = parseInt(cfg.alert_threshold || '120', 10) * 1000;
-    const send = async (msg) => {
-      try {
-        await fetch(`https://api.telegram.org/bot${cfg.tg_bot_token}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: cfg.tg_chat_id, text: msg, parse_mode: 'HTML' }),
-          signal: AbortSignal.timeout(10000)
-        });
-      } catch (e) {}
-    };
-    for (const s of servers) {
-      const diff = now - s.last_updated;
-      const isOffline = diff > thresMs;
-      if (isOffline && !alertState[s.id]) {
-        await send(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${tgEsc(s.name)}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-        alertState[s.id] = true; changed = true;
-      } else if (!isOffline && alertState[s.id]) {
-        await send(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${tgEsc(s.name)}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-        delete alertState[s.id]; changed = true;
-      }
-    }
-    if (changed) await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
-    await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("last_alert_check_at", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(String(now)).run();
-  } catch (e) {}
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -705,45 +660,35 @@ export default {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
           if (data.settings.tg_bot_token) {
-             // 复用已有 webhook secret；仅在确实没有时才生成新值，且必须等 Telegram 侧 setWebhook 成功才落库，
-             // 避免保存失败/网络异常时 DB 与 Telegram 侧 secret 不一致，导致后续全部 webhook 管理请求 403
-             const hadSecret = !!(data.settings.tg_webhook_secret || sys.tg_webhook_secret);
-             const hookSecret = data.settings.tg_webhook_secret || sys.tg_webhook_secret || crypto.randomUUID().replace(/-/g, '');
-             const wbUrl = `${host}/api/tg_webhook`;
+             // 若未显式提供 webhook secret，则自动生成并持久化（接收端据此校验来源）
+             const hookSecret = data.settings.tg_webhook_secret || crypto.randomUUID().replace(/-/g, '');
+             if (!data.settings.tg_webhook_secret) {
+                await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind('tg_webhook_secret', hookSecret).run();
+             }
              try {
-                const wbRes = await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setWebhook`, {
+                await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setWebhook`, {
                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({ url: wbUrl, secret_token: hookSecret }),
+                   body: JSON.stringify({ url: `${host}/api/tg_webhook`, secret_token: hookSecret }),
                    signal: AbortSignal.timeout(10000)
                 });
-                if (!wbRes.ok) {
-                   return new Response(JSON.stringify({ success: false, error: `Telegram setWebhook 失败(HTTP ${wbRes.status})：请确认 Bot Token 有效，且 ${wbUrl} 可从公网通过 HTTPS 访问` }), { headers: { 'Content-Type': 'application/json' } });
-                }
-                if (!hadSecret) {
-                   await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind('tg_webhook_secret', hookSecret).run();
-                }
-                try {
-                   await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setMyCommands`, {
-                      method: 'POST', headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({
-                         commands: [
-                            { command: "menu", description: "打开可视化管理菜单" },
-                            { command: "add", description: "添加节点 (例: /add HK debian)" },
-                            { command: "edit", description: "编辑节点 (例: /edit ID 名称 分组)" },
-                            { command: "del", description: "删除节点 (例: /del ID)" },
-                            { command: "set_interval", description: "上报间隔 (例: /set_interval 10)" },
-                            { command: "set_offline", description: "前台离线判定时间(秒)" },
-                            { command: "set_alert", description: "TG告警判定时间(秒)" },
-                            { command: "set_sitetitle", description: "前台标题 (例: /set_sitetitle 探针)" },
-                            { command: "set_admintitle", description: "后台标题 (例: /set_admintitle 管理)" }
-                         ]
-                      }),
-                      signal: AbortSignal.timeout(10000)
-                   });
-                } catch (e) {}
-             } catch (e) {
-                return new Response(JSON.stringify({ success: false, error: 'Telegram 通信失败：' + String((e && e.message) || e) + '。请确认 Bot Token 有效且网络可达 api.telegram.org' }), { headers: { 'Content-Type': 'application/json' } });
-             }
+                await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setMyCommands`, {
+                   method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify({
+                      commands: [
+                         { command: "menu", description: "打开可视化管理菜单" },
+                         { command: "add", description: "添加节点 (例: /add HK debian)" },
+                         { command: "edit", description: "编辑节点 (例: /edit ID 名称 分组)" },
+                         { command: "del", description: "删除节点 (例: /del ID)" },
+                         { command: "set_interval", description: "上报间隔 (例: /set_interval 10)" },
+                         { command: "set_offline", description: "前台离线判定时间(秒)" },
+                         { command: "set_alert", description: "TG告警判定时间(秒)" },
+                         { command: "set_sitetitle", description: "前台标题 (例: /set_sitetitle 探针)" },
+                         { command: "set_admintitle", description: "后台标题 (例: /set_admintitle 管理)" }
+                      ]
+                   }),
+                   signal: AbortSignal.timeout(10000)
+                });
+             } catch(e) {}
           }
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
@@ -1193,12 +1138,11 @@ export default {
               }
             };
             const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-            const saved = await res.json().catch(() => ({}));
-            if (res.ok && saved.success !== false) { 
+            if (res.ok) { 
               alert('✅ 设置已保存！如果您配置了机器人，现在可以前往 Telegram 发送 /menu 测试，或查看左下角是否有 Menu 快捷菜单。'); 
               const newPath = document.getElementById('cfg_admin_path').value || '/admin';
               window.location.href = newPath.startsWith('/') ? newPath : '/' + newPath; 
-            } else alert('保存失败：' + (saved.error || ('HTTP ' + res.status)));
+            } else alert('保存失败');
           }
           async function addServer() {
             const name = document.getElementById('newName').value;
@@ -2819,10 +2763,5 @@ rm -f /tmp/cf_install.sh
     }
 
     return new Response('Not Found', { status: 404 });
-  },
-
-  // Cron 定时触发：探针全部掉线时无上报流量，仍能靠本入口触发告警扫描
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(scheduledAlertCheck(env));
   }
 };

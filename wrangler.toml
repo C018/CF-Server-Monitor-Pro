@@ -12,3 +12,7 @@ database_id = "" # 留空即可，一键部署时向导会自动处理
 #   wrangler secret put API_SECRET
 [vars]
 API_SECRET = "你的密码" # 默认探针通信密钥和后台管理密码（请勿公开此值）
+
+# 掉线告警定时扫描：全部节点掉线时没有上报流量触发检查，靠 Cron 保证告警可达
+[triggers]
+crons = ["*/1 * * * *"]
