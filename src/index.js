@@ -336,6 +336,11 @@ export default {
     const themeStyles = `
       .ping-box { font-size:11px; margin-top:10px; display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:5px 12px; padding: 6px 8px; border-radius: 4px; background: rgba(150,150,150,0.1); border: 1px solid rgba(150,150,150,0.2); }
       .ping-box > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+      .ping-group { font-size:11px; margin-top:10px; padding: 6px 8px; border-radius: 4px; background: rgba(150,150,150,0.08); border: 1px solid rgba(150,150,150,0.2); }
+      .ping-group-title { display:flex; align-items:center; gap:6px; font-size:10px; font-weight:600; color:#64748b; margin-bottom:4px; line-height:1.4; }
+      .ping-group-title::after { content:''; flex:1; height:1px; background: rgba(150,150,150,0.25); }
+      .ping-group-box { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:4px 12px; }
+      .ping-group-box > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
       .chart-full { grid-column: 1 / -1; }
       .chart-full canvas { max-height: 250px !important; }
 
@@ -2177,9 +2182,16 @@ rm -f /tmp/cf_install.sh
 
               <div class="chart-card chart-full" style="padding: 20px; border-radius: 12px; position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                   <span class="card-title" style="font-weight:bold;">延迟 (ms)</span>
+                   <span class="card-title" style="font-weight:bold;">国内延迟 (ms)</span>
                  </div>
-                 <div style="height: 250px;"><canvas id="chart-ping"></canvas></div>
+                 <div style="height: 220px;"><canvas id="chart-ping-dom"></canvas></div>
+              </div>
+
+              <div class="chart-card chart-full" style="padding: 20px; border-radius: 12px; position: relative; grid-column: 1 / -1;">
+                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                   <span class="card-title" style="font-weight:bold;">海外延迟 (ms)</span>
+                 </div>
+                 <div style="height: 180px;"><canvas id="chart-ping-ov"></canvas></div>
               </div>
             </div>
             
@@ -2265,25 +2277,18 @@ rm -f /tmp/cf_install.sh
               });
             }
 
-            function initPingChart() {
-              const ctx = document.getElementById('chart-ping').getContext('2d');
+            function initPingChart(canvasId, series) {
+              const ctx = document.getElementById(canvasId).getContext('2d');
               const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4') || document.body.className.includes('theme8') || document.body.className.includes('theme6');
               const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
               const fontColor = isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.6)';
+              const datasets = (series || []).map((s) => ({
+                     label: s[0], data: [], borderColor: s[1], borderWidth: 2, pointRadius: 0, tension: 0.4
+              }));
 
               return new Chart(ctx, {
                 type: 'line',
-                data: { 
-                   labels: [], 
-                   datasets: [
-                     { label: '电信', data: [], borderColor: '#3b82f6', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: '联通', data: [], borderColor: '#f59e0b', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: '移动', data: [], borderColor: '#10b981', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: '字节', data: [], borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: 'Google', data: [], borderColor: '#8b5cf6', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: 'Cloudflare', data: [], borderColor: '#06b6d4', borderWidth: 2, pointRadius: 0, tension: 0.4 }
-                   ] 
-                },
+                data: { labels: [], datasets: datasets },
                 options: {
                   responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, interaction: { mode: 'index', intersect: false },
                   plugins: { legend: { labels: { color: fontColor } } },
@@ -2301,7 +2306,8 @@ rm -f /tmp/cf_install.sh
                charts.proc = initChart('chart-proc', '进程数', null, 'rgba(139, 92, 246, 1)');
                charts.net = initChart('chart-net', '下载', '上传', 'rgba(16, 185, 129, 1)', 'rgba(59, 130, 246, 1)', true);
                charts.conn = initChart('chart-conn', 'TCP', 'UDP', 'rgba(245, 158, 11, 1)', 'rgba(236, 72, 153, 1)');
-               charts.ping = initPingChart();
+               charts.pingDom = initPingChart('chart-ping-dom', [['电信', '#3b82f6'], ['联通', '#f59e0b'], ['移动', '#10b981'], ['字节', '#ef4444']]);
+               charts.pingOversea = initPingChart('chart-ping-ov', [['Google', '#8b5cf6'], ['Cloudflare', '#06b6d4']]);
                fetchData(); setInterval(fetchData, 4000);
             });
 
@@ -2348,7 +2354,8 @@ rm -f /tmp/cf_install.sh
                      updateChart(charts.proc, labels, [history.proc]);
                      updateChart(charts.net, labels, [history.net_in, history.net_out]);
                      updateChart(charts.conn, labels, [history.tcp, history.udp]);
-                     updateChart(charts.ping, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd, history.ping_gg || [], history.ping_cf || []]);
+                     updateChart(charts.pingDom, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd]);
+                     updateChart(charts.pingOversea, labels, [history.ping_gg || [], history.ping_cf || []]);
                   }
                } catch (e) {}
             }
@@ -2502,7 +2509,7 @@ rm -f /tmp/cf_install.sh
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
+            const pingHtml = `<div class="ping-group"><div class="ping-group-title">国内延迟</div><div class="ping-group-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span></div></div><div class="ping-group"><div class="ping-group-title">海外延迟</div><div class="ping-group-box"><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
