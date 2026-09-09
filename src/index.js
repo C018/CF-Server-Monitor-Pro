@@ -2132,6 +2132,7 @@ rm -f /tmp/cf_install.sh
           <script>
             const serverId = "${idParam}";
             let charts = {};
+            let chartSyncCount = 0;
 
             const formatBytesJs = (bytes) => {
                const b = parseInt(bytes);
@@ -2211,7 +2212,6 @@ rm -f /tmp/cf_install.sh
                charts.net = initChart('chart-net', '下载', '上传', 'rgba(16, 185, 129, 1)', 'rgba(59, 130, 246, 1)', true);
                charts.conn = initChart('chart-conn', 'TCP', 'UDP', 'rgba(245, 158, 11, 1)', 'rgba(236, 72, 153, 1)');
                charts.ping = initPingChart();
-               let chartSyncCount = 0;
                fetchData(); setInterval(fetchData, 4000);
             });
 
