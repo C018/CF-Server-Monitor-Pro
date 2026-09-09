@@ -66,6 +66,7 @@ export default {
             server_group TEXT DEFAULT '默认分组', price TEXT DEFAULT '', expire_date TEXT DEFAULT '', 
             bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
             ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0',
+            ping_gg TEXT DEFAULT '0', ping_cf TEXT DEFAULT '0',
             monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0',
             reset_month TEXT DEFAULT '', history TEXT DEFAULT '{}', is_hidden TEXT DEFAULT 'false', virt TEXT DEFAULT '',
             reset_day TEXT DEFAULT '1', sort_order INTEGER DEFAULT 0
@@ -79,6 +80,7 @@ export default {
         
         const newCols = {
           ping_ct: "TEXT DEFAULT '0'", ping_cu: "TEXT DEFAULT '0'", ping_cm: "TEXT DEFAULT '0'", ping_bd: "TEXT DEFAULT '0'",
+          ping_gg: "TEXT DEFAULT '0'", ping_cf: "TEXT DEFAULT '0'",
           monthly_rx: "TEXT DEFAULT '0'", monthly_tx: "TEXT DEFAULT '0'", last_rx: "TEXT DEFAULT '0'", last_tx: "TEXT DEFAULT '0'", reset_month: "TEXT DEFAULT ''",
           agent_os: "TEXT DEFAULT 'debian'",
           history: "TEXT DEFAULT '{}'",
@@ -115,6 +117,15 @@ export default {
       const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
       const i = Math.floor(Math.log(b) / Math.log(k));
       return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    };
+
+    // 全站绝对时间统一按中国上海时区(UTC+8)格式化，返回 "YYYY-MM-DD HH:mm:ss"
+    const fmtBJ = (tsMs) => {
+      const ts = parseInt(tsMs);
+      if (isNaN(ts) || ts <= 0) return '-';
+      const d = new Date(ts + 8 * 3600 * 1000);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
     };
 
     // ==========================================
@@ -210,7 +221,7 @@ export default {
       custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
       is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true', show_admin_btn: 'true',
       admin_path: '/admin', asset_currency: '元', seed_nodes: '', tg_notify: 'false', tg_bot_token: '', tg_chat_id: '', tg_webhook_secret: '',
-      auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
+      auto_reset_traffic: 'false', report_interval: '5', ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default', ping_node_gg: 'default', ping_node_cf: 'default',
       offline_threshold: '30', alert_threshold: '120',
       enable_popup: 'false', popup_content: '<h3>📢 公告</h3><p>欢迎来到 Server Monitor Pro！<br>这是自定义弹窗内容，支持 HTML 排版。</p>'
     };
@@ -323,7 +334,8 @@ export default {
     if (currentThemeObj.has_custom_css || currentThemeObj.id === 'theme6') themeOverrides += `\n${sys.custom_css || ''}`;
 
     const themeStyles = `
-      .ping-box { font-size:11px; margin-top:10px; display:flex; gap:10px; padding: 6px 8px; border-radius: 4px; flex-wrap:wrap; background: rgba(150,150,150,0.1); border: 1px solid rgba(150,150,150,0.2); }
+      .ping-box { font-size:11px; margin-top:10px; display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:5px 12px; padding: 6px 8px; border-radius: 4px; background: rgba(150,150,150,0.1); border: 1px solid rgba(150,150,150,0.2); }
+      .ping-box > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
       .chart-full { grid-column: 1 / -1; }
       .chart-full canvas { max-height: 250px !important; }
 
@@ -595,9 +607,9 @@ export default {
                     const id = crypto.randomUUID();
                     await env.DB.prepare(`
                       INSERT INTO servers 
-                      (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day) 
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', agentOs, '{}', 'false', '1').run();
+                      (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, ping_gg, ping_cf, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day) 
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '', agentOs, '{}', 'false', '1').run();
                     
                     const newS = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
                     const cmds = getCmds(newS);
@@ -754,9 +766,9 @@ export default {
           const newSort = (maxRow && maxRow.m !== undefined ? maxRow.m : -1) + 1;
           await env.DB.prepare(`
             INSERT INTO servers 
-            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day, sort_order) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false', '1', newSort).run();
+            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, ping_gg, ping_cf, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day, sort_order) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false', '1', newSort).run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
         else if (data.action === 'delete') {
@@ -1059,10 +1071,12 @@ export default {
               <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789"></div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #8b5cf6;">📡 三网延迟测试节点选择 (动态下发更新)</label>
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #8b5cf6;">📡 延迟测试节点选择 (动态下发更新)</label>
               <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
               <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
               <div class="form-group"><label>移动 (CM) 测速节点</label><select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select></div>
+              <div class="form-group"><label>Google 测速目标</label><input type="text" id="cfg_ping_node_gg" value="${sys.ping_node_gg || 'default'}" placeholder="default = www.google.com，或填写自定义域名"></div>
+              <div class="form-group"><label>Cloudflare 测速目标</label><input type="text" id="cfg_ping_node_cf" value="${sys.ping_node_cf || 'default'}" placeholder="default = www.cloudflare.com，或填写自定义域名"></div>
             </div>
           </div>
           <button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
@@ -1189,7 +1203,9 @@ export default {
                 popup_content: document.getElementById('cfg_popup_content').value,
                 ping_node_ct: document.getElementById('cfg_ping_node_ct').value,
                 ping_node_cu: document.getElementById('cfg_ping_node_cu').value,
-                ping_node_cm: document.getElementById('cfg_ping_node_cm').value
+                ping_node_cm: document.getElementById('cfg_ping_node_cm').value,
+                ping_node_gg: (document.getElementById('cfg_ping_node_gg').value || '').trim() || 'default',
+                ping_node_cf: (document.getElementById('cfg_ping_node_cf').value || '').trim() || 'default'
               }
             };
             const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
@@ -1275,19 +1291,21 @@ export default {
     // 动态下发设置参数公共方法
     // ==========================================
     const getAgentConfig = async () => {
-      let reportInterval = '5'; let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default';
+      let reportInterval = '5'; let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default'; let pingGg = 'default'; let pingCf = 'default';
       try {
-        const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm')").all();
+        const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm', 'ping_node_gg', 'ping_node_cf')").all();
         if (res && res.results) {
            res.results.forEach(r => {
               if (r.key === 'report_interval') reportInterval = r.value || '5';
               if (r.key === 'ping_node_ct') pingCt = r.value || 'default';
               if (r.key === 'ping_node_cu') pingCu = r.value || 'default';
               if (r.key === 'ping_node_cm') pingCm = r.value || 'default';
+              if (r.key === 'ping_node_gg') pingGg = r.value || 'default';
+              if (r.key === 'ping_node_cf') pingCf = r.value || 'default';
            });
         }
       } catch(e) {}
-      return { reportInterval, pingCt, pingCu, pingCm };
+      return { reportInterval, pingCt, pingCu, pingCm, pingGg, pingCf };
     }
 
     // ==========================================
@@ -1341,11 +1359,14 @@ $REPORT_INTERVAL = ${cfg.reportInterval}
 $PING_NODE_CT = "${cfg.pingCt}"
 $PING_NODE_CU = "${cfg.pingCu}"
 $PING_NODE_CM = "${cfg.pingCm}"
+$PING_NODE_GG = "${cfg.pingGg}"
+$PING_NODE_CF = "${cfg.pingCf}"
 
 $RX_PREV = 0; $TX_PREV = 0
 $LOOP_COUNT = 0
 $IPV4 = "0"; $IPV6 = "0"
 $PING_CT = "0"; $PING_CU = "0"; $PING_CM = "0"; $PING_BD = "0"
+$PING_GG = "0"; $PING_CF = "0"
 
 function Get-HttpPing {
     param([string]$node)
@@ -1392,6 +1413,12 @@ while ($true) {
         $PING_CU = Get-HttpPing $c_cu
         $PING_CM = Get-HttpPing $c_cm
         $PING_BD = Get-HttpPing "lf3-ips.zstaticcdn.com"
+
+        $c_gg = if ($PING_NODE_GG -eq "default") { "www.google.com" } else { $PING_NODE_GG }
+        $c_cf = if ($PING_NODE_CF -eq "default") { "www.cloudflare.com" } else { $PING_NODE_CF }
+
+        $PING_GG = Get-HttpPing $c_gg
+        $PING_CF = Get-HttpPing $c_cf
     }
 
     $LOOP_COUNT++
@@ -1497,6 +1524,8 @@ while ($true) {
             ping_cu = "$PING_CU"
             ping_cm = "$PING_CM"
             ping_bd = "$PING_BD"
+            ping_gg = "$PING_GG"
+            ping_cf = "$PING_CF"
             virt = "$VIRT"
         }
     }
@@ -1513,6 +1542,8 @@ while ($true) {
                 if ($p -match "CT=(.+)") { $PING_NODE_CT = $matches[1] }
                 if ($p -match "CU=(.+)") { $PING_NODE_CU = $matches[1] }
                 if ($p -match "CM=(.+)") { $PING_NODE_CM = $matches[1] }
+                if ($p -match "GG=(.+)") { $PING_NODE_GG = $matches[1] }
+                if ($p -match "CF=(.+)") { $PING_NODE_CF = $matches[1] }
             }
         }
     } catch {
@@ -1596,11 +1627,14 @@ PREV_CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
 LOOP_COUNT=0
 IPV4="0"; IPV6="0"
 PING_CT="0"; PING_CU="0"; PING_CM="0"; PING_BD="0"
+PING_GG="0"; PING_CF="0"
 
 REPORT_INTERVAL="${cfg.reportInterval}"
 PING_NODE_CT="${cfg.pingCt}"
 PING_NODE_CU="${cfg.pingCu}"
 PING_NODE_CM="${cfg.pingCm}"
+PING_NODE_GG="${cfg.pingGg}"
+PING_NODE_CF="${cfg.pingCf}"
 
 while true; do
   if [ \\$((LOOP_COUNT % 60)) -eq 0 ]; then
@@ -1619,15 +1653,21 @@ while true; do
     CT_NODE="\\$PING_NODE_CT"
     CU_NODE="\\$PING_NODE_CU"
     CM_NODE="\\$PING_NODE_CM"
+    GG_NODE="\\$PING_NODE_GG"
+    CF_NODE="\\$PING_NODE_CF"
     
     [ "\\$CT_NODE" = "default" ] && CT_NODE="\\$D_CT"
     [ "\\$CU_NODE" = "default" ] && CU_NODE="\\$D_CU"
     [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
+    [ "\\$GG_NODE" = "default" ] && GG_NODE="www.google.com"
+    [ "\\$CF_NODE" = "default" ] && CF_NODE="www.cloudflare.com"
 
     PING_CT=\\$(get_http_ping "\\$CT_NODE")
     PING_CU=\\$(get_http_ping "\\$CU_NODE")
     PING_CM=\\$(get_http_ping "\\$CM_NODE")
     PING_BD=\\$(get_http_ping "lf3-ips.zstaticcdn.com")
+    PING_GG=\\$(get_http_ping "\\$GG_NODE")
+    PING_CF=\\$(get_http_ping "\\$CF_NODE")
   fi
   
   LOOP_COUNT=\\$((LOOP_COUNT + 1))
@@ -1710,7 +1750,7 @@ while true; do
   TX_SPEED=\\$(((TX_NOW - TX_PREV) / INV_SECS))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
   
-  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
+  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"ping_gg\\": \\"\\$PING_GG\\", \\"ping_cf\\": \\"\\$PING_CF\\", \\"virt\\": \\"\\$VIRT\\" }}"
   
   RES=\\$(curl -s -m 10 -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
   if echo "\\$RES" | grep -q "INTERVAL="; then
@@ -1725,6 +1765,12 @@ while true; do
     
     NEW_CM=\\$(echo "\\$RES" | awk -F'CM=' '{print \\$2}' | awk -F'|' '{print \\$1}')
     [ -n "\\$NEW_CM" ] && PING_NODE_CM="\\$NEW_CM"
+    
+    NEW_GG=\\$(echo "\\$RES" | awk -F'GG=' '{print \\$2}' | awk -F'|' '{print \\$1}')
+    [ -n "\\$NEW_GG" ] && PING_NODE_GG="\\$NEW_GG"
+    
+    NEW_CF=\\$(echo "\\$RES" | awk -F'CF=' '{print \\$2}' | awk -F'|' '{print \\$1}')
+    [ -n "\\$NEW_CF" ] && PING_NODE_CF="\\$NEW_CF"
   fi
   sleep \\$REPORT_INTERVAL
 done
@@ -1882,6 +1928,8 @@ rm -f /tmp/cf_install.sh
             history.ping_cu = updateArr(history.ping_cu, parseInt(metrics.ping_cu) || 0);
             history.ping_cm = updateArr(history.ping_cm, parseInt(metrics.ping_cm) || 0);
             history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
+            history.ping_gg = updateArr(history.ping_gg, parseInt(metrics.ping_gg) || 0);
+            history.ping_cf = updateArr(history.ping_cf, parseInt(metrics.ping_cf) || 0);
             history.time = updateLabels(history.time);
             history.last_time = nowMs;
         }
@@ -1894,7 +1942,7 @@ rm -f /tmp/cf_install.sh
               ram_total = ?, net_rx = ?, net_tx = ?, net_in_speed = ?, net_out_speed = ?,
               os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
               swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
-              country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
+              country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?, ping_gg = ?, ping_cf = ?,
               monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?
           WHERE id = ?
         `).bind(
@@ -1907,6 +1955,7 @@ rm -f /tmp/cf_install.sh
           metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode, 
           metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
           metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
+          metrics.ping_gg || '0', metrics.ping_cf || '0',
           monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '',
           id
         ).run();
@@ -1915,7 +1964,7 @@ rm -f /tmp/cf_install.sh
         
         let riNum = parseInt(sys.report_interval || '5', 10);
         if (isNaN(riNum) || riNum < 1 || riNum > 3600) riNum = 5;
-        return new Response(`INTERVAL=${riNum}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
+        return new Response(`INTERVAL=${riNum}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}|GG=${sys.ping_node_gg || 'default'}|CF=${sys.ping_node_cf || 'default'}`, { status: 200 });
       } catch (e) {
         return new Response('Error', { status: 400 });
       }
@@ -1926,7 +1975,7 @@ rm -f /tmp/cf_install.sh
     // ==========================================
     // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
     if (!(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
-    let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
+    let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,ping_gg,ping_cf,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
 
     const now = Date.now();
     const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
@@ -2028,6 +2077,10 @@ rm -f /tmp/cf_install.sh
         const flagHtml = flagCode !== 'xx' ? `<img src="https://flagcdn.com/24x18/${flagCode}.png" alt="${flagCode}" style="vertical-align: middle; margin-right: 8px; border-radius: 3px;">` : '🏳️';
         const isOnline = (Date.now() - server.last_updated) < offlineThresMs;
         const statusHtml = isOnline ? '<span style="background:#10b981; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold;">在线</span>' : '<span style="background:#ef4444; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold;">离线</span>';
+        const lastUpdMs = server.last_updated ? parseInt(server.last_updated) : 0;
+        const lastUpdSec = lastUpdMs > 0 ? Math.max(0, Math.round((Date.now() - lastUpdMs) / 1000)) : -1;
+        const lastUpdAbsText = lastUpdMs > 0 ? fmtBJ(lastUpdMs) : '-';
+        const lastUpdText = lastUpdMs > 0 ? `${lastUpdSec}s前 · ${lastUpdAbsText}` : '未知';
 
         const detailHtml = `<!DOCTYPE html>
         <html>
@@ -2055,8 +2108,13 @@ rm -f /tmp/cf_install.sh
             </div>
             
             <div class="header-card" style="padding: 25px; border-radius: 12px; margin-bottom: 20px;">
-              <div style="font-size: 24px; font-weight: bold; margin-bottom: 20px; display: flex; align-items: center;">
-                ${flagHtml} ${server.name} ${statusHtml}
+              <div style="display:flex; justify-content:flex-end; margin-bottom: 12px;">
+                <span id="bj-clock" style="font-size:13px; color:#888; background: rgba(150,150,150,0.12); padding:4px 10px; border-radius:8px;">北京时间加载中...</span>
+              </div>
+              <div style="font-size: 24px; font-weight: bold; margin-bottom: 20px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px;">
+                ${flagHtml} ${server.name}
+                <span id="d-status-wrap">${statusHtml}</span>
+                <span id="d-lastupd" style="font-size: 12px; font-weight: normal; color: #888;">最后更新: ${lastUpdText}</span>
               </div>
               <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px;">
                 <div><div class="stat-label">运行时间</div><div class="stat-val" id="d-uptime">${server.uptime || '-'}</div></div>
@@ -2119,7 +2177,7 @@ rm -f /tmp/cf_install.sh
 
               <div class="chart-card chart-full" style="padding: 20px; border-radius: 12px; position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                   <span class="card-title" style="font-weight:bold;">三网延迟 (ms)</span>
+                   <span class="card-title" style="font-weight:bold;">延迟 (ms)</span>
                  </div>
                  <div style="height: 250px;"><canvas id="chart-ping"></canvas></div>
               </div>
@@ -2133,6 +2191,36 @@ rm -f /tmp/cf_install.sh
             const serverId = "${idParam}";
             let charts = {};
             let chartSyncCount = 0;
+
+            // 统一北京时间(UTC+8)格式化，返回 "YYYY-MM-DD HH:mm:ss"
+            const fmtBJ = (ts) => {
+               const d = new Date(parseInt(ts) + 8 * 3600 * 1000);
+               const p = (n) => String(n).padStart(2, '0');
+               return \`\${d.getUTCFullYear()}-\${p(d.getUTCMonth() + 1)}-\${p(d.getUTCDate())} \${p(d.getUTCHours())}:\${p(d.getUTCMinutes())}:\${p(d.getUTCSeconds())}\`;
+            };
+            const OFFLINE_THRES = ${offlineThresMs};
+            let lastUpdTs = ${server.last_updated ? server.last_updated : 0};
+            function tickBjClock() {
+               const nowMs = Date.now();
+               const clockEl = document.getElementById('bj-clock');
+               if (clockEl) clockEl.textContent = '北京时间 ' + fmtBJ(nowMs);
+               if (lastUpdTs > 0) {
+                 const diff = Math.max(0, Math.round((nowMs - lastUpdTs) / 1000));
+                 const luEl = document.getElementById('d-lastupd');
+                 if (luEl) luEl.textContent = '最后更新: ' + diff + 's前 · ' + fmtBJ(lastUpdTs);
+                 const wrap = document.getElementById('d-status-wrap');
+                 if (wrap) {
+                   const on = (nowMs - lastUpdTs) < OFFLINE_THRES;
+                   const st = on ? '在线' : '离线';
+                   if (wrap.dataset.st !== st) {
+                     wrap.dataset.st = st;
+                     wrap.innerHTML = on ? '<span style="background:#10b981; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold;">在线</span>' : '<span style="background:#ef4444; color:white; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold;">离线</span>';
+                   }
+                 }
+               }
+            }
+            setInterval(tickBjClock, 1000);
+            tickBjClock();
 
             const formatBytesJs = (bytes) => {
                const b = parseInt(bytes);
@@ -2191,7 +2279,9 @@ rm -f /tmp/cf_install.sh
                      { label: '电信', data: [], borderColor: '#3b82f6', borderWidth: 2, pointRadius: 0, tension: 0.4 },
                      { label: '联通', data: [], borderColor: '#f59e0b', borderWidth: 2, pointRadius: 0, tension: 0.4 },
                      { label: '移动', data: [], borderColor: '#10b981', borderWidth: 2, pointRadius: 0, tension: 0.4 },
-                     { label: '字节', data: [], borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, tension: 0.4 }
+                     { label: '字节', data: [], borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, tension: 0.4 },
+                     { label: 'Google', data: [], borderColor: '#8b5cf6', borderWidth: 2, pointRadius: 0, tension: 0.4 },
+                     { label: 'Cloudflare', data: [], borderColor: '#06b6d4', borderWidth: 2, pointRadius: 0, tension: 0.4 }
                    ] 
                 },
                 options: {
@@ -2222,7 +2312,8 @@ rm -f /tmp/cf_install.sh
                   const res = await fetch('/api/server?id=' + serverId + (needHistory ? '' : '&no_history=1'));
                   if (!res.ok) return;
                   const data = await res.json();
-                  
+                  if (data.last_updated) { lastUpdTs = parseInt(data.last_updated) || lastUpdTs; tickBjClock(); }
+
                   document.getElementById('d-uptime').innerText = data.uptime;
                   document.getElementById('d-os').innerText = data.os;
                   document.getElementById('d-arch').innerText = data.arch;
@@ -2247,7 +2338,7 @@ rm -f /tmp/cf_install.sh
                   document.getElementById('txt-tcp').innerText = data.tcp_conn;
                   document.getElementById('txt-udp').innerText = data.udp_conn;
 
-                  let history = { time: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [] };
+                  let history = { time: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [], ping_gg: [], ping_cf: [] };
                   try { if (data.history) history = JSON.parse(data.history); } catch(e) {}
                   
                   if (history.time && history.time.length > 0) {
@@ -2257,7 +2348,7 @@ rm -f /tmp/cf_install.sh
                      updateChart(charts.proc, labels, [history.proc]);
                      updateChart(charts.net, labels, [history.net_in, history.net_out]);
                      updateChart(charts.conn, labels, [history.tcp, history.udp]);
-                     updateChart(charts.ping, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd]);
+                     updateChart(charts.ping, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd, history.ping_gg || [], history.ping_cf || []]);
                   }
                } catch (e) {}
             }
@@ -2399,9 +2490,11 @@ rm -f /tmp/cf_install.sh
             const tx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
             metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' && sys.show_expire !== 'true' ? 'margin-top:8px;' : ''}">流量: <span style="color:#10b981">↓</span> ${rx_val_str} | <span style="color:#3b82f6">↑</span> ${tx_val_str}</div>`;
             
-            const diffSec = Math.round((now - server.last_updated) / 1000);
+            const diffSec = Math.max(0, Math.round((now - server.last_updated) / 1000));
             let upTimeFormat = (server.uptime || '-').replace('days', '天').replace('day', '天');
-            metaHtml += `<div class="card-meta" style="margin-top:2px;">在线: ${upTimeFormat} | 更新: ${diffSec}s前</div>`;
+            const lastUpdAbs = server.last_updated ? fmtBJ(server.last_updated) : '-';
+            metaHtml += `<div class="card-meta" style="margin-top:2px;" title="最后更新(北京时间): ${lastUpdAbs}">在线: ${upTimeFormat} | 更新: ${diffSec}s前</div>`;
+            metaHtml += `<div class="card-meta" style="margin-top:1px; font-size:11px; color:#9ca3af; line-height:1.5;" title="最后更新(北京时间): ${lastUpdAbs}">最后更新: ${diffSec}s前 · ${lastUpdAbs}</div>`;
 
             let badgesHtml = '';
             if (sys.show_bw === 'true' && server.bandwidth) badgesHtml += `<span class="badge badge-bw">${server.bandwidth}</span>`;
@@ -2409,7 +2502,7 @@ rm -f /tmp/cf_install.sh
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span></div>`;
+            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
@@ -2422,6 +2515,7 @@ rm -f /tmp/cf_install.sh
                   <div class="card-title">
                     <div class="status-dot" style="background:${statusColor};"></div>
                     ${flagHtml} <span style="font-size:15px;" class="card-title-text">${server.name}</span>
+                    ${isOnline ? '' : '<span style="color:#ef4444; font-weight:bold; font-size:11px; margin-left:6px; border:1px solid rgba(239,68,68,0.45); border-radius:4px; padding:1px 5px; line-height:1.4; flex-shrink:0;">离线</span>'}
                   </div>
                   ${metaHtml}
                   <div class="card-badges">${badgesHtml}</div>
@@ -2487,7 +2581,7 @@ rm -f /tmp/cf_install.sh
                 <td style="color:#64748b; font-size:12px; white-space: nowrap;">${rx_val_str} | ${tx_val_str}</td>
                 <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-in-${server.id}" data-val="${netInSpeedRaw}">0 B/s</span></td>
                 <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-out-${server.id}" data-val="${netOutSpeedRaw}">0 B/s</span></td>
-                <td style="color:#64748b; font-size:12px; white-space: nowrap;">${Math.round((now - server.last_updated)/1000)} 秒前</td>
+                <td style="color:#64748b; font-size:12px; white-space: nowrap;" title="最后更新(北京时间): ${server.last_updated ? fmtBJ(server.last_updated) : '-'}">${Math.max(0, Math.round((now - server.last_updated)/1000))} 秒前</td>
               </tr>
             `;
           }
@@ -2553,6 +2647,7 @@ rm -f /tmp/cf_install.sh
             <h1 style="margin:0;">${esc(sys.site_title)}</h1>
             
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+              <span id="bj-clock" style="font-size:13px; color:#888; background: rgba(150,150,150,0.12); padding:4px 10px; border-radius:8px;">北京时间加载中...</span>
               <div class="view-controls">
                 <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片
@@ -2653,6 +2748,18 @@ rm -f /tmp/cf_install.sh
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
         
         <script>
+          // 统一北京时间(UTC+8)格式化，返回 "YYYY-MM-DD HH:mm:ss"
+          const fmtBJ = (ts) => {
+            const d = new Date(parseInt(ts) + 8 * 3600 * 1000);
+            const p = (n) => String(n).padStart(2, '0');
+            return \`\${d.getUTCFullYear()}-\${p(d.getUTCMonth() + 1)}-\${p(d.getUTCDate())} \${p(d.getUTCHours())}:\${p(d.getUTCMinutes())}:\${p(d.getUTCSeconds())}\`;
+          };
+          function tickHomeClock() {
+            const el = document.getElementById('bj-clock');
+            if (el) el.textContent = '北京时间 ' + fmtBJ(Date.now());
+          }
+          setInterval(tickHomeClock, 1000);
+          tickHomeClock();
           const formatBytesJs = (bytes) => {
             const b = parseInt(bytes);
             if (isNaN(b) || b === 0) return '0 B';
