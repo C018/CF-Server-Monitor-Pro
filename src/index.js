@@ -20,7 +20,10 @@ export default {
             country TEXT, ip_v4 TEXT, ip_v6 TEXT,
             server_group TEXT DEFAULT '默认分组', price TEXT DEFAULT '', expire_date TEXT DEFAULT '', 
             bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
-            sort_order INTEGER DEFAULT 0
+            ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0',
+            monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0',
+            reset_month TEXT DEFAULT '', history TEXT DEFAULT '{}', is_hidden TEXT DEFAULT 'false', virt TEXT DEFAULT '',
+            reset_day TEXT DEFAULT '1', sort_order INTEGER DEFAULT 0
           )
         `).run();
 
@@ -49,7 +52,7 @@ export default {
         const checkNodes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cached_nodes_data'").first();
         if (!checkNodes) {
            try {
-               const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
+               const res = await fetch('https://raw.githubusercontent.com/C018/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(10000) });
                if (res.ok) {
                    const dataText = await res.text();
                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run();
@@ -73,7 +76,9 @@ export default {
     // 0. 通用安全工具：输出编码 / 常量时间比较
     // ==========================================
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    const escJs = (s) => String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '\\u003c').replace(/\r/g, '').replace(/\n/g, '\\n');
+    const scrubServerText = (srv) => {
+      ['name','os','arch','virt','uptime','boot_time','cpu_info','price','bandwidth','traffic_limit','ip_v4','ip_v6','expire_date','country'].forEach(k => { if (srv[k] != null) srv[k] = esc(srv[k]); });
+    };
     const safeEqual = (a, b) => {
       const la = String(a || ''), lb = String(b || '');
       let res = la.length === lb.length ? 0 : 1;
@@ -203,7 +208,7 @@ export default {
             unCmd = `Stop-ScheduledTask -TaskName CFProbeAgent -EA 0; Unregister-ScheduledTask -TaskName CFProbeAgent -Confirm:$false -EA 0; `+`R`+`emove-Item -Path C:\\ProgramData\\CFProbe -Recurse -Force -EA 0; Write-Host Uninstall_Success`;
         } else {
             const shellType = osType === 'alpine' ? 'sh' : 'bash';
-            cmd = `c`+'url -sL' + ` ${host}/install.sh?os=${osType} | ${shellType} -s ${s.id} ${env.API_SECRET}`;
+            cmd = `c`+'url -sL' + ` -H 'x-cf-secret: ${env.API_SECRET}' ${host}/install.sh?os=${osType} | ${shellType} -s ${s.id}`;
             if (osType === 'alpine') {
                 unCmd = `rc-service cf-probe stop; rc-update del cf-probe default; `+`r`+`m -f /et`+`c/init.d/cf-probe /us`+`r/local/bin/cf-probe.sh; echo Uninstall_Success`;
             } else {
@@ -218,7 +223,8 @@ export default {
       try {
         await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' })
+          body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(10000)
         });
       } catch (e) {}
     };
@@ -263,7 +269,7 @@ export default {
             <span style="margin-right: 15px;">👁️ 历史总访问：<b style="color: #3b82f6;">${sys.visits_total || 0}</b> 次</span>
             <span>🔥 今日访问：<b style="color: #10b981;">${sys.visits_today || 0}</b> 次</span>
         </div>
-        Powered by <a href="https://github.com/a63414262/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a>
+        Powered by <a href="https://github.com/C018/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a>
       </div>
     `;
 
@@ -278,12 +284,14 @@ export default {
 
       ${sys.custom_bg ? `
         body { background: url('${sys.custom_bg}') no-repeat center center fixed !important; background-size: cover !important; }
-        .vps-card, .global-stats, .header-card, .chart-card, .custom-table, .filter-tag, .view-controls { background: rgba(255, 255, 255, 0.4) !important; backdrop-filter: blur(12px) !important; -webkit-backdrop-filter: blur(12px) !important; border: 1px solid rgba(255, 255, 255, 0.6) !important; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.1) !important; color: #111 !important; }
-        .vps-card:hover { background: rgba(255, 255, 255, 0.6) !important; transform: translateY(-3px); }
-        .group-header { color: #fff !important; text-shadow: 0 2px 5px rgba(0,0,0,0.6) !important; border-left-color: #fff !important; }
-        .stat-val, .g-val, .card-title { color: #000 !important; font-weight: 800 !important; }
-        .stat-label, .g-label, .g-sub, .card-meta { color: #333 !important; font-weight: 600 !important; }
-        .stat-bar, .stat-bar-full { background: rgba(0,0,0,0.1) !important; }
+        .vps-card, .global-stats, .header-card, .chart-card, .custom-table, .filter-tag, .view-controls { background: rgba(255, 255, 255, 0.55) !important; backdrop-filter: blur(12px) !important; -webkit-backdrop-filter: blur(12px) !important; }
+        .vps-card:hover { background: rgba(255, 255, 255, 0.8) !important; transform: translateY(-3px); }
+        .group-header { color: #fff !important; text-shadow: 0 2px 5px rgba(0,0,0,0.8), 0 0 3px rgba(0,0,0,0.55), 0 0 16px rgba(0,0,0,0.4) !important; border-left-color: #fff !important; border-left-width: 5px !important; }
+        .stat-val, .g-val, .card-title { color: #0f172a !important; font-weight: 800 !important; text-shadow: 0 0 4px rgba(255,255,255,0.65), 0 1px 2px rgba(255,255,255,0.5) !important; }
+        .stat-label, .g-label, .g-sub, .card-meta, .stat-header, .stat-subtext { color: #1f2937 !important; font-weight: 600 !important; text-shadow: 0 0 4px rgba(255,255,255,0.75), 0 1px 2px rgba(255,255,255,0.6) !important; }
+        .header h1, .detail-title { text-shadow: 0 1px 3px rgba(0,0,0,0.35), 0 0 2px rgba(0,0,0,0.25); }
+        .filter-tag { color: #1f2937 !important; }
+        .stat-bar, .stat-bar-full { background: rgba(0,0,0,0.12) !important; }
       ` : ''}
 
       .view-controls { display: flex; gap: 8px; background: rgba(0,0,0,0.05); padding: 4px; border-radius: 8px; }
@@ -335,6 +343,8 @@ export default {
       if (!id) return new Response('Miss ID', { status: 400 });
       const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
       if (!server || server.is_hidden === 'true') return new Response('Not Found', { status: 404 });
+      // 轮询瘦身：前端默认 no_history=1，仅按需（约每 5 分钟）拉一次完整 history 用于图表归档
+      if (url.searchParams.get('no_history') === '1') delete server.history;
       return new Response(JSON.stringify(server), { headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -384,7 +394,7 @@ export default {
             const payload = { chat_id: chatId, text: text, parse_mode: 'HTML' };
             if (keyboard) payload.reply_markup = keyboard;
             await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000)
             });
         };
 
@@ -392,7 +402,7 @@ export default {
             const payload = { chat_id: chatId, message_id: msgId, text: text, parse_mode: 'HTML' };
             if (keyboard) payload.reply_markup = keyboard;
             await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/editMessageText`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000)
             });
         };
 
@@ -640,6 +650,12 @@ export default {
       try {
         const data = await request.json();
         if (data.action === 'save_settings') {
+          const clampNum = (v, def, min, max) => { const n = parseInt(v, 10); return String(isNaN(n) ? def : Math.min(Math.max(n, min), max)); };
+          if (data.settings) {
+            if ('report_interval' in data.settings) data.settings.report_interval = clampNum(data.settings.report_interval, 5, 1, 3600);
+            if ('offline_threshold' in data.settings) data.settings.offline_threshold = clampNum(data.settings.offline_threshold, 30, 5, 86400);
+            if ('alert_threshold' in data.settings) data.settings.alert_threshold = clampNum(data.settings.alert_threshold, 120, 5, 86400);
+          }
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
@@ -652,7 +668,8 @@ export default {
              try {
                 await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setWebhook`, {
                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({ url: `${host}/api/tg_webhook`, secret_token: hookSecret })
+                   body: JSON.stringify({ url: `${host}/api/tg_webhook`, secret_token: hookSecret }),
+                   signal: AbortSignal.timeout(10000)
                 });
                 await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setMyCommands`, {
                    method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -668,7 +685,8 @@ export default {
                          { command: "set_sitetitle", description: "前台标题 (例: /set_sitetitle 探针)" },
                          { command: "set_admintitle", description: "后台标题 (例: /set_admintitle 管理)" }
                       ]
-                   })
+                   }),
+                   signal: AbortSignal.timeout(10000)
                 });
              } catch(e) {}
           }
@@ -716,7 +734,7 @@ export default {
         }
         else if (data.action === 'pull_github') {
           try {
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
+            const res = await fetch('https://raw.githubusercontent.com/C018/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(10000) });
             if (res.ok) {
               const dataText = await res.text();
               await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('cached_nodes_data', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(dataText).run();
@@ -912,11 +930,11 @@ export default {
               </div>
               <div class="form-group">
                 <label>前台看板标题</label>
-                <input type="text" id="cfg_site_title" value="${sys.site_title}">
+                <input type="text" id="cfg_site_title" value="${esc(sys.site_title)}">
               </div>
               <div class="form-group">
                 <label>后台标签栏名称</label>
-                <input type="text" id="cfg_admin_title" value="${sys.admin_title}">
+                <input type="text" id="cfg_admin_title" value="${esc(sys.admin_title)}">
               </div>
               <div class="form-group">
                 <label>⏱️ Agent 上报间隔 (秒)</label>
@@ -960,7 +978,7 @@ export default {
               <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #0284c7;">⚙️ 安全与路由控制</label>
               <div class="form-group" style="margin-bottom: 10px;">
                 <label>后台管理路径 (默认: /admin)</label>
-                <input type="text" id="cfg_admin_path" value="${sys.admin_path}" placeholder="例如: /xiaok-panel">
+                <input type="text" id="cfg_admin_path" value="${esc(sys.admin_path)}" placeholder="例如: /xiaok-panel">
               </div>
               <div class="checkbox-group">
                 <input type="checkbox" id="cfg_show_admin_btn" ${sys.show_admin_btn === 'true' ? 'checked' : ''}>
@@ -1293,6 +1311,13 @@ function Get-HttpPing {
 }
 
 while ($true) {
+    # 日志轮转：error.log 超过 1MB 时归档为 error.log.old，防止无限增长
+    try {
+        $errLog = Get-Item "C:\\ProgramData\\CFProbe\\error.log" -ErrorAction Stop
+        if ($errLog.Length -gt 1MB) {
+            Move-Item $errLog.FullName "$($errLog.FullName).old" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
     if ($LOOP_COUNT % 60 -eq 0) {
         try { $ipv4_req = (Invoke-RestMethod -Uri "https://cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 3); if ($ipv4_req -match "ip=") { $IPV4 = "1" } else { $IPV4 = "0" } } catch { $IPV4 = "0" }
     }
@@ -1418,7 +1443,7 @@ while ($true) {
     try {
         $res = Invoke-RestMethod -Uri $WORKER_URL -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8" -TimeoutSec 10
         if ($res -match "INTERVAL=") {
-            $parts = $res -split '\\|'
+            $parts = $res -split '\|'
             foreach ($p in $parts) {
                 if ($p -match "INTERVAL=(.+)") { $REPORT_INTERVAL = [int]$matches[1] }
                 if ($p -match "CT=(.+)") { $PING_NODE_CT = $matches[1] }
@@ -1462,13 +1487,16 @@ Invoke-Expression $script
     // Linux/Alpine 探针安装脚本 (/install.sh)
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/install.sh') {
+      // 密钥优先从请求头读取（与 /install.ps1 一致），不再出现在 URL 与访问日志
+      const secret = request.headers.get('x-cf-secret') || url.searchParams.get('secret') || '';
+      if (!secret) return new Response('Error: Missing secret.', { status: 401 });
       const cfg = await getAgentConfig();
       const osType = url.searchParams.get('os') || 'debian';
       const sh_bin = osType === 'alpine' ? "/bin/sh" : "/bin/bash";
 
       let realBashScript = `#!${sh_bin}
 SERVER_ID=\$1
-SECRET=\$2
+SECRET=\$(echo "\$SECRET_B64" | base64 -d)
 WORKER_URL="${host}/update"
 
 if [ -z "\$SERVER_ID" ] || [ -z "\$SECRET" ]; then echo "错误: 缺少参数。"; exit 1; fi
@@ -1620,7 +1648,7 @@ while true; do
   
   PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
   
-  RES=\\$(curl -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
+  RES=\\$(curl -s -m 10 -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
   if echo "\\$RES" | grep -q "INTERVAL="; then
     NEW_INV=\\$(echo "\\$RES" | awk -F'INTERVAL=' '{print \\$2}' | awk -F'|' '{print \\$1}')
     if [ -n "\\$NEW_INV" ] && [ "\\$NEW_INV" -eq "\\$NEW_INV" ] 2>/dev/null; then REPORT_INTERVAL=\\$NEW_INV; fi
@@ -1681,8 +1709,9 @@ echo "✅ Linux 探针安装成功！"
       const b64BashScript = encodeBase64(realBashScript);
       const bashWrapper = `#!/bin/sh
 echo ">> Downloading Secure Payload from CF-Monitor..."
+export SECRET_B64='${encodeBase64(secret)}'
 echo "${b64BashScript}" | base64 -d > /tmp/cf_install.sh
-sh /tmp/cf_install.sh "$1" "$2"
+sh /tmp/cf_install.sh "$1"
 rm -f /tmp/cf_install.sh
 `;
       return new Response(bashWrapper, { headers: { 'Content-Type': 'text/plain;charset=UTF-8' } });
@@ -1696,7 +1725,7 @@ rm -f /tmp/cf_install.sh
         const data = await request.json();
         const { id, secret, metrics } = data;
 
-        if (secret !== env.API_SECRET) return new Response('Unauthorized', { status: 401 });
+        if (!safeEqual(secret, env.API_SECRET)) return new Response('Unauthorized', { status: 401 });
 
         let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX';
 
@@ -1820,7 +1849,9 @@ rm -f /tmp/cf_install.sh
 
         ctx.waitUntil(checkOfflineNodes());
         
-        return new Response(`INTERVAL=${sys.report_interval || '5'}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
+        let riNum = parseInt(sys.report_interval || '5', 10);
+        if (isNaN(riNum) || riNum < 1 || riNum > 3600) riNum = 5;
+        return new Response(`INTERVAL=${riNum}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
       } catch (e) {
         return new Response('Error', { status: 400 });
       }
@@ -1831,7 +1862,7 @@ rm -f /tmp/cf_install.sh
     // ==========================================
     // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
     if (!(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
-    let { results } = await env.DB.prepare('SELECT * FROM servers ORDER BY sort_order ASC, rowid ASC').all();
+    let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
 
     const now = Date.now();
     const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
@@ -1851,6 +1882,7 @@ rm -f /tmp/cf_install.sh
 
     if (results && results.length > 0) {
       for (const server of results) {
+        scrubServerText(server);
         let amount = 0; let remValue = 0;
         if (server.price && server.price.match(/[\d.]+/)) {
             let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
@@ -1925,6 +1957,7 @@ rm -f /tmp/cf_install.sh
       if (idParam && !isAjax) {
         const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(idParam).first();
         if (!server || server.is_hidden === 'true') return new Response('Server Not Found', { status: 404 });
+        scrubServerText(server);
         
         const cCode = (server.country || 'xx').toLowerCase();
         const flagCode = cCode === 'tw' ? 'cn' : cCode;
@@ -1937,7 +1970,7 @@ rm -f /tmp/cf_install.sh
         <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>${server.name} - ${sys.site_title}</title>
+          <title>${server.name} - ${esc(sys.site_title)}</title>
           ${sys.custom_head || ''}
           <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 0; }
@@ -2114,12 +2147,15 @@ rm -f /tmp/cf_install.sh
                charts.net = initChart('chart-net', '下载', '上传', 'rgba(16, 185, 129, 1)', 'rgba(59, 130, 246, 1)', true);
                charts.conn = initChart('chart-conn', 'TCP', 'UDP', 'rgba(245, 158, 11, 1)', 'rgba(236, 72, 153, 1)');
                charts.ping = initPingChart();
+               let chartSyncCount = 0;
                fetchData(); setInterval(fetchData, 4000);
             });
 
             async function fetchData() {
                try {
-                  const res = await fetch('/api/server?id=' + serverId);
+                  const needHistory = (chartSyncCount === 0 || chartSyncCount % 75 === 0);
+                  chartSyncCount++;
+                  const res = await fetch('/api/server?id=' + serverId + (needHistory ? '' : '&no_history=1'));
                   if (!res.ok) return;
                   const data = await res.json();
                   
@@ -2233,6 +2269,7 @@ rm -f /tmp/cf_install.sh
                        method: 'POST',
                        body: JSON.stringify(payload),
                        headers: {'Content-Type': 'application/json'},
+                       signal: AbortSignal.timeout(8000),
                        cf: { cacheTtl: 0 }
                    });
                } catch(e) {} 
@@ -2262,7 +2299,7 @@ rm -f /tmp/cf_install.sh
         cardContentHtml = '<p style="text-align:center; width: 100%; color:#888;">暂无公开服务器</p>';
       } else {
         for (const [grpName, grpServers] of Object.entries(groups)) {
-          cardContentHtml += `<div class="group-header">${grpName}</div><div class="grid-container">`;
+          cardContentHtml += `<div class="group-header">${esc(grpName)}</div><div class="grid-container">`;
           for (const server of grpServers) {
             const isOnline = (now - server.last_updated) < offlineThresMs;
             const statusColor = isOnline ? '#10b981' : '#ef4444'; 
@@ -2399,7 +2436,7 @@ rm -f /tmp/cf_install.sh
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${sys.site_title}</title>
+        <title>${esc(sys.site_title)}</title>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
         <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
         ${sys.custom_head || ''}
@@ -2449,7 +2486,7 @@ rm -f /tmp/cf_install.sh
         <div class="container" id="app-container">
           
           <div class="header" style="flex-wrap: wrap; gap: 15px;">
-            <h1 style="margin:0;">${sys.site_title}</h1>
+            <h1 style="margin:0;">${esc(sys.site_title)}</h1>
             
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
               <div class="view-controls">

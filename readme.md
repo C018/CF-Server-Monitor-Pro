@@ -8,9 +8,14 @@ https://github.com/a6216abcd/K-UI/tree/dev
 
 # 新人点击下方一键极速部署/老用户直接覆盖代码升级  
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a63414262/CF-Server-Monitor-Pro)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/C018/CF-Server-Monitor-Pro)
 
 
+
+### 安全部署提示
+
+* 一键部署向导会把 `API_SECRET` 写入 Cloudflare 的 `vars`（明文）。正式使用建议改为 **Secret**：先删除 `wrangler.toml` 中的 `[vars] API_SECRET`，再执行 `wrangler secret put API_SECRET`（旧值即作废，已安装探针需重新复制安装）。
+* 维护代码请统一编辑 `src/index.js`，完成后**必须同步复制为根目录 `workers.js`**（两文件需保持一致）；本仓库约定同步部署入口即根目录 `workers.js`。
 
 ### 第二步：添加节点并挂载探针
 
@@ -18,6 +23,8 @@ https://github.com/a6216abcd/K-UI/tree/dev
 2. 节点生成后，点击对应行的 **复制安装** 按钮。
 3. 登录你的被控端 VPS 或 Windows 服务器，粘贴命令并回车运行。
 4. 等待 5~10 秒，回到前台大盘刷新即可看到数据跳动。
+
+> ⚠️ **安装命令含通信密钥（API_SECRET）**：请勿在群聊、工单、Telegram 等公开渠道转发安装命令；密钥仅用于探针与 Worker 间鉴权，泄露后可在 Cloudflare 后台执行 `wrangler secret put API_SECRET` 更新。
 
 ---
 ## 📸 界面预览
@@ -41,7 +48,7 @@ https://github.com/a6216abcd/K-UI/tree/dev
 
 # ⚡ CF-Server-Monitor-Pro (Serverless 探针增强版)
 
-10台VPS以下可以使用cf版本轻量部署，10台VPS以上建议使用docker部署在免费容器northflank https://github.com/a63414262/server-monitor
+10台VPS以下可以使用cf版本轻量部署，10台VPS以上建议使用docker部署在免费容器northflank https://github.com/C018/server-monitor
 
 基于 Cloudflare Workers 和 D1 数据库构建的零成本、高定制化服务器探针大盘。
 完全白嫖 Cloudflare 的免费 Serverless 资源，无需额外部署任何服务端 VPS！支持多节点大盘展示、单节点详情图表、全平台 Agent 监控与 Telegram 机器人深度交互。
@@ -51,7 +58,7 @@ https://github.com/a6216abcd/K-UI/tree/dev
 * **🚀 纯 Serverless 架构**：后端与数据库依托 Cloudflare，全球极速访问，彻底告别服务端宕机烦恼。
 * **🚀 新增首页访客弹窗**：开启访客首次访问弹窗 (按IP和浏览器缓存控制)。
 * **🤖 Telegram 深度管理**：不仅支持节点离线/恢复告警推送，更支持通过 Telegram Bot 快捷菜单直接**添加节点、修改配置、全局设置交互**。
-* **🌐 Gossip 去中心化排行**：内置节点互联共识协议，自动加入全网数字资产与在线设备数量的排行榜。
+* **🌐 Gossip 节点互联同步**：多实例间通过共识协议自动同步节点与资产数据（排行 UI 已移除）。
 * **📊 全维度高精度监控**：
 * 支持 CPU、内存、磁盘、进程数、TCP/UDP 连接数实时折线图。
 * **硬核双栈检测**：自动探测 IPv4 与 IPv6 网络连通性。
