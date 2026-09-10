@@ -1114,9 +1114,59 @@ export default {
           .modal input, .modal select { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;}
           .modal label { font-size: 14px; color: #555; display: block; margin-bottom: 4px; font-weight: bold;}
         </style>
+        <style>
+          /* 后台夜间模式（跟随系统 / 夜间 / 日间 三态，与前台共用本地记忆） */
+          body.dark-mode { background: #111827; color: #e5e7eb; }
+          body.dark-mode .card { background: #1f2937; box-shadow: 0 4px 6px rgba(0,0,0,0.45); }
+          body.dark-mode h2 { border-bottom-color: #374151; }
+          body.dark-mode th { background: #374151; }
+          body.dark-mode th, body.dark-mode td { border-color: #374151; }
+          body.dark-mode .form-group label, body.dark-mode .checkbox-group { color: #9ca3af; }
+          body.dark-mode .form-group input[type="text"], body.dark-mode .form-group select, body.dark-mode .form-group input[type="date"], body.dark-mode .form-group input[type="number"], body.dark-mode .form-group textarea { background: #111827; color: #e5e7eb; border-color: #374151; }
+          body.dark-mode .modal-content { background: #1f2937; color: #e5e7eb; }
+          body.dark-mode .modal input, body.dark-mode .modal select { background: #111827; color: #e5e7eb; border-color: #374151; }
+          body.dark-mode .theme-mode-btn { background: #374151; color: #e5e7eb; border-color: #4b5563; }
+          .theme-mode-btn { cursor: pointer; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 6px; padding: 6px 12px; font-size: 13px; }
+        </style>
+        <script>
+        /* 后台主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
+        (function(){
+          var THEME_MODE_KEY = 'monitor_theme_mode';
+          function getMode(){ try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; } }
+          function applyMode(){
+            if (!document.body) return;
+            var mode = getMode();
+            var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            var dark = (mode === 'dark') || (mode === 'system' && sysDark);
+            document.body.classList.toggle('dark-mode', dark);
+            var btns = document.querySelectorAll('.theme-mode-btn');
+            var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
+            for (var i=0;i<btns.length;i++){ btns[i].textContent = label; btns[i].setAttribute('data-mode', mode); }
+          }
+          window.adminApplyThemeMode = applyMode;
+          window.adminCycleThemeMode = function(){
+            var order = ['system','dark','light'];
+            var next = order[(order.indexOf(getMode()) + 1) % 3];
+            try { localStorage.setItem(THEME_MODE_KEY, next); } catch(e){}
+            applyMode();
+          };
+          function init(){
+            applyMode();
+            try {
+              var mql = window.matchMedia('(prefers-color-scheme: dark)');
+              var onScheme = function(){ if (getMode() === 'system') applyMode(); };
+              if (mql.addEventListener) mql.addEventListener('change', onScheme);
+              else if (mql.addListener) mql.addListener(onScheme);
+            } catch(e){}
+          }
+          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+          else init();
+        })();
+        </script>
       </head>
       <body>
-        <div style="max-width:1100px; margin:0 auto 14px auto; display:flex; justify-content:flex-end;">
+        <div style="max-width:1100px; margin:0 auto 14px auto; display:flex; justify-content:flex-end; align-items:center; gap:10px;">
+          <button type="button" class="theme-mode-btn" id="admin-theme-mode-btn" onclick="adminCycleThemeMode()" data-mode="system" title="主题切换：跟随系统 / 夜间模式 / 日间模式（本地记忆）">🌗 跟随系统</button>
           <a href="${sys.admin_path}/logout" style="color:#6b7280; text-decoration:none; font-size:13px;" title="退出登录后需重新输入密码">退出登录 →</a>
         </div>
         <div class="card">
@@ -1230,8 +1280,8 @@ export default {
               <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
               <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
               <div class="form-group"><label>移动 (CM) 测速节点</label><select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select></div>
-              <div class="form-group"><label>Google 测速目标</label><input type="text" id="cfg_ping_node_gg" value="${sys.ping_node_gg || 'default'}" placeholder="default = www.google.com，或填写自定义域名"></div>
-              <div class="form-group"><label>Cloudflare 测速目标</label><input type="text" id="cfg_ping_node_cf" value="${sys.ping_node_cf || 'default'}" placeholder="default = www.cloudflare.com，或填写自定义域名"></div>
+              <div class="form-group"><label>Google / 8.8.4.4 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_gg" value="${sys.ping_node_gg || 'default'}" placeholder="default = 8.8.4.4（ICMP ping 失败时回退 TCP ping），或填写自定义域名/IP"></div>
+              <div class="form-group"><label>Cloudflare / 1.0.0.1 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_cf" value="${sys.ping_node_cf || 'default'}" placeholder="default = 1.0.0.1（ICMP ping 失败时回退 TCP ping），或填写自定义域名/IP"></div>
             </div>
           </div>
           <button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
@@ -1523,7 +1573,7 @@ $IPV4 = "0"; $IPV6 = "0"
 $PING_CT = "0"; $PING_CU = "0"; $PING_CM = "0"; $PING_BD = "0"
 $PING_GG = "0"; $PING_CF = "0"
 
-function Get-HttpPing {
+function Get-IcmpPing {
     param([string]$node)
     # ICMP ping: 单包 2 秒超时(2000ms)，解析往返毫秒；失败记 0
     try {
@@ -1534,6 +1584,35 @@ function Get-HttpPing {
     } catch {
         return 0
     }
+}
+
+function Get-TcpPing {
+    param([string]$node, [int]$port = 53)
+    # TCP ping: 真实 TCP 握手耗时(ms)，2 秒超时；ICMP 不可用(无权限/被丢弃)时兜底
+    $client = $null
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($node, $port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(2000, $false)) { $client.Close(); return 0 }
+        $client.EndConnect($iar)
+        $sw.Stop()
+        $client.Close()
+        $ms = [int]$sw.Elapsed.TotalMilliseconds
+        if ($ms -lt 1) { $ms = 1 }
+        return $ms
+    } catch {
+        if ($client) { try { $client.Close() } catch {} }
+        return 0
+    }
+}
+
+function Get-RealPing {
+    param([string]$node, [int]$port = 53)
+    # 真实延迟: ICMP 优先，ICMP 不可用时回退 TCP 连接延迟
+    $r = Get-IcmpPing $node
+    if ($r -gt 0) { return $r }
+    return (Get-TcpPing $node $port)
 }
 
 while ($true) {
@@ -1558,16 +1637,16 @@ while ($true) {
         $c_cu = (($c_cu -replace '^https?://','') -replace '/.*$','').Trim()
         $c_cm = (($c_cm -replace '^https?://','') -replace '/.*$','').Trim()
 
-        $PING_CT = Get-HttpPing $c_ct
-        $PING_CU = Get-HttpPing $c_cu
-        $PING_CM = Get-HttpPing $c_cm
-        $PING_BD = Get-HttpPing "lf3-ips.zstaticcdn.com"
+        $PING_CT = Get-RealPing $c_ct 53
+        $PING_CU = Get-RealPing $c_cu 53
+        $PING_CM = Get-RealPing $c_cm 53
+        $PING_BD = Get-RealPing "lf3-ips.zstaticcdn.com" 443
 
-        $c_gg = if ($PING_NODE_GG -eq "default") { "www.google.com" } else { $PING_NODE_GG }
-        $c_cf = if ($PING_NODE_CF -eq "default") { "www.cloudflare.com" } else { $PING_NODE_CF }
+        $c_gg = if ($PING_NODE_GG -eq "default") { "8.8.4.4" } else { $PING_NODE_GG }
+        $c_cf = if ($PING_NODE_CF -eq "default") { "1.0.0.1" } else { $PING_NODE_CF }
 
-        $PING_GG = Get-HttpPing $c_gg
-        $PING_CF = Get-HttpPing $c_cf
+        $PING_GG = Get-RealPing $c_gg 53
+        $PING_CF = Get-RealPing $c_cf 53
     }
 
     $LOOP_COUNT++
@@ -1761,7 +1840,9 @@ WORKER_URL="\$WORKER_URL"
 
 get_net_bytes() { grep -vE '^[ 	]*(lo|docker|veth|br-|virbr|tun[0-9]*|tap[0-9]*|kube|vxlan|wg[0-9]*|tailscale[0-9]*|zt[0-9]*|sit[0-9]*|ip6tnl|vboxnet[0-9]*|vmnet[0-9]*|vmbr[0-9]*|utun[0-9]*|awdl[0-9]*|gif[0-9]*):' /proc/net/dev | awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}'; }
 get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
-get_http_ping() { out=\\$(ping -c 1 -W 2 "\\$1" 2>/dev/null); [ -z "\\$out" ] && echo 0 || { rtt=\\$(printf '%s' "\\$out" | awk '{for(i=1;i<=NF;i++){if(\\$i ~ /^time[=<]/){gsub(/[^0-9.]/,"",\\$i); printf "%.0f",\\$i+0; exit}}}'); [ -n "\\$rtt" ] && echo "\\$rtt" || echo 0; }; }
+get_icmp_ping() { out=\\$(ping -c 1 -W 2 "\\$1" 2>/dev/null); [ -z "\\$out" ] && echo 0 || { rtt=\\$(printf '%s' "\\$out" | awk '{for(i=1;i<=NF;i++){if(\\$i ~ /^time[=<]/){gsub(/[^0-9.]/,"",\\$i); printf "%.0f",\\$i+0; exit}}}'); [ -n "\\$rtt" ] && echo "\\$rtt" || echo 0; }; }
+get_tcp_ping() { command -v curl >/dev/null 2>&1 || { echo 0; return; }; port="\\$2"; [ -z "\\$port" ] && port=53; t=\\$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout 2 "telnet://\\$1:\\$port" 2>/dev/null); case "\\$t" in ''|*[!0-9.]*) echo 0 ;; *) awk -v v="\\$t" 'BEGIN{r=(v*1000)+0; if(r<1) r=1; printf "%.0f", r}' ;; esac; }
+get_http_ping() { r=\\$(get_icmp_ping "\\$1"); case "\\$r" in ''|0) p="\\$2"; [ -z "\\$p" ] && p=53; r=\\$(get_tcp_ping "\\$1" "\\$p") ;; esac; [ -z "\\$r" ] && r=0; echo "\\$r"; }
 
 NET_STAT=\\$(get_net_bytes)
 RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
@@ -1803,20 +1884,20 @@ while true; do
     [ "\\$CT_NODE" = "default" ] && CT_NODE="\\$D_CT"
     [ "\\$CU_NODE" = "default" ] && CU_NODE="\\$D_CU"
     [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
-    [ "\\$GG_NODE" = "default" ] && GG_NODE="www.google.com"
-    [ "\\$CF_NODE" = "default" ] && CF_NODE="www.cloudflare.com"
+    [ "\\$GG_NODE" = "default" ] && GG_NODE="8.8.4.4"
+    [ "\\$CF_NODE" = "default" ] && CF_NODE="1.0.0.1"
     CT_NODE=\\$(printf '%s' "\\$CT_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
     CU_NODE=\\$(printf '%s' "\\$CU_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
     CM_NODE=\\$(printf '%s' "\\$CM_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
     GG_NODE=\\$(printf '%s' "\\$GG_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
     CF_NODE=\\$(printf '%s' "\\$CF_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
 
-    PING_CT=\\$(get_http_ping "\\$CT_NODE")
-    PING_CU=\\$(get_http_ping "\\$CU_NODE")
-    PING_CM=\\$(get_http_ping "\\$CM_NODE")
-    PING_BD=\\$(get_http_ping "lf3-ips.zstaticcdn.com")
-    PING_GG=\\$(get_http_ping "\\$GG_NODE")
-    PING_CF=\\$(get_http_ping "\\$CF_NODE")
+    PING_CT=\\$(get_http_ping "\\$CT_NODE" 53)
+    PING_CU=\\$(get_http_ping "\\$CU_NODE" 53)
+    PING_CM=\\$(get_http_ping "\\$CM_NODE" 53)
+    PING_BD=\\$(get_http_ping "lf3-ips.zstaticcdn.com" 443)
+    PING_GG=\\$(get_http_ping "\\$GG_NODE" 53)
+    PING_CF=\\$(get_http_ping "\\$CF_NODE" 53)
   fi
   
   LOOP_COUNT=\\$((LOOP_COUNT + 1))
@@ -2229,7 +2310,7 @@ rm -f /tmp/cf_install.sh
         const lastUpdMs = server.last_updated ? parseInt(server.last_updated) : 0;
         const lastUpdSec = lastUpdMs > 0 ? Math.max(0, Math.round((Date.now() - lastUpdMs) / 1000)) : -1;
         const lastUpdAbsText = lastUpdMs > 0 ? fmtBJ(lastUpdMs) : '-';
-        const lastUpdText = lastUpdMs > 0 ? `${lastUpdSec}s前 · ${lastUpdAbsText}` : '未知';
+        const lastUpdText = lastUpdMs > 0 ? `${lastUpdSec}秒前 · ${lastUpdAbsText}` : '未知';
 
         const detailHtml = `<!DOCTYPE html>
         <html>
@@ -2238,32 +2319,60 @@ rm -f /tmp/cf_install.sh
           <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
           <title>${server.name} - ${esc(sys.site_title)}</title>
           <script>
+          /* 主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
           (function(){
             var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
-            function uiDark(){
+            var THEME_MODE_KEY = 'monitor_theme_mode';
+            function getThemeMode(){
+              try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; }
+            }
+            function isDarkTheme(){
               var cls = document.body ? document.body.className : '';
               for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
+              return false;
+            }
+            function applyThemeMode(notify){
+              if (!document.body) return;
+              var mode = getThemeMode();
+              document.body.classList.remove('forced-dark','forced-light');
+              if (mode === 'dark') document.body.classList.add('forced-dark');
+              else if (mode === 'light') document.body.classList.add('forced-light');
+              else {
+                var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+                if (sysDark && !isDarkTheme()) document.body.classList.add('forced-dark');
+              }
+              var btns = document.querySelectorAll('.theme-mode-btn');
+              var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
+              for (var j=0;j<btns.length;j++){ btns[j].textContent = label; btns[j].setAttribute('data-mode', mode); }
+              if (notify && window.__uiThemeChanged) window.__uiThemeChanged();
+            }
+            window.getThemeMode = getThemeMode;
+            window.applyThemeMode = applyThemeMode;
+            window.setThemeMode = function(m){
+              try { localStorage.setItem(THEME_MODE_KEY, m); } catch(e){}
+              applyThemeMode(true);
+            };
+            window.cycleThemeMode = function(){
+              var order = ['system','dark','light'];
+              window.setThemeMode(order[(order.indexOf(getThemeMode()) + 1) % 3]);
+            };
+            window.uiDark = function(){
+              var cls = document.body ? document.body.className : '';
               if (cls.indexOf('forced-dark') !== -1) return true;
               if (cls.indexOf('forced-light') !== -1) return false;
-              return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+              return isDarkTheme() || !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            };
+            function initThemeMode(){
+              applyThemeMode(false);
+              try {
+                var mql = window.matchMedia('(prefers-color-scheme: dark)');
+                var onSchemeChange = function(){ if (getThemeMode() === 'system') applyThemeMode(true); };
+                if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
+                else if (mql.addListener) mql.addListener(onSchemeChange);
+              } catch(e){}
             }
-            window.uiDark = uiDark;
-            try {
-              var mql = window.matchMedia('(prefers-color-scheme: dark)');
-              var onSchemeChange = function(){
-                if (!document.body) return;
-                var cls = document.body.className;
-                var hardDark = false;
-                for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) hardDark = true; }
-                document.body.classList.remove('forced-dark','forced-light');
-                if (hardDark) document.body.classList.add('forced-dark');
-                else if (mql.matches) document.body.classList.add('forced-dark');
-                else document.body.classList.add('forced-light');
-                if (window.__uiThemeChanged) window.__uiThemeChanged();
-              };
-              if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
-              else if (mql.addListener) mql.addListener(onSchemeChange);
-            } catch(e){}
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initThemeMode);
+            else initThemeMode();
           })();
           </script>
           ${sys.custom_head || ''}
@@ -2383,7 +2492,7 @@ rm -f /tmp/cf_install.sh
                if (lastUpdTs > 0) {
                  const diff = Math.max(0, Math.round((nowMs - lastUpdTs) / 1000));
                  const luEl = document.getElementById('d-lastupd');
-                 if (luEl) luEl.textContent = '最后更新: ' + diff + 's前 · ' + fmtBJ(lastUpdTs);
+                 if (luEl) luEl.textContent = '最后更新: ' + diff + '秒前 · ' + fmtBJ(lastUpdTs);
                  const wrap = document.getElementById('d-status-wrap');
                  if (wrap) {
                    const on = (nowMs - lastUpdTs) < OFFLINE_THRES;
@@ -2471,7 +2580,7 @@ rm -f /tmp/cf_install.sh
               { key: 'net', canvasId: 'chart-net', args: ['下载', '上传', '#10b981', '#3b82f6', true] },
               { key: 'conn', canvasId: 'chart-conn', args: ['TCP', 'UDP', '#f59e0b', '#ec4899'] },
               { key: 'pingDom', canvasId: 'chart-ping-dom', ping: true, series: [['电信', '#3b82f6'], ['联通', '#f59e0b'], ['移动', '#10b981'], ['字节', '#ef4444']] },
-              { key: 'pingOversea', canvasId: 'chart-ping-ov', ping: true, series: [['Google', '#8b5cf6'], ['Cloudflare', '#06b6d4']] }
+              { key: 'pingOversea', canvasId: 'chart-ping-ov', ping: true, series: [['8.8.4.4', '#8b5cf6'], ['1.0.0.1', '#06b6d4']] }
             ];
             function rebuildDetailCharts() {
               const keep = {};
@@ -2697,7 +2806,7 @@ rm -f /tmp/cf_install.sh
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
+            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>8.8.4.4 <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>1.0.0.1 <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
@@ -2736,14 +2845,11 @@ rm -f /tmp/cf_install.sh
                     <div class="stat-subtext">${diskUsedStr} / ${diskTotalStr}</div>
                   </div>
                   
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 2px;">
-                    <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 5px;" title="${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}">${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}</div>
-                    <div style="white-space: nowrap; flex-shrink: 0;">TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
-                  </div>
-                  
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 4px; white-space: nowrap; gap: 8px;">
-                    <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="c-in-${server.id}" data-val="${netInSpeedRaw}">0 B/s</span></div>
-                    <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="c-out-${server.id}" data-val="${netOutSpeedRaw}">0 B/s</span></div>
+                  <div style="font-size: 11px; color: var(--text2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}">${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}</div>
+
+                  <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 4px; white-space: nowrap; gap: 8px;">
+                    <div style="flex-shrink: 0;">TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
+                    <div style="overflow: hidden; text-overflow: ellipsis; text-align: right;"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="c-in-${server.id}" data-val="${netInSpeedRaw}">0 B/s</span> <span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="c-out-${server.id}" data-val="${netOutSpeedRaw}">0 B/s</span></div>
                   </div>
                 </div>
               </a>
@@ -2791,32 +2897,60 @@ rm -f /tmp/cf_install.sh
         <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>${esc(sys.site_title)}</title>
         <script>
+        /* 主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
         (function(){
           var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
-          function uiDark(){
+          var THEME_MODE_KEY = 'monitor_theme_mode';
+          function getThemeMode(){
+            try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; }
+          }
+          function isDarkTheme(){
             var cls = document.body ? document.body.className : '';
             for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
+            return false;
+          }
+          function applyThemeMode(notify){
+            if (!document.body) return;
+            var mode = getThemeMode();
+            document.body.classList.remove('forced-dark','forced-light');
+            if (mode === 'dark') document.body.classList.add('forced-dark');
+            else if (mode === 'light') document.body.classList.add('forced-light');
+            else {
+              var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+              if (sysDark && !isDarkTheme()) document.body.classList.add('forced-dark');
+            }
+            var btns = document.querySelectorAll('.theme-mode-btn');
+            var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
+            for (var j=0;j<btns.length;j++){ btns[j].textContent = label; btns[j].setAttribute('data-mode', mode); }
+            if (notify && window.__uiThemeChanged) window.__uiThemeChanged();
+          }
+          window.getThemeMode = getThemeMode;
+          window.applyThemeMode = applyThemeMode;
+          window.setThemeMode = function(m){
+            try { localStorage.setItem(THEME_MODE_KEY, m); } catch(e){}
+            applyThemeMode(true);
+          };
+          window.cycleThemeMode = function(){
+            var order = ['system','dark','light'];
+            window.setThemeMode(order[(order.indexOf(getThemeMode()) + 1) % 3]);
+          };
+          window.uiDark = function(){
+            var cls = document.body ? document.body.className : '';
             if (cls.indexOf('forced-dark') !== -1) return true;
             if (cls.indexOf('forced-light') !== -1) return false;
-            return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            return isDarkTheme() || !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          };
+          function initThemeMode(){
+            applyThemeMode(false);
+            try {
+              var mql = window.matchMedia('(prefers-color-scheme: dark)');
+              var onSchemeChange = function(){ if (getThemeMode() === 'system') applyThemeMode(true); };
+              if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
+              else if (mql.addListener) mql.addListener(onSchemeChange);
+            } catch(e){}
           }
-          window.uiDark = uiDark;
-          try {
-            var mql = window.matchMedia('(prefers-color-scheme: dark)');
-            var onSchemeChange = function(){
-              if (!document.body) return;
-              var cls = document.body.className;
-              var hardDark = false;
-              for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) hardDark = true; }
-              document.body.classList.remove('forced-dark','forced-light');
-              if (hardDark) document.body.classList.add('forced-dark');
-              else if (mql.matches) document.body.classList.add('forced-dark');
-              else document.body.classList.add('forced-light');
-              if (window.__uiThemeChanged) window.__uiThemeChanged();
-            };
-            if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
-            else if (mql.addListener) mql.addListener(onSchemeChange);
-          } catch(e){}
+          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initThemeMode);
+          else initThemeMode();
         })();
         </script>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -2849,6 +2983,7 @@ rm -f /tmp/cf_install.sh
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"></polygon><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg> 地图
                 </button>
               </div>
+              <button class="toggle-btn theme-mode-btn" id="btn-theme-mode" onclick="cycleThemeMode()" title="主题切换：跟随系统 / 夜间模式 / 日间模式（本地记忆）" data-mode="system">🌗 跟随系统</button>
               ${sys.show_admin_btn === 'true' ? `<a href="${sys.admin_path}" class="admin-btn">${sys.admin_title}</a>` : ''}
             </div>
           </div>
