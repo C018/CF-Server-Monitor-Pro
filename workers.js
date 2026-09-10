@@ -67,6 +67,8 @@ export default {
             bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
             ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0',
             ping_gg TEXT DEFAULT '0', ping_cf TEXT DEFAULT '0',
+            ping_intl_hk TEXT DEFAULT '0', ping_intl_tyo TEXT DEFAULT '0', ping_intl_sin TEXT DEFAULT '0', ping_intl_syd TEXT DEFAULT '0', ping_intl_lax TEXT DEFAULT '0',
+            ping_intl_nyc TEXT DEFAULT '0', ping_intl_fra TEXT DEFAULT '0', ping_intl_lon TEXT DEFAULT '0', ping_intl_ams TEXT DEFAULT '0', ping_intl_sao TEXT DEFAULT '0',
             ping_ct_m TEXT DEFAULT 'fail', ping_cu_m TEXT DEFAULT 'fail', ping_cm_m TEXT DEFAULT 'fail', ping_bd_m TEXT DEFAULT 'fail',
             ping_gg_m TEXT DEFAULT 'fail', ping_cf_m TEXT DEFAULT 'fail',
             monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0',
@@ -83,6 +85,8 @@ export default {
         const newCols = {
           ping_ct: "TEXT DEFAULT '0'", ping_cu: "TEXT DEFAULT '0'", ping_cm: "TEXT DEFAULT '0'", ping_bd: "TEXT DEFAULT '0'",
           ping_gg: "TEXT DEFAULT '0'", ping_cf: "TEXT DEFAULT '0'",
+          ping_intl_hk: "TEXT DEFAULT '0'", ping_intl_tyo: "TEXT DEFAULT '0'", ping_intl_sin: "TEXT DEFAULT '0'", ping_intl_syd: "TEXT DEFAULT '0'", ping_intl_lax: "TEXT DEFAULT '0'",
+          ping_intl_nyc: "TEXT DEFAULT '0'", ping_intl_fra: "TEXT DEFAULT '0'", ping_intl_lon: "TEXT DEFAULT '0'", ping_intl_ams: "TEXT DEFAULT '0'", ping_intl_sao: "TEXT DEFAULT '0'",
           ping_ct_m: "TEXT DEFAULT 'fail'", ping_cu_m: "TEXT DEFAULT 'fail'", ping_cm_m: "TEXT DEFAULT 'fail'", ping_bd_m: "TEXT DEFAULT 'fail'",
           ping_gg_m: "TEXT DEFAULT 'fail'", ping_cf_m: "TEXT DEFAULT 'fail'",
           monthly_rx: "TEXT DEFAULT '0'", monthly_tx: "TEXT DEFAULT '0'", last_rx: "TEXT DEFAULT '0'", last_tx: "TEXT DEFAULT '0'", reset_month: "TEXT DEFAULT ''",
@@ -1578,6 +1582,8 @@ $PING_CT = "fail"; $PING_CU = "fail"; $PING_CM = "fail"; $PING_BD = "fail"
 $PING_GG = "fail"; $PING_CF = "fail"
 $PING_M_CT = "fail"; $PING_M_CU = "fail"; $PING_M_CM = "fail"; $PING_M_BD = "fail"
 $PING_M_GG = "fail"; $PING_M_CF = "fail"
+$PING_INTL_HK = "fail"; $PING_INTL_TYO = "fail"; $PING_INTL_SIN = "fail"; $PING_INTL_SYD = "fail"; $PING_INTL_LAX = "fail"
+$PING_INTL_NYC = "fail"; $PING_INTL_FRA = "fail"; $PING_INTL_LON = "fail"; $PING_INTL_AMS = "fail"; $PING_INTL_SAO = "fail"
 
 # ICMP ping: 优先 .NET Ping(结果与系统语言无关)，再解析 ping.exe 文本兜底；失败返回 -1
 function Get-IcmpPing {
@@ -1640,16 +1646,50 @@ function Get-HttpPing {
     return -1
 }
 
-# 真实延迟三层探测: ICMP -> TCP(多端口) -> HTTP；返回 @(延迟ms, 探测方式)，全失败返回 @(-1,'fail')
+# 单目标三层探测: ICMP 优先 -> TCP(指定端口序列) -> HTTP 兜底；返回 @(延迟ms, 探测方式)，全失败返回 @(-1,'fail')
 function Get-RealPing {
-    param([string]$node, [int]$port = 53)
+    param([string]$node, [int[]]$ports = @(53, 443, 80))
     $r = Get-IcmpPing $node
     if ($r -ge 0) { return @($r, 'icmp') }
-    $ports = if ($port -eq 443) { @(443, 53, 80) } else { @(53, 443, 80) }
     $t = Get-TcpPing $node $ports
     if ($t[0] -ge 0) { return @($t[0], 'tcp') }
     $h = Get-HttpPing $node
     if ($h -ge 0) { return @($h, 'http') }
+    return @(-1, 'fail')
+}
+
+# 批量 ICMP: 并发发送所有目标，返回 @{host = 延迟ms}（仅含成功项）
+function Get-IcmpPingBatch {
+    param([string[]]$nodes, [int]$timeout = 1500)
+    $map = @{}
+    $jobs = @()
+    foreach ($n in $nodes) {
+        try {
+            $pg = New-Object System.Net.NetworkInformation.Ping
+            $jobs += [pscustomobject]@{ Host = $n; Ping = $pg; Task = $pg.SendPingAsync($n, $timeout) }
+        } catch {}
+    }
+    foreach ($j in $jobs) {
+        try {
+            $rp = $j.Task.GetAwaiter().GetResult()
+            if ($rp -and $rp.Status -eq 'Success') { $map[$j.Host] = [int]$rp.RoundtripTime }
+        } catch {}
+        try { $j.Ping.Dispose() } catch {}
+    }
+    return $map
+}
+
+# 多目标池探测: 按池内顺序取首个可达目标（ICMP 优先；DNS 类纯 IP 走 TCP 53/443，网站类走 80/443，最后 HTTP 兜底）
+function Get-PoolPing {
+    param([string[]]$pool)
+    foreach ($node in $pool) {
+        $n = (($node -replace '^https?://', '') -replace '/.*$', '').Trim()
+        if (-not $n) { continue }
+        $ports = @(53, 443)
+        if (-not ($n -match '^\d{1,3}(\.\d{1,3}){3}$')) { $ports = @(80, 443) }
+        $res = Get-RealPing $n $ports
+        if ($res[0] -ge 0) { return $res }
+    }
     return @(-1, 'fail')
 }
 
@@ -1675,27 +1715,67 @@ while ($true) {
     }
     
     if ($LOOP_COUNT % 6 -eq 0) {
-        $D_CT="119.29.29.29"; $D_CU="223.5.5.5"; $D_CM="211.136.25.153"
-        
-        $c_ct = if ($PING_NODE_CT -eq "default") { $D_CT } else { $PING_NODE_CT }
-        $c_cu = if ($PING_NODE_CU -eq "default") { $D_CU } else { $PING_NODE_CU }
-        $c_cm = if ($PING_NODE_CM -eq "default") { $D_CM } else { $PING_NODE_CM }
-        $c_ct = (($c_ct -replace '^https?://','') -replace '/.*$','').Trim()
-        $c_cu = (($c_cu -replace '^https?://','') -replace '/.*$','').Trim()
-        $c_cm = (($c_cm -replace '^https?://','') -replace '/.*$','').Trim()
+        # 国内三网: NodeQuality 省级测速域名池（31 省 × 电信/联通/移动），并发 ICMP 后取最优(最小)延迟作为该网代表值
+        $PROV_CODES = @('bj','tj','he','sx','nm','ln','jl','hl','sh','js','zj','ah','fj','jx','sd','ha','hb','hn','gd','gx','hi','cq','sc','gz','yn','xz','sn','gs','qh','nx','xj')
+        foreach ($ck in @('ct','cu','cm')) {
+            $domains = @()
+            foreach ($pc in $PROV_CODES) { $domains += ($pc + '-' + $ck + '-v4.ip.zstaticcdn.com') }
+            $best = -1; $bestMode = 'fail'
+            $batch = Get-IcmpPingBatch $domains 1200
+            foreach ($d in $domains) {
+                if ($batch.ContainsKey($d)) { $mv = [int]$batch[$d]; if ($best -lt 0 -or $mv -lt $best) { $best = $mv; $bestMode = 'icmp' } }
+            }
+            if ($best -lt 0) {
+                foreach ($fp in @('bj', 'sh', 'gd', 'sc', 'hb')) {
+                    $fb = Get-RealPing ($fp + '-' + $ck + '-v4.ip.zstaticcdn.com') @(80, 443)
+                    if ($fb[0] -ge 0) { $mv = [int]$fb[0]; if ($best -lt 0 -or $mv -lt $best) { $best = $mv; $bestMode = [string]$fb[1] } }
+                }
+            }
+            $val = if ($best -ge 0) { [string]$best } else { 'fail' }
+            if ($ck -eq 'ct') { $PING_CT = $val; $PING_M_CT = $bestMode }
+            elseif ($ck -eq 'cu') { $PING_CU = $val; $PING_M_CU = $bestMode }
+            else { $PING_CM = $val; $PING_M_CM = $bestMode }
+        }
+        # 后台配置了自定义节点时改为单目标探测（覆盖省级域名池结果）
+        if ($PING_NODE_CT -ne 'default') { $n = (($PING_NODE_CT -replace '^https?://', '') -replace '/.*$', '').Trim(); $rr = Format-PingResult (Get-RealPing $n @(80, 443, 53)); $PING_CT = $rr[0]; $PING_M_CT = $rr[1] }
+        if ($PING_NODE_CU -ne 'default') { $n = (($PING_NODE_CU -replace '^https?://', '') -replace '/.*$', '').Trim(); $rr = Format-PingResult (Get-RealPing $n @(80, 443, 53)); $PING_CU = $rr[0]; $PING_M_CU = $rr[1] }
+        if ($PING_NODE_CM -ne 'default') { $n = (($PING_NODE_CM -replace '^https?://', '') -replace '/.*$', '').Trim(); $rr = Format-PingResult (Get-RealPing $n @(80, 443, 53)); $PING_CM = $rr[0]; $PING_M_CM = $rr[1] }
 
-        $rr = Format-PingResult (Get-RealPing $c_ct 53); $PING_CT = $rr[0]; $PING_M_CT = $rr[1]
-        $rr = Format-PingResult (Get-RealPing $c_cu 53); $PING_CU = $rr[0]; $PING_M_CU = $rr[1]
-        $rr = Format-PingResult (Get-RealPing $c_cm 53); $PING_CM = $rr[0]; $PING_M_CM = $rr[1]
-        $rr = Format-PingResult (Get-RealPing "lf3-ips.zstaticcdn.com" 443); $PING_BD = $rr[0]; $PING_M_BD = $rr[1]
+        # 字节 CDN 目标（保留）
+        $rr = Format-PingResult (Get-RealPing "lf3-ips.zstaticcdn.com" @(443, 80, 53)); $PING_BD = $rr[0]; $PING_M_BD = $rr[1]
 
-        $c_gg = if ($PING_NODE_GG -eq "default") { "8.8.4.4" } else { $PING_NODE_GG }
-        $c_cf = if ($PING_NODE_CF -eq "default") { "1.0.0.1" } else { $PING_NODE_CF }
-        $c_gg = (($c_gg -replace '^https?://','') -replace '/.*$','').Trim()
-        $c_cf = (($c_cf -replace '^https?://','') -replace '/.*$','').Trim()
+        # 海外: Google / Cloudflare 多目标池，池内取首个可达目标（ICMP 优先；DNS 类纯 IP 走 TCP 53/443，网站类走 80/443）
+        $ggPool = @('8.8.8.8', '8.8.4.4', 'dns.google')
+        $cfPool = @('1.1.1.1', '1.0.0.1', 'cloudflare.com')
+        if ($PING_NODE_GG -ne 'default') { $ggPool = @($PING_NODE_GG) + $ggPool }
+        if ($PING_NODE_CF -ne 'default') { $cfPool = @($PING_NODE_CF) + $cfPool }
+        $rr = Format-PingResult (Get-PoolPing $ggPool); $PING_GG = $rr[0]; $PING_M_GG = $rr[1]
+        $rr = Format-PingResult (Get-PoolPing $cfPool); $PING_CF = $rr[0]; $PING_M_CF = $rr[1]
+    }
 
-        $rr = Format-PingResult (Get-RealPing $c_gg 53); $PING_GG = $rr[0]; $PING_M_GG = $rr[1]
-        $rr = Format-PingResult (Get-RealPing $c_cf 53); $PING_CF = $rr[0]; $PING_M_CF = $rr[1]
+    if ($LOOP_COUNT % 12 -eq 0) {
+        # 国际互联延迟: 10 个 iperf 公共节点（并发 ICMP 优先，失败回退 TCP 到该节点 iperf 端口）
+        $intlDefs = @(
+            @{ k = 'HK';  host = 'speedtest.hkg12.hk.leaseweb.net'; port = 5201 },
+            @{ k = 'TYO'; host = 'speedtest.tyo11.jp.leaseweb.net'; port = 5201 },
+            @{ k = 'SIN'; host = 'speedtest.sin1.sg.leaseweb.net'; port = 5201 },
+            @{ k = 'SYD'; host = 'speedtest.syd12.au.leaseweb.net'; port = 5201 },
+            @{ k = 'LAX'; host = 'speedtest.lax12.us.leaseweb.net'; port = 5201 },
+            @{ k = 'NYC'; host = 'nyc.speedtest.clouvider.net'; port = 5200 },
+            @{ k = 'FRA'; host = 'fra.speedtest.clouvider.net'; port = 5200 },
+            @{ k = 'LON'; host = 'speedtest.lon1.uk.leaseweb.net'; port = 5201 },
+            @{ k = 'AMS'; host = 'iperf-ams-nl.eranium.net'; port = 5201 },
+            @{ k = 'SAO'; host = 'speedtest.sao1.edgoo.net'; port = 9205 }
+        )
+        $intlHosts = @()
+        foreach ($t in $intlDefs) { $intlHosts += $t.host }
+        $intlBatch = Get-IcmpPingBatch $intlHosts 1500
+        foreach ($t in $intlDefs) {
+            $v = -1
+            if ($intlBatch.ContainsKey($t.host)) { $v = [int]$intlBatch[$t.host] }
+            if ($v -lt 0) { $tb = Get-TcpPing $t.host @($t.port, 443) 1000; if ($tb[0] -ge 0) { $v = [int]$tb[0] } }
+            Set-Variable -Name ('PING_INTL_' + $t.k) -Value $(if ($v -ge 0) { [string]$v } else { 'fail' })
+        }
     }
 
     $LOOP_COUNT++
@@ -1809,6 +1889,16 @@ while ($true) {
             ping_bd_m = "$PING_M_BD"
             ping_gg_m = "$PING_M_GG"
             ping_cf_m = "$PING_M_CF"
+            ping_intl_hk = "$PING_INTL_HK"
+            ping_intl_tyo = "$PING_INTL_TYO"
+            ping_intl_sin = "$PING_INTL_SIN"
+            ping_intl_syd = "$PING_INTL_SYD"
+            ping_intl_lax = "$PING_INTL_LAX"
+            ping_intl_nyc = "$PING_INTL_NYC"
+            ping_intl_fra = "$PING_INTL_FRA"
+            ping_intl_lon = "$PING_INTL_LON"
+            ping_intl_ams = "$PING_INTL_AMS"
+            ping_intl_sao = "$PING_INTL_SAO"
             virt = "$VIRT"
         }
     }
@@ -1900,6 +1990,8 @@ get_tcp_ping() { command -v curl >/dev/null 2>&1 || { echo -1; return; }; port="
 get_tcp_ping_multi() { for p in \\$2; do r=\\$(get_tcp_ping "\\$1" "\\$p"); case "\\$r" in ''|-1) ;; *) echo "\\$r"; return ;; esac; done; echo -1; }
 get_http_ping() { t=\\$(curl -s -k -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 4 "https://\\$1/" 2>/dev/null); case "\\$t" in ''|*[!0-9.]*) t=\\$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 4 "http://\\$1/" 2>/dev/null) ;; esac; case "\\$t" in ''|*[!0-9.]*) echo -1 ;; *) awk -v v="\\$t" 'BEGIN{r=v*1000; if(r<=0){print -1; exit} printf "%.0f", r}' ;; esac; }
 get_real_ping() { r=\\$(get_icmp_ping "\\$1"); case "\\$r" in ''|-1) ;; *) echo "\\$r icmp"; return ;; esac; r=\\$(get_tcp_ping_multi "\\$1" "\\$2"); case "\\$r" in ''|-1) ;; *) echo "\\$r tcp"; return ;; esac; r=\\$(get_http_ping "\\$1"); case "\\$r" in ''|-1) ;; *) echo "\\$r http"; return ;; esac; echo "-1 fail"; }
+get_pool_ping() { for n in \\$1; do case "\\$n" in *[a-zA-Z]*) PORTS="80 443" ;; *) PORTS="53 443" ;; esac; r=\\$(get_real_ping "\\$n" "\\$PORTS"); v=\\$(echo "\\$r" | cut -d' ' -f1); case "\\$v" in ''|-1) ;; *) echo "\\$r"; return ;; esac; done; echo "-1 fail"; }
+get_icmp_ping_batch() { _t=\\$(mktemp); for h in \\$1; do ( r=\\$(get_icmp_ping "\\$h"); case "\\$r" in ''|-1) ;; *) echo "\\$r" >> "\\$_t" ;; esac ) & done; wait; _b=\\$(sort -n "\\$_t" 2>/dev/null | head -n 1); rm -f "\\$_t"; [ -z "\\$_b" ] && _b=-1; echo "\\$_b"; }
 
 NET_STAT=\\$(get_net_bytes)
 RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
@@ -1917,6 +2009,8 @@ PING_CT="fail"; PING_CU="fail"; PING_CM="fail"; PING_BD="fail"
 PING_GG="fail"; PING_CF="fail"
 PING_M_CT="fail"; PING_M_CU="fail"; PING_M_CM="fail"; PING_M_BD="fail"
 PING_M_GG="fail"; PING_M_CF="fail"
+PING_INTL_HK="fail"; PING_INTL_TYO="fail"; PING_INTL_SIN="fail"; PING_INTL_SYD="fail"; PING_INTL_LAX="fail"
+PING_INTL_NYC="fail"; PING_INTL_FRA="fail"; PING_INTL_LON="fail"; PING_INTL_AMS="fail"; PING_INTL_SAO="fail"
 
 REPORT_INTERVAL="${cfg.reportInterval}"
 PING_NODE_CT="${cfg.pingCt}"
@@ -1932,31 +2026,56 @@ while true; do
   fi
   
   if [ \\$((LOOP_COUNT % 6)) -eq 0 ]; then
-    D_CT="119.29.29.29"; D_CU="223.5.5.5"; D_CM="211.136.25.153"
-    
-    CT_NODE="\\$PING_NODE_CT"
-    CU_NODE="\\$PING_NODE_CU"
-    CM_NODE="\\$PING_NODE_CM"
-    GG_NODE="\\$PING_NODE_GG"
-    CF_NODE="\\$PING_NODE_CF"
-    
-    [ "\\$CT_NODE" = "default" ] && CT_NODE="\\$D_CT"
-    [ "\\$CU_NODE" = "default" ] && CU_NODE="\\$D_CU"
-    [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
-    [ "\\$GG_NODE" = "default" ] && GG_NODE="8.8.4.4"
-    [ "\\$CF_NODE" = "default" ] && CF_NODE="1.0.0.1"
-    CT_NODE=\\$(printf '%s' "\\$CT_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
-    CU_NODE=\\$(printf '%s' "\\$CU_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
-    CM_NODE=\\$(printf '%s' "\\$CM_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
-    GG_NODE=\\$(printf '%s' "\\$GG_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
-    CF_NODE=\\$(printf '%s' "\\$CF_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
+    # 国内三网: NodeQuality 省级测速域名池（31 省 × 电信/联通/移动），并发 ICMP 取最优(最小)延迟作为该网代表值
+    PROV_CODES="bj tj he sx nm ln jl hl sh js zj ah fj jx sd ha hb hn gd gx hi cq sc gz yn xz sn gs qh nx xj"
+    for CK in ct cu cm; do
+      DOMAINS=""
+      for PC in \\$PROV_CODES; do DOMAINS="\\$DOMAINS \\$PC-\\$CK-v4.ip.zstaticcdn.com"; done
+      BEST=\\$(get_icmp_ping_batch "\\$DOMAINS")
+      BEST_MODE="icmp"
+      if [ -z "\\$BEST" ] || [ "\\$BEST" = "-1" ]; then
+        for FP in bj sh gd sc hb; do
+          FB=\\$(get_real_ping "\\$FP-\\$CK-v4.ip.zstaticcdn.com" "80 443")
+          FBV=\\$(echo "\\$FB" | cut -d' ' -f1)
+          case "\\$FBV" in ''|-1) ;; *) if [ "\\$BEST" = "-1" ]; then BEST="\\$FBV"; BEST_MODE=\\$(echo "\\$FB" | cut -d' ' -f2); elif [ "\\$FBV" -lt "\\$BEST" ]; then BEST="\\$FBV"; BEST_MODE=\\$(echo "\\$FB" | cut -d' ' -f2); fi ;; esac
+        done
+        if [ -z "\\$BEST" ] || [ "\\$BEST" = "-1" ]; then BEST="fail"; BEST_MODE="fail"; fi
+      fi
+      case "\\$CK" in
+        ct) PING_CT="\\$BEST"; PING_M_CT="\\$BEST_MODE" ;;
+        cu) PING_CU="\\$BEST"; PING_M_CU="\\$BEST_MODE" ;;
+        cm) PING_CM="\\$BEST"; PING_M_CM="\\$BEST_MODE" ;;
+      esac
+    done
+    # 后台配置了自定义节点时改为单目标探测（覆盖省级域名池结果）
+    if [ "\\$PING_NODE_CT" != "default" ]; then CT_NODE=\\$(printf '%s' "\\$PING_NODE_CT" | sed -e 's#^https\\?://##' -e 's#/.*##' | tr -d ' '); PR=\\$(get_real_ping "\\$CT_NODE" "80 443 53"); PING_CT=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CT=\\$(echo "\\$PR" | cut -d' ' -f2); fi
+    if [ "\\$PING_NODE_CU" != "default" ]; then CU_NODE=\\$(printf '%s' "\\$PING_NODE_CU" | sed -e 's#^https\\?://##' -e 's#/.*##' | tr -d ' '); PR=\\$(get_real_ping "\\$CU_NODE" "80 443 53"); PING_CU=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CU=\\$(echo "\\$PR" | cut -d' ' -f2); fi
+    if [ "\\$PING_NODE_CM" != "default" ]; then CM_NODE=\\$(printf '%s' "\\$PING_NODE_CM" | sed -e 's#^https\\?://##' -e 's#/.*##' | tr -d ' '); PR=\\$(get_real_ping "\\$CM_NODE" "80 443 53"); PING_CM=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CM=\\$(echo "\\$PR" | cut -d' ' -f2); fi
 
-    PR=\\$(get_real_ping "\\$CT_NODE" "53 443 80"); PING_CT=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CT=\\$(echo "\\$PR" | cut -d' ' -f2)
-    PR=\\$(get_real_ping "\\$CU_NODE" "53 443 80"); PING_CU=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CU=\\$(echo "\\$PR" | cut -d' ' -f2)
-    PR=\\$(get_real_ping "\\$CM_NODE" "53 443 80"); PING_CM=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CM=\\$(echo "\\$PR" | cut -d' ' -f2)
-    PR=\\$(get_real_ping "lf3-ips.zstaticcdn.com" "443 53 80"); PING_BD=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_BD=\\$(echo "\\$PR" | cut -d' ' -f2)
-    PR=\\$(get_real_ping "\\$GG_NODE" "53 443 80"); PING_GG=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_GG=\\$(echo "\\$PR" | cut -d' ' -f2)
-    PR=\\$(get_real_ping "\\$CF_NODE" "53 443 80"); PING_CF=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CF=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "lf3-ips.zstaticcdn.com" "443 80 53"); PING_BD=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_BD=\\$(echo "\\$PR" | cut -d' ' -f2)
+
+    # 海外: Google / Cloudflare 多目标池，池内取首个可达目标（ICMP 优先；DNS 类纯 IP 走 TCP 53/443，网站类走 80/443）
+    GG_POOL="\\$PING_NODE_GG"; [ "\\$GG_POOL" = "default" ] && GG_POOL="8.8.8.8 8.8.4.4 dns.google"
+    CF_POOL="\\$PING_NODE_CF"; [ "\\$CF_POOL" = "default" ] && CF_POOL="1.1.1.1 1.0.0.1 cloudflare.com"
+    PR=\\$(get_pool_ping "\\$GG_POOL"); PING_GG=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_GG=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_pool_ping "\\$CF_POOL"); PING_CF=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CF=\\$(echo "\\$PR" | cut -d' ' -f2)
+  fi
+
+  if [ \\$((LOOP_COUNT % 12)) -eq 0 ]; then
+    # 国际互联延迟: 10 个 iperf 公共节点（ICMP 优先，失败回退 TCP 到该节点 iperf 端口）
+    INTL_LIST="HK:speedtest.hkg12.hk.leaseweb.net:5201 TYO:speedtest.tyo11.jp.leaseweb.net:5201 SIN:speedtest.sin1.sg.leaseweb.net:5201 SYD:speedtest.syd12.au.leaseweb.net:5201 LAX:speedtest.lax12.us.leaseweb.net:5201 NYC:nyc.speedtest.clouvider.net:5200 FRA:fra.speedtest.clouvider.net:5200 LON:speedtest.lon1.uk.leaseweb.net:5201 AMS:iperf-ams-nl.eranium.net:5201 SAO:speedtest.sao1.edgoo.net:9205"
+    for ITEM in \\$INTL_LIST; do
+      IK=\\$(echo "\\$ITEM" | cut -d: -f1)
+      IH=\\$(echo "\\$ITEM" | cut -d: -f2)
+      IP=\\$(echo "\\$ITEM" | cut -d: -f3)
+      IV=\\$(get_icmp_ping "\\$IH")
+      if [ -z "\\$IV" ] || [ "\\$IV" = "-1" ]; then
+        IR=\\$(get_tcp_ping_multi "\\$IH" "\\$IP 443")
+        IV=\\$(echo "\\$IR" | cut -d' ' -f1)
+      fi
+      [ -z "\\$IV" ] && IV="fail"
+      eval "PING_INTL_\\$IK=\\$IV"
+    done
   fi
   
   LOOP_COUNT=\\$((LOOP_COUNT + 1))
@@ -2039,7 +2158,7 @@ while true; do
   TX_SPEED=\\$(((TX_NOW - TX_PREV) / INV_SECS))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
   
-  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"ping_gg\\": \\"\\$PING_GG\\", \\"ping_cf\\": \\"\\$PING_CF\\", \\"ping_ct_m\\": \\"\\$PING_M_CT\\", \\"ping_cu_m\\": \\"\\$PING_M_CU\\", \\"ping_cm_m\\": \\"\\$PING_M_CM\\", \\"ping_bd_m\\": \\"\\$PING_M_BD\\", \\"ping_gg_m\\": \\"\\$PING_M_GG\\", \\"ping_cf_m\\": \\"\\$PING_M_CF\\", \\"virt\\": \\"\\$VIRT\\" }}"
+  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"ping_gg\\": \\"\\$PING_GG\\", \\"ping_cf\\": \\"\\$PING_CF\\", \\"ping_ct_m\\": \\"\\$PING_M_CT\\", \\"ping_cu_m\\": \\"\\$PING_M_CU\\", \\"ping_cm_m\\": \\"\\$PING_M_CM\\", \\"ping_bd_m\\": \\"\\$PING_M_BD\\", \\"ping_gg_m\\": \\"\\$PING_M_GG\\", \\"ping_cf_m\\": \\"\\$PING_M_CF\\", \\"ping_intl_hk\\": \\"\\$PING_INTL_HK\\", \\"ping_intl_tyo\\": \\"\\$PING_INTL_TYO\\", \\"ping_intl_sin\\": \\"\\$PING_INTL_SIN\\", \\"ping_intl_syd\\": \\"\\$PING_INTL_SYD\\", \\"ping_intl_lax\\": \\"\\$PING_INTL_LAX\\", \\"ping_intl_nyc\\": \\"\\$PING_INTL_NYC\\", \\"ping_intl_fra\\": \\"\\$PING_INTL_FRA\\", \\"ping_intl_lon\\": \\"\\$PING_INTL_LON\\", \\"ping_intl_ams\\": \\"\\$PING_INTL_AMS\\", \\"ping_intl_sao\\": \\"\\$PING_INTL_SAO\\", \\"virt\\": \\"\\$VIRT\\" }}"
   
   RES=\\$(curl -s -m 10 -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
   if echo "\\$RES" | grep -q "INTERVAL="; then
@@ -2219,6 +2338,16 @@ rm -f /tmp/cf_install.sh
             history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
             history.ping_gg = updateArr(history.ping_gg, parseInt(metrics.ping_gg) || 0);
             history.ping_cf = updateArr(history.ping_cf, parseInt(metrics.ping_cf) || 0);
+            history.ping_intl_hk = updateArr(history.ping_intl_hk, parseInt(metrics.ping_intl_hk) || 0);
+            history.ping_intl_tyo = updateArr(history.ping_intl_tyo, parseInt(metrics.ping_intl_tyo) || 0);
+            history.ping_intl_sin = updateArr(history.ping_intl_sin, parseInt(metrics.ping_intl_sin) || 0);
+            history.ping_intl_syd = updateArr(history.ping_intl_syd, parseInt(metrics.ping_intl_syd) || 0);
+            history.ping_intl_lax = updateArr(history.ping_intl_lax, parseInt(metrics.ping_intl_lax) || 0);
+            history.ping_intl_nyc = updateArr(history.ping_intl_nyc, parseInt(metrics.ping_intl_nyc) || 0);
+            history.ping_intl_fra = updateArr(history.ping_intl_fra, parseInt(metrics.ping_intl_fra) || 0);
+            history.ping_intl_lon = updateArr(history.ping_intl_lon, parseInt(metrics.ping_intl_lon) || 0);
+            history.ping_intl_ams = updateArr(history.ping_intl_ams, parseInt(metrics.ping_intl_ams) || 0);
+            history.ping_intl_sao = updateArr(history.ping_intl_sao, parseInt(metrics.ping_intl_sao) || 0);
             history.time = updateLabels(history.time);
             history.last_time = nowMs;
         }
@@ -2232,6 +2361,8 @@ rm -f /tmp/cf_install.sh
               os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
               swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
               country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?, ping_gg = ?, ping_cf = ?,
+              ping_intl_hk = ?, ping_intl_tyo = ?, ping_intl_sin = ?, ping_intl_syd = ?, ping_intl_lax = ?,
+              ping_intl_nyc = ?, ping_intl_fra = ?, ping_intl_lon = ?, ping_intl_ams = ?, ping_intl_sao = ?,
               ping_ct_m = ?, ping_cu_m = ?, ping_cm_m = ?, ping_bd_m = ?, ping_gg_m = ?, ping_cf_m = ?,
               monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?
           WHERE id = ?
@@ -2246,6 +2377,8 @@ rm -f /tmp/cf_install.sh
           metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
           metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
           metrics.ping_gg || '0', metrics.ping_cf || '0',
+          metrics.ping_intl_hk || 'fail', metrics.ping_intl_tyo || 'fail', metrics.ping_intl_sin || 'fail', metrics.ping_intl_syd || 'fail', metrics.ping_intl_lax || 'fail',
+          metrics.ping_intl_nyc || 'fail', metrics.ping_intl_fra || 'fail', metrics.ping_intl_lon || 'fail', metrics.ping_intl_ams || 'fail', metrics.ping_intl_sao || 'fail',
           metrics.ping_ct_m || 'fail', metrics.ping_cu_m || 'fail', metrics.ping_cm_m || 'fail', metrics.ping_bd_m || 'fail',
           metrics.ping_gg_m || 'fail', metrics.ping_cf_m || 'fail',
           monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '',
@@ -2530,6 +2663,12 @@ rm -f /tmp/cf_install.sh
                  </div>
                  <div style="height: 180px;"><canvas id="chart-ping-ov"></canvas></div>
               </div>
+              <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
+                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                   <span class="card-title" style="font-weight:bold;">国际互联延迟 (ms)</span>
+                 </div>
+                 <div style="height: 220px;"><canvas id="chart-ping-intl"></canvas></div>
+              </div>
             </div>
             
             ${getFooterHtml(sys)}
@@ -2642,7 +2781,8 @@ rm -f /tmp/cf_install.sh
               { key: 'net', canvasId: 'chart-net', args: ['下载', '上传', '#10b981', '#3b82f6', true] },
               { key: 'conn', canvasId: 'chart-conn', args: ['TCP', 'UDP', '#f59e0b', '#ec4899'] },
               { key: 'pingDom', canvasId: 'chart-ping-dom', ping: true, series: [['电信', '#3b82f6'], ['联通', '#f59e0b'], ['移动', '#10b981'], ['字节', '#ef4444']] },
-              { key: 'pingOversea', canvasId: 'chart-ping-ov', ping: true, series: [['8.8.4.4', '#8b5cf6'], ['1.0.0.1', '#06b6d4']] }
+              { key: 'pingOversea', canvasId: 'chart-ping-ov', ping: true, series: [['Google', '#8b5cf6'], ['Cloudflare', '#06b6d4']] },
+              { key: 'pingIntl', canvasId: 'chart-ping-intl', ping: true, series: [['香港', '#f59e0b'], ['东京', '#10b981'], ['新加坡', '#3b82f6'], ['悉尼', '#8b5cf6'], ['洛杉矶', '#06b6d4'], ['纽约', '#ec4899'], ['法兰克福', '#ef4444'], ['伦敦', '#22c55e'], ['阿姆斯特丹', '#eab308'], ['圣保罗', '#6366f1']] }
             ];
             function rebuildDetailCharts() {
               const keep = {};
@@ -2704,7 +2844,7 @@ rm -f /tmp/cf_install.sh
                   document.getElementById('txt-tcp').innerText = data.tcp_conn;
                   document.getElementById('txt-udp').innerText = data.udp_conn;
 
-                  let history = { time: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [], ping_gg: [], ping_cf: [] };
+                  let history = { time: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [], ping_gg: [], ping_cf: [], ping_intl_hk: [], ping_intl_tyo: [], ping_intl_sin: [], ping_intl_syd: [], ping_intl_lax: [], ping_intl_nyc: [], ping_intl_fra: [], ping_intl_lon: [], ping_intl_ams: [], ping_intl_sao: [] };
                   try { if (data.history) history = JSON.parse(data.history); } catch(e) {}
                   
                   if (history.time && history.time.length > 0) {
@@ -2716,6 +2856,7 @@ rm -f /tmp/cf_install.sh
                      updateChart(charts.conn, labels, [history.tcp, history.udp]);
                      updateChart(charts.pingDom, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd]);
                      updateChart(charts.pingOversea, labels, [history.ping_gg || [], history.ping_cf || []]);
+                     updateChart(charts.pingIntl, labels, [history.ping_intl_hk || [], history.ping_intl_tyo || [], history.ping_intl_sin || [], history.ping_intl_syd || [], history.ping_intl_lax || [], history.ping_intl_nyc || [], history.ping_intl_fra || [], history.ping_intl_lon || [], history.ping_intl_ams || [], history.ping_intl_sao || []]);
                   }
                } catch (e) {}
             }
@@ -2817,7 +2958,8 @@ rm -f /tmp/cf_install.sh
       let cardContentHtml = ''; let tableBodyHtml = '';
       const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
 const isPingFail = (v) => { const s = String(v ?? '').trim().toLowerCase(); if (!s || s === 'fail' || s === '0' || s === 'null' || s === 'undefined') return true; const p = parseInt(s); return isNaN(p) || p <= 0; };
-const pingTag = (v, m) => { if (isPingFail(v)) return '超时'; let label = ''; const mt = String(m ?? '').trim().toLowerCase(); if (mt === 'icmp') label = 'ICMP'; else if (mt === 'tcp') label = 'TCP'; else if (mt === 'http') label = 'HTTP'; return label ? (v + 'ms (' + label + ')') : (v + 'ms'); };
+// 首页延迟仅展示数值（探测方式不外显），失败显示「超时」
+const pingTag = (v) => { if (isPingFail(v)) return '超时'; return v + 'ms'; };
 
       if (Object.keys(groups).length === 0) {
         cardContentHtml = '<p style="text-align:center; width: 100%; color: var(--text2);">暂无公开服务器</p>';
@@ -2870,7 +3012,7 @@ const pingTag = (v, m) => { if (isPingFail(v)) return '超时'; let label = ''; 
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${pingTag(server.ping_ct, server.ping_ct_m)}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${pingTag(server.ping_cu, server.ping_cu_m)}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${pingTag(server.ping_cm, server.ping_cm_m)}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${pingTag(server.ping_bd, server.ping_bd_m)}</span></span><span>8.8.4.4 <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${pingTag(server.ping_gg, server.ping_gg_m)}</span></span><span>1.0.0.1 <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${pingTag(server.ping_cf, server.ping_cf_m)}</span></span></div>`;
+const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${pingTag(server.ping_ct)}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${pingTag(server.ping_cu)}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${pingTag(server.ping_cm)}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${pingTag(server.ping_bd)}</span></span><span>Google <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${pingTag(server.ping_gg)}</span></span><span>Cloudflare <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${pingTag(server.ping_cf)}</span></span></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
