@@ -67,6 +67,8 @@ export default {
             bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
             ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0',
             ping_gg TEXT DEFAULT '0', ping_cf TEXT DEFAULT '0',
+            ping_ct_m TEXT DEFAULT 'fail', ping_cu_m TEXT DEFAULT 'fail', ping_cm_m TEXT DEFAULT 'fail', ping_bd_m TEXT DEFAULT 'fail',
+            ping_gg_m TEXT DEFAULT 'fail', ping_cf_m TEXT DEFAULT 'fail',
             monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0',
             reset_month TEXT DEFAULT '', history TEXT DEFAULT '{}', is_hidden TEXT DEFAULT 'false', virt TEXT DEFAULT '',
             reset_day TEXT DEFAULT '1', sort_order INTEGER DEFAULT 0
@@ -81,6 +83,8 @@ export default {
         const newCols = {
           ping_ct: "TEXT DEFAULT '0'", ping_cu: "TEXT DEFAULT '0'", ping_cm: "TEXT DEFAULT '0'", ping_bd: "TEXT DEFAULT '0'",
           ping_gg: "TEXT DEFAULT '0'", ping_cf: "TEXT DEFAULT '0'",
+          ping_ct_m: "TEXT DEFAULT 'fail'", ping_cu_m: "TEXT DEFAULT 'fail'", ping_cm_m: "TEXT DEFAULT 'fail'", ping_bd_m: "TEXT DEFAULT 'fail'",
+          ping_gg_m: "TEXT DEFAULT 'fail'", ping_cf_m: "TEXT DEFAULT 'fail'",
           monthly_rx: "TEXT DEFAULT '0'", monthly_tx: "TEXT DEFAULT '0'", last_rx: "TEXT DEFAULT '0'", last_tx: "TEXT DEFAULT '0'", reset_month: "TEXT DEFAULT ''",
           agent_os: "TEXT DEFAULT 'debian'",
           history: "TEXT DEFAULT '{}'",
@@ -1570,50 +1574,93 @@ $PING_NODE_CF = "${cfg.pingCf}"
 $RX_PREV = 0; $TX_PREV = 0
 $LOOP_COUNT = 0
 $IPV4 = "0"; $IPV6 = "0"
-$PING_CT = "0"; $PING_CU = "0"; $PING_CM = "0"; $PING_BD = "0"
-$PING_GG = "0"; $PING_CF = "0"
+$PING_CT = "fail"; $PING_CU = "fail"; $PING_CM = "fail"; $PING_BD = "fail"
+$PING_GG = "fail"; $PING_CF = "fail"
+$PING_M_CT = "fail"; $PING_M_CU = "fail"; $PING_M_CM = "fail"; $PING_M_BD = "fail"
+$PING_M_GG = "fail"; $PING_M_CF = "fail"
 
+# ICMP ping: 优先 .NET Ping(结果与系统语言无关)，再解析 ping.exe 文本兜底；失败返回 -1
 function Get-IcmpPing {
-    param([string]$node)
-    # ICMP ping: 单包 2 秒超时(2000ms)，解析往返毫秒；失败记 0
+    param([string]$node, [int]$timeout = 2000)
     try {
-        $raw = (& ping.exe -n 1 -w 2000 $node 2>$null) | Out-String
+        $pg = New-Object System.Net.NetworkInformation.Ping
+        $rp = $pg.Send($node, $timeout)
+        if ($rp -and $rp.Status -eq 'Success') { return [int]$rp.RoundtripTime }
+    } catch {}
+    try {
+        $raw = (& ping.exe -n 1 -w $timeout $node 2>$null) | Out-String
         if ($raw -match 'time[=<]([0-9]+)ms') { return [int]$Matches[1] }
         if ($raw -match '时间[=<]([0-9]+)ms') { return [int]$Matches[1] }
-        return 0
-    } catch {
-        return 0
-    }
+        if ($raw -match '([0-9]+)ms') { return [int]$Matches[1] }
+    } catch {}
+    return -1
 }
 
+# TCP ping: 依次尝试多个端口(默认 443/53/80)的真实握手耗时；全部失败返回 -1
 function Get-TcpPing {
-    param([string]$node, [int]$port = 53)
-    # TCP ping: 真实 TCP 握手耗时(ms)，2 秒超时；ICMP 不可用(无权限/被丢弃)时兜底
-    $client = $null
-    try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect($node, $port, $null, $null)
-        if (-not $iar.AsyncWaitHandle.WaitOne(2000, $false)) { $client.Close(); return 0 }
-        $client.EndConnect($iar)
-        $sw.Stop()
-        $client.Close()
-        $ms = [int]$sw.Elapsed.TotalMilliseconds
-        if ($ms -lt 1) { $ms = 1 }
-        return $ms
-    } catch {
-        if ($client) { try { $client.Close() } catch {} }
-        return 0
+    param([string]$node, [int[]]$ports = @(443, 53, 80), [int]$timeout = 2000)
+    foreach ($pt in $ports) {
+        $client = $null
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect($node, $pt, $null, $null)
+            if (-not $iar.AsyncWaitHandle.WaitOne($timeout, $false)) { $client.Close(); continue }
+            $client.EndConnect($iar)
+            $sw.Stop()
+            $client.Close()
+            $ms = [int]$sw.Elapsed.TotalMilliseconds
+            if ($ms -lt 1) { $ms = 1 }
+            return @($ms, 'tcp')
+        } catch { if ($client) { try { $client.Close() } catch {} } }
     }
+    return @(-1, 'fail')
 }
 
+# HTTP ping: 最后兜底，HTTPS 优先、HTTP 次之，取首字节耗时；失败返回 -1
+function Get-HttpPing {
+    param([string]$node, [int]$timeout = 3000)
+    $hc = $null
+    foreach ($scheme in @('https', 'http')) {
+        try {
+            $handler = New-Object System.Net.Http.HttpClientHandler
+            $handler.AllowAutoRedirect = $false
+            try { $handler.ServerCertificateCustomValidationCallback = [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator } catch {}
+            $hc = New-Object System.Net.Http.HttpClient($handler)
+            $hc.Timeout = [TimeSpan]::FromMilliseconds($timeout)
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $resp = $hc.GetAsync($scheme + '://' + $node + '/').GetAwaiter().GetResult()
+            $sw.Stop()
+            $hc.Dispose()
+            $ms = [int]$sw.Elapsed.TotalMilliseconds
+            if ($ms -lt 1) { $ms = 1 }
+            return $ms
+        } catch { if ($hc) { try { $hc.Dispose() } catch {}; $hc = $null } }
+    }
+    return -1
+}
+
+# 真实延迟三层探测: ICMP -> TCP(多端口) -> HTTP；返回 @(延迟ms, 探测方式)，全失败返回 @(-1,'fail')
 function Get-RealPing {
     param([string]$node, [int]$port = 53)
-    # 真实延迟: ICMP 优先，ICMP 不可用时回退 TCP 连接延迟
     $r = Get-IcmpPing $node
-    if ($r -gt 0) { return $r }
-    return (Get-TcpPing $node $port)
+    if ($r -ge 0) { return @($r, 'icmp') }
+    $ports = if ($port -eq 443) { @(443, 53, 80) } else { @(53, 443, 80) }
+    $t = Get-TcpPing $node $ports
+    if ($t[0] -ge 0) { return @($t[0], 'tcp') }
+    $h = Get-HttpPing $node
+    if ($h -ge 0) { return @($h, 'http') }
+    return @(-1, 'fail')
 }
+
+# 规范化探测结果: 返回 @(值字符串, 方式字符串)
+function Format-PingResult {
+    param([array]$res)
+    if (-not $res -or $res[0] -lt 0) { return @('fail', 'fail') }
+    return @([string]$res[0], [string]$res[1])
+}
+
+try { Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue } catch {}
 
 while ($true) {
     # 日志轮转：error.log 超过 1MB 时归档为 error.log.old，防止无限增长
@@ -1637,16 +1684,18 @@ while ($true) {
         $c_cu = (($c_cu -replace '^https?://','') -replace '/.*$','').Trim()
         $c_cm = (($c_cm -replace '^https?://','') -replace '/.*$','').Trim()
 
-        $PING_CT = Get-RealPing $c_ct 53
-        $PING_CU = Get-RealPing $c_cu 53
-        $PING_CM = Get-RealPing $c_cm 53
-        $PING_BD = Get-RealPing "lf3-ips.zstaticcdn.com" 443
+        $rr = Format-PingResult (Get-RealPing $c_ct 53); $PING_CT = $rr[0]; $PING_M_CT = $rr[1]
+        $rr = Format-PingResult (Get-RealPing $c_cu 53); $PING_CU = $rr[0]; $PING_M_CU = $rr[1]
+        $rr = Format-PingResult (Get-RealPing $c_cm 53); $PING_CM = $rr[0]; $PING_M_CM = $rr[1]
+        $rr = Format-PingResult (Get-RealPing "lf3-ips.zstaticcdn.com" 443); $PING_BD = $rr[0]; $PING_M_BD = $rr[1]
 
         $c_gg = if ($PING_NODE_GG -eq "default") { "8.8.4.4" } else { $PING_NODE_GG }
         $c_cf = if ($PING_NODE_CF -eq "default") { "1.0.0.1" } else { $PING_NODE_CF }
+        $c_gg = (($c_gg -replace '^https?://','') -replace '/.*$','').Trim()
+        $c_cf = (($c_cf -replace '^https?://','') -replace '/.*$','').Trim()
 
-        $PING_GG = Get-RealPing $c_gg 53
-        $PING_CF = Get-RealPing $c_cf 53
+        $rr = Format-PingResult (Get-RealPing $c_gg 53); $PING_GG = $rr[0]; $PING_M_GG = $rr[1]
+        $rr = Format-PingResult (Get-RealPing $c_cf 53); $PING_CF = $rr[0]; $PING_M_CF = $rr[1]
     }
 
     $LOOP_COUNT++
@@ -1754,6 +1803,12 @@ while ($true) {
             ping_bd = "$PING_BD"
             ping_gg = "$PING_GG"
             ping_cf = "$PING_CF"
+            ping_ct_m = "$PING_M_CT"
+            ping_cu_m = "$PING_M_CU"
+            ping_cm_m = "$PING_M_CM"
+            ping_bd_m = "$PING_M_BD"
+            ping_gg_m = "$PING_M_GG"
+            ping_cf_m = "$PING_M_CF"
             virt = "$VIRT"
         }
     }
@@ -1840,9 +1895,11 @@ WORKER_URL="\$WORKER_URL"
 
 get_net_bytes() { grep -vE '^[ 	]*(lo|docker|veth|br-|virbr|tun[0-9]*|tap[0-9]*|kube|vxlan|wg[0-9]*|tailscale[0-9]*|zt[0-9]*|sit[0-9]*|ip6tnl|vboxnet[0-9]*|vmnet[0-9]*|vmbr[0-9]*|utun[0-9]*|awdl[0-9]*|gif[0-9]*):' /proc/net/dev | awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}'; }
 get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
-get_icmp_ping() { out=\\$(ping -c 1 -W 2 "\\$1" 2>/dev/null); [ -z "\\$out" ] && echo 0 || { rtt=\\$(printf '%s' "\\$out" | awk '{for(i=1;i<=NF;i++){if(\\$i ~ /^time[=<]/){gsub(/[^0-9.]/,"",\\$i); printf "%.0f",\\$i+0; exit}}}'); [ -n "\\$rtt" ] && echo "\\$rtt" || echo 0; }; }
-get_tcp_ping() { command -v curl >/dev/null 2>&1 || { echo 0; return; }; port="\\$2"; [ -z "\\$port" ] && port=53; t=\\$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout 2 "telnet://\\$1:\\$port" 2>/dev/null); case "\\$t" in ''|*[!0-9.]*) echo 0 ;; *) awk -v v="\\$t" 'BEGIN{r=(v*1000)+0; if(r<1) r=1; printf "%.0f", r}' ;; esac; }
-get_http_ping() { r=\\$(get_icmp_ping "\\$1"); case "\\$r" in ''|0) p="\\$2"; [ -z "\\$p" ] && p=53; r=\\$(get_tcp_ping "\\$1" "\\$p") ;; esac; [ -z "\\$r" ] && r=0; echo "\\$r"; }
+get_icmp_ping() { out=\\$(ping -c 1 -W 2 "\\$1" 2>/dev/null); [ -z "\\$out" ] && { echo -1; return; }; rtt=\\$(printf '%s' "\\$out" | awk '{for(i=1;i<=NF;i++){if(\\$i ~ /^time[=<]/){gsub(/[^0-9.]/,"",\\$i); printf "%.0f",\\$i+0; exit}}}'); case "\\$rtt" in ''|0) echo -1 ;; *) echo "\\$rtt" ;; esac; }
+get_tcp_ping() { command -v curl >/dev/null 2>&1 || { echo -1; return; }; port="\\$2"; [ -z "\\$port" ] && port=443; t=\\$(curl -s -o /dev/null -w '%{time_connect}' --connect-timeout 2 --max-time 3 "telnet://\\$1:\\$port" 2>/dev/null); case "\\$t" in ''|*[!0-9.]*) echo -1 ;; *) awk -v v="\\$t" 'BEGIN{r=v*1000; if(r<=0){print -1; exit} if(r<1) r=1; printf "%.0f", r}' ;; esac; }
+get_tcp_ping_multi() { for p in \\$2; do r=\\$(get_tcp_ping "\\$1" "\\$p"); case "\\$r" in ''|-1) ;; *) echo "\\$r"; return ;; esac; done; echo -1; }
+get_http_ping() { t=\\$(curl -s -k -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 4 "https://\\$1/" 2>/dev/null); case "\\$t" in ''|*[!0-9.]*) t=\\$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 4 "http://\\$1/" 2>/dev/null) ;; esac; case "\\$t" in ''|*[!0-9.]*) echo -1 ;; *) awk -v v="\\$t" 'BEGIN{r=v*1000; if(r<=0){print -1; exit} printf "%.0f", r}' ;; esac; }
+get_real_ping() { r=\\$(get_icmp_ping "\\$1"); case "\\$r" in ''|-1) ;; *) echo "\\$r icmp"; return ;; esac; r=\\$(get_tcp_ping_multi "\\$1" "\\$2"); case "\\$r" in ''|-1) ;; *) echo "\\$r tcp"; return ;; esac; r=\\$(get_http_ping "\\$1"); case "\\$r" in ''|-1) ;; *) echo "\\$r http"; return ;; esac; echo "-1 fail"; }
 
 NET_STAT=\\$(get_net_bytes)
 RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
@@ -1856,8 +1913,10 @@ PREV_CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
 
 LOOP_COUNT=0
 IPV4="0"; IPV6="0"
-PING_CT="0"; PING_CU="0"; PING_CM="0"; PING_BD="0"
-PING_GG="0"; PING_CF="0"
+PING_CT="fail"; PING_CU="fail"; PING_CM="fail"; PING_BD="fail"
+PING_GG="fail"; PING_CF="fail"
+PING_M_CT="fail"; PING_M_CU="fail"; PING_M_CM="fail"; PING_M_BD="fail"
+PING_M_GG="fail"; PING_M_CF="fail"
 
 REPORT_INTERVAL="${cfg.reportInterval}"
 PING_NODE_CT="${cfg.pingCt}"
@@ -1892,12 +1951,12 @@ while true; do
     GG_NODE=\\$(printf '%s' "\\$GG_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
     CF_NODE=\\$(printf '%s' "\\$CF_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
 
-    PING_CT=\\$(get_http_ping "\\$CT_NODE" 53)
-    PING_CU=\\$(get_http_ping "\\$CU_NODE" 53)
-    PING_CM=\\$(get_http_ping "\\$CM_NODE" 53)
-    PING_BD=\\$(get_http_ping "lf3-ips.zstaticcdn.com" 443)
-    PING_GG=\\$(get_http_ping "\\$GG_NODE" 53)
-    PING_CF=\\$(get_http_ping "\\$CF_NODE" 53)
+    PR=\\$(get_real_ping "\\$CT_NODE" "53 443 80"); PING_CT=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CT=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "\\$CU_NODE" "53 443 80"); PING_CU=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CU=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "\\$CM_NODE" "53 443 80"); PING_CM=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CM=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "lf3-ips.zstaticcdn.com" "443 53 80"); PING_BD=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_BD=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "\\$GG_NODE" "53 443 80"); PING_GG=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_GG=\\$(echo "\\$PR" | cut -d' ' -f2)
+    PR=\\$(get_real_ping "\\$CF_NODE" "53 443 80"); PING_CF=\\$(echo "\\$PR" | cut -d' ' -f1); PING_M_CF=\\$(echo "\\$PR" | cut -d' ' -f2)
   fi
   
   LOOP_COUNT=\\$((LOOP_COUNT + 1))
@@ -1980,7 +2039,7 @@ while true; do
   TX_SPEED=\\$(((TX_NOW - TX_PREV) / INV_SECS))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
   
-  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"ping_gg\\": \\"\\$PING_GG\\", \\"ping_cf\\": \\"\\$PING_CF\\", \\"virt\\": \\"\\$VIRT\\" }}"
+  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"ping_gg\\": \\"\\$PING_GG\\", \\"ping_cf\\": \\"\\$PING_CF\\", \\"ping_ct_m\\": \\"\\$PING_M_CT\\", \\"ping_cu_m\\": \\"\\$PING_M_CU\\", \\"ping_cm_m\\": \\"\\$PING_M_CM\\", \\"ping_bd_m\\": \\"\\$PING_M_BD\\", \\"ping_gg_m\\": \\"\\$PING_M_GG\\", \\"ping_cf_m\\": \\"\\$PING_M_CF\\", \\"virt\\": \\"\\$VIRT\\" }}"
   
   RES=\\$(curl -s -m 10 -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
   if echo "\\$RES" | grep -q "INTERVAL="; then
@@ -2173,6 +2232,7 @@ rm -f /tmp/cf_install.sh
               os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
               swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
               country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?, ping_gg = ?, ping_cf = ?,
+              ping_ct_m = ?, ping_cu_m = ?, ping_cm_m = ?, ping_bd_m = ?, ping_gg_m = ?, ping_cf_m = ?,
               monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?
           WHERE id = ?
         `).bind(
@@ -2186,6 +2246,8 @@ rm -f /tmp/cf_install.sh
           metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
           metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
           metrics.ping_gg || '0', metrics.ping_cf || '0',
+          metrics.ping_ct_m || 'fail', metrics.ping_cu_m || 'fail', metrics.ping_cm_m || 'fail', metrics.ping_bd_m || 'fail',
+          metrics.ping_gg_m || 'fail', metrics.ping_cf_m || 'fail',
           monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '',
           id
         ).run();
@@ -2205,7 +2267,7 @@ rm -f /tmp/cf_install.sh
     // ==========================================
     // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
     if (!(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
-    let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,ping_gg,ping_cf,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
+    let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,ping_gg,ping_cf,ping_ct_m,ping_cu_m,ping_cm_m,ping_bd_m,ping_gg_m,ping_cf_m,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
 
     const now = Date.now();
     const offlineThresMs = parseInt(sys.offline_threshold || '30') * 1000;
@@ -2754,6 +2816,8 @@ rm -f /tmp/cf_install.sh
 
       let cardContentHtml = ''; let tableBodyHtml = '';
       const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
+const isPingFail = (v) => { const s = String(v ?? '').trim().toLowerCase(); if (!s || s === 'fail' || s === '0' || s === 'null' || s === 'undefined') return true; const p = parseInt(s); return isNaN(p) || p <= 0; };
+const pingTag = (v, m) => { if (isPingFail(v)) return '超时'; let label = ''; const mt = String(m ?? '').trim().toLowerCase(); if (mt === 'icmp') label = 'ICMP'; else if (mt === 'tcp') label = 'TCP'; else if (mt === 'http') label = 'HTTP'; return label ? (v + 'ms (' + label + ')') : (v + 'ms'); };
 
       if (Object.keys(groups).length === 0) {
         cardContentHtml = '<p style="text-align:center; width: 100%; color: var(--text2);">暂无公开服务器</p>';
@@ -2806,7 +2870,7 @@ rm -f /tmp/cf_install.sh
             if (server.ip_v4 === '1') badgesHtml += `<span class="badge badge-v4">IPv4</span>`;
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
-            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span><span>8.8.4.4 <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${server.ping_gg === '0' ? '超时' : server.ping_gg + 'ms'}</span></span><span>1.0.0.1 <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${server.ping_cf === '0' ? '超时' : server.ping_cf + 'ms'}</span></span></div>`;
+            const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${pingTag(server.ping_ct, server.ping_ct_m)}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${pingTag(server.ping_cu, server.ping_cu_m)}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${pingTag(server.ping_cm, server.ping_cm_m)}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${pingTag(server.ping_bd, server.ping_bd_m)}</span></span><span>8.8.4.4 <span style="color:${getColor(server.ping_gg)}; font-weight:bold;">${pingTag(server.ping_gg, server.ping_gg_m)}</span></span><span>1.0.0.1 <span style="color:${getColor(server.ping_cf)}; font-weight:bold;">${pingTag(server.ping_cf, server.ping_cf_m)}</span></span></div>`;
 
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
