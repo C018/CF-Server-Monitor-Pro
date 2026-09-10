@@ -2309,8 +2309,8 @@ rm -f /tmp/cf_install.sh
         const lastHistTime = history.last_time || 0;
         
         if (nowMs - lastHistTime >= 300000 || !history.time) {
-            const maxPoints = 576; // 采样点上限，兜底防止异常膨胀
-            const HIST_WINDOW_MS = 48 * 60 * 60 * 1000; // 详情页展示区间：最近 48 小时
+            const maxPoints = 900; // 采样点上限，兜底防止异常膨胀（72 小时 × 5 分钟 ≈ 864 点，留少量余量）
+            const HIST_WINDOW_MS = 72 * 60 * 60 * 1000; // 详情页展示区间：最近 72 小时
             // 统一的历史序列注册表：新增曲线字段只需在此登记，保证各数组长度与 time 严格一致
             const PING_SERIES = ['ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'ping_gg', 'ping_cf',
                 'ping_intl_hk', 'ping_intl_tyo', 'ping_intl_sin', 'ping_intl_syd', 'ping_intl_lax',
@@ -2364,14 +2364,14 @@ rm -f /tmp/cf_install.sh
                 ping_intl_sao: toNum(metrics.ping_intl_sao)
             };
             for (const k of HIST_SERIES) history[k] = pushVal(history[k], metricVals[k]);
-            // 时间标签带上日期，48 小时跨天可区分，供前端 2 小时刻度对齐：MM-DD HH:mm（北京时间 UTC+8）
+            // 时间标签带上日期，72 小时跨天可区分：MM-DD HH:mm（北京时间 UTC+8）
             const p2 = (n) => String(n).padStart(2, '0');
             const tbj = new Date(nowMs + 8 * 60 * 60000);
             timeArr.push(p2(tbj.getUTCMonth() + 1) + '-' + p2(tbj.getUTCDate()) + ' ' + p2(tbj.getUTCHours()) + ':' + p2(tbj.getUTCMinutes()));
             history.time = timeArr;
             history.last_time = nowMs;
-            // 采样时间戳（epoch ms）与各序列一一对应：既用于后端按真实时间裁剪 48 小时窗口，
-            // 也供前端 X 轴精确落在 2 小时整点上（不依赖标签字符串解析）
+            // 采样时间戳（epoch ms）与各序列一一对应：既用于后端按真实时间裁剪 72 小时窗口，
+            // 也供前端按档位固定步长对齐北京时间边界生成 X 轴刻度（不依赖标签字符串解析）
             let tsArr = padTo(history.ts);
             tsArr.push(nowMs);
             const minTs = nowMs - HIST_WINDOW_MS;
@@ -2665,7 +2665,7 @@ rm -f /tmp/cf_install.sh
                 <button type="button" class="toggle-btn" data-range="3600000">近 1 小时</button>
                 <button type="button" class="toggle-btn" data-range="21600000">近 6 小时</button>
                 <button type="button" class="toggle-btn active" data-range="86400000">近 24 小时</button>
-                <button type="button" class="toggle-btn" data-range="0">全部</button>
+                <button type="button" class="toggle-btn" data-range="259200000">近 72 小时</button>
               </div>
             </div>
 
@@ -2788,6 +2788,16 @@ rm -f /tmp/cf_install.sh
             const HIST_BJ_OFFSET = 8 * 3600 * 1000; // 北京时间 UTC+8 偏移
             const HIST_MAX_TICKS = 8;               // 单轴最多显示刻度数（宽图目标值，窄图再降档）
             const DAY_MS = 24 * 3600 * 1000;
+            const HIST_MINUTE_MS = 60 * 1000;
+            const HIST_HOUR_MS = 60 * HIST_MINUTE_MS;
+            const HIST_RANGE_FULL = 259200000;      // 近 72 小时（原「全部」档，服务端保留上限 72 小时）
+            // 时间范围档位 → 固定刻度步长：1 小时→10 分钟 / 6 小时→1 小时 / 24 小时→4 小时 / 72 小时→12 小时
+            const HIST_STEP_BY_RANGE = { 3600000: 10 * HIST_MINUTE_MS, 21600000: HIST_HOUR_MS, 86400000: 4 * HIST_HOUR_MS, 259200000: 12 * HIST_HOUR_MS };
+            // 当前档位对应的固定刻度步长（毫秒）；无匹配返回 0，调用方走兜底
+            function histStepMs(rangeMs) {
+               const r = (typeof rangeMs === 'number') ? rangeMs : histRangeMs();
+               return HIST_STEP_BY_RANGE[r] || 0;
+            }
             // 目标刻度数：宽图（>=900px）8 个 / 中等（>=560px）6 个 / 窄图 4 个（resize 自动重算）
             function histTargetTicks(chart) {
                let w = 0;
@@ -2800,21 +2810,48 @@ rm -f /tmp/cf_install.sh
                if (w >= 560) return 6;
                return 4;
             }
-            // 按索引等距抽稀：与标签文本内容无关，首尾刻度必保留；返回原 tick 对象引用
-            function histThinTicks(list, k) {
+            // 按索引等距抽稀（输入为下标数组）：与标签文本内容无关，首尾必保留
+            function histThinIndexes(list, k) {
                const n = Array.isArray(list) ? list.length : 0;
-               if (!n) return list;
-               if (!k || k < 2 || n <= k + 1) return list;
-               const picked = [];
+               if (!n) return [];
+               if (!k || k < 2 || n <= k) return list;
+               const out = [];
                for (let i = 0; i < k; i++) {
                   const p = Math.round(i * (n - 1) / (k - 1));
-                  if (picked.indexOf(p) < 0) picked.push(p);
+                  const v = list[p];
+                  if (out.indexOf(v) < 0) out.push(v);
                }
-               const out = [];
-               for (let i = 0; i < picked.length; i++) out.push(list[picked[i]]);
                return out;
             }
-            // 稀疏刻度：afterBuildTicks 内按索引均匀取刻度，任意轴类型/标签格式下都生效
+            // 按档位固定步长对齐北京时间边界挑刻度：返回落在步长边界上的采样点下标
+            // 优先用 __ts 计算「时间桶」，桶发生变化处的采样点即边界点（采样时刻本身不必整点）；
+            // __ts 缺失时按索引近似（步长 ÷ 采样间隔 取一个点），末尾补一个点兜底
+            function histStepTicks(chart, stepMs) {
+               const labels = (chart && chart.data && chart.data.labels) || [];
+               const n = labels.length;
+               if (!n || !stepMs) return null;
+               const ts = (chart && chart.data) ? chart.data.__ts : null;
+               const out = [];
+               if (Array.isArray(ts) && ts.length === n) {
+                  let hasTs = false;
+                  for (let i = 0; i < n; i++) { const v = ts[i]; if (typeof v === 'number' && isFinite(v)) { hasTs = true; break; } }
+                  if (hasTs) {
+                     let lastBucket = null;
+                     for (let i = 0; i < n; i++) {
+                        const v = ts[i];
+                        if (typeof v !== 'number' || !isFinite(v)) continue;
+                        const bucket = Math.floor((v + HIST_BJ_OFFSET) / stepMs);
+                        if (lastBucket === null || bucket !== lastBucket) { out.push(i); lastBucket = bucket; }
+                     }
+                     return out;
+                  }
+               }
+               const stride = Math.max(1, Math.round(stepMs / HIST_SAMPLE_MS));
+               for (let i = 0; i < n; i += stride) out.push(i);
+               if (out.length && out[out.length - 1] !== n - 1) out.push(n - 1);
+               return out;
+            }
+            // 稀疏刻度：afterBuildTicks 内按档位固定步长对齐北京时间边界取刻度，含宽度上限与首尾兜底
             function histAfterBuildTicks(axis) {
                const chart = axis && axis.chart;
                const ticks = (axis && axis.ticks) || [];
@@ -2823,8 +2860,34 @@ rm -f /tmp/cf_install.sh
                // category 轴常在数据点之外多出一个边界刻度（下标越界、无标签），抽稀前先剔除，避免末刻度空文本
                let pool = ticks;
                if (labels.length && ticks.length === labels.length + 1) pool = ticks.slice(0, labels.length);
-               const out = histThinTicks(pool, histTargetTicks(chart));
-               return (out && out.length) ? out : pool;
+               // tick → 数据点下标 映射（category 轴 value 可能是下标或标签字符串）
+               const tickIdx = [];
+               for (let i = 0; i < pool.length; i++) tickIdx.push(histTickIndex(chart, pool[i].value, i));
+               // 1) 按当前档位固定步长对齐北京时间边界挑刻度
+               let idxs = histStepTicks(chart, histStepMs());
+               // 2) 兜底：按步长得到的刻度少于 2 个时，按索引均分 2 个（保证首尾可见）
+               if (!idxs || idxs.length < 2) {
+                  const n = labels.length;
+                  if (n >= 2) idxs = [0, n - 1];
+               }
+               if (!idxs || !idxs.length) return pool;
+               // 3) 宽度上限再抽稀（宽图 8 / 中等 6 / 窄图 4），避免窄屏标签重叠
+               const limit = histTargetTicks(chart);
+               if (idxs.length > limit) idxs = histThinIndexes(idxs, limit);
+               const pick = {};
+               for (let i = 0; i < idxs.length; i++) pick[idxs[i]] = true;
+               // 4) 映射回 tick 对象，并剔除相邻重复文本
+               const out = [];
+               let prevText = null;
+               for (let i = 0; i < pool.length; i++) {
+                  const di = tickIdx[i];
+                  if (typeof di !== 'number' || di < 0 || di >= labels.length || !pick[di]) continue;
+                  const txt = histTickText(chart, di, histDayBreak(chart, di));
+                  if (txt === prevText) continue;
+                  prevText = txt;
+                  out.push(pool[i]);
+               }
+               return out.length ? out : pool;
             }
             // 还原 tick 对应的采样点下标（category 轴 value 可能为下标或标签字符串）
             function histTickIndex(chart, value, fallback) {
@@ -2853,8 +2916,10 @@ rm -f /tmp/cf_install.sh
                return false;
             }
             // 刻度文本：优先该采样点真实时间戳 __ts（北京时间）；无 __ts 时回退原始标签文本（仅按空格切分，不做时间解析）
+            // 近 72 小时档刻度间隔 12 小时，文本统一带日期（MM-DD HH:mm），其余档位首刻度与跨天刻度也带日期
             function histTickText(chart, idx, firstOfDay) {
                const p = (n) => String(n).padStart(2, '0');
+               const withDate = !!firstOfDay || histRangeMs() === HIST_RANGE_FULL;
                const ts = (chart && chart.data) ? chart.data.__ts : null;
                const labels = (chart && chart.data && chart.data.labels) || [];
                if (Array.isArray(ts) && typeof idx === 'number' && idx >= 0 && idx < ts.length) {
@@ -2862,14 +2927,14 @@ rm -f /tmp/cf_install.sh
                   if (typeof v === 'number' && isFinite(v)) {
                      const d = new Date(v + HIST_BJ_OFFSET);
                      const hhmm = p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
-                     return firstOfDay ? (p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + hhmm) : hhmm;
+                     return withDate ? (p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + hhmm) : hhmm;
                   }
                }
                const lb = labels[idx];
                if (lb === undefined || lb === null || lb === '') return '';
                const s = String(lb);
                const sp = s.split(' ');
-               if (sp.length === 2) return firstOfDay ? s : sp[1];
+               if (sp.length === 2) return withDate ? s : sp[1];
                return s;
             }
             // X 轴刻度配置：颜色随主题，字号随屏宽（手机 9 / 其余 10），不旋转；autoSkip + maxTicksLimit 作保底，主抽稀由 afterBuildTicks 完成
@@ -2893,24 +2958,31 @@ rm -f /tmp/cf_install.sh
                const d = new Date(ms + HIST_BJ_OFFSET);
                return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
             }
-            // ===== 时间范围分段控件：近 1 小时 / 近 6 小时 / 近 24 小时 / 全部（默认近 24 小时，localStorage 记忆）=====
+            // ===== 时间范围分段控件：近 1 小时 / 近 6 小时 / 近 24 小时 / 近 72 小时（默认近 24 小时，localStorage 记忆）=====
             const HIST_RANGE_KEY = 'cfpro_ping_range';
             const HIST_RANGE_DEFAULT = 86400000;
-            const HIST_RANGE_VALUES = [3600000, 21600000, 86400000, 0];
+            // 时间范围档位：近 1 小时 / 近 6 小时 / 近 24 小时 / 近 72 小时（原「全部」档已迁移为 72 小时，与服务端保留上限一致）
+            const HIST_RANGE_VALUES = [3600000, 21600000, 86400000, HIST_RANGE_FULL];
             let lastFullHistory = null;   // 最近一次完整 history 缓存，切换 range 时复用、不额外请求
+            let histRangeCached = null;   // 当前档位缓存（毫秒），避免每帧/每刻度反复读 localStorage
             function histRangeMs() {
+               if (typeof histRangeCached === 'number' && histRangeCached >= 0) return histRangeCached;
                let raw = null;
                try { raw = localStorage.getItem(HIST_RANGE_KEY); } catch (e) {}
                const num = parseInt(raw, 10);
-               return HIST_RANGE_VALUES.indexOf(num) >= 0 ? num : HIST_RANGE_DEFAULT;
+               let v = HIST_RANGE_DEFAULT;
+               if (isFinite(num) && num > 0) v = num;
+               else if (num === 0) v = HIST_RANGE_FULL;   // 旧「全部」档迁移为近 72 小时，避免无高亮的空白档位
+               histRangeCached = v;
+               return v;
             }
             // 按当前 range 裁剪 history：优先 __ts（ts >= 最新 ts - range），无 __ts 按点数近似（5 分钟一点）
             function histSliceHistory(history) {
                const labels = Array.isArray(history.time) ? history.time : [];
                const ts = Array.isArray(history.ts) ? history.ts : [];
                const n = labels.length;
-               const rangeMs = histRangeMs();
-               if (!rangeMs || n === 0) return { labels: labels, ts: ts, from: 0 };
+               const rangeMs = histRangeMs() || HIST_RANGE_FULL;   // 档位恒为 1/6/24/72 小时，兜底防异常值
+               if (n === 0) return { labels: labels, ts: ts, from: 0 };
                let from = 0;
                if (ts.length === n && typeof ts[n - 1] === 'number' && isFinite(ts[n - 1])) {
                   const edge = ts[n - 1] - rangeMs;
@@ -2963,6 +3035,8 @@ rm -f /tmp/cf_install.sh
             function histBindRange() {
                const box = document.getElementById('hist-range');
                if (!box) return;
+               // 旧版本「全部」档（值 0）迁移为近 72 小时，避免出现无高亮的空白档位
+               try { if (parseInt(localStorage.getItem(HIST_RANGE_KEY), 10) === 0) localStorage.setItem(HIST_RANGE_KEY, String(HIST_RANGE_FULL)); } catch (err) {}
                histMarkRange();
                box.addEventListener('click', (e) => {
                   let el = e.target;
@@ -2970,6 +3044,7 @@ rm -f /tmp/cf_install.sh
                   if (!el || el === box) return;
                   const v = parseInt(el.getAttribute('data-range'), 10);
                   if (HIST_RANGE_VALUES.indexOf(v) < 0) return;
+                  histRangeCached = v;
                   try { localStorage.setItem(HIST_RANGE_KEY, String(v)); } catch (err) {}
                   histMarkRange();
                   if (lastFullHistory) renderHistory(lastFullHistory);
