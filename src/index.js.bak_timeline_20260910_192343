@@ -2617,22 +2617,6 @@ rm -f /tmp/cf_install.sh
             /* 页面私有样式：仅保留设计系统未覆盖的页面级布局 */
             body { padding: 0; }
             ${themeStyles}
-            /* ===== 详情页专用：历史趋势工具条 + 响应式图表高度（仅详情页使用，类名 hist-* 与其他页面无交集）===== */
-            .hist-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: nowrap; margin-bottom: 14px; padding: 0 4px; }
-            .hist-toolbar-title { font-size: 12px; font-weight: 600; color: var(--text2); letter-spacing: 0.2px; white-space: nowrap; }
-            .hist-toolbar .view-controls { flex-shrink: 1; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
-            .hist-toolbar .view-controls::-webkit-scrollbar { display: none; }
-            .hist-toolbar .toggle-btn { white-space: nowrap; }
-            .hist-box { height: 180px; }
-            .hist-box-lg { height: 240px; }
-            .hist-box-md { height: 200px; }
-            @media (max-width: 767px) {
-              .hist-toolbar { gap: 8px; }
-              .hist-toolbar-title { font-size: 11px; }
-              .hist-box { height: 150px; }
-              .hist-box-lg { height: 180px; }
-              .hist-box-md { height: 160px; }
-            }
           </style>
         </head>
         <body class="${sys.theme || 'theme1'}">
@@ -2659,22 +2643,12 @@ rm -f /tmp/cf_install.sh
               </div>
             </div>
 
-            <div class="hist-toolbar">
-              <span class="hist-toolbar-title">历史趋势</span>
-              <div class="view-controls" id="hist-range">
-                <button type="button" class="toggle-btn" data-range="3600000">近 1 小时</button>
-                <button type="button" class="toggle-btn" data-range="21600000">近 6 小时</button>
-                <button type="button" class="toggle-btn active" data-range="86400000">近 24 小时</button>
-                <button type="button" class="toggle-btn" data-range="0">全部</button>
-              </div>
-            </div>
-
             <div class="detail-grid">
               <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">CPU</span><span id="txt-cpu" class="stat-val" style="font-weight:bold;">0%</span>
                  </div>
-                 <div class="hist-box"><canvas id="chart-cpu"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-cpu"></canvas></div>
               </div>
               
               <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
@@ -2682,7 +2656,7 @@ rm -f /tmp/cf_install.sh
                    <span class="card-title" style="font-weight:bold;">内存</span><span id="txt-ram" class="stat-val" style="font-weight:bold;">0%</span>
                  </div>
                  <div style="font-size: 12px; color: var(--text2); position: absolute; top: 45px; left: 20px;">Swap: <span id="txt-swap">0 / 0</span></div>
-                 <div class="hist-box"><canvas id="chart-ram"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-ram"></canvas></div>
               </div>
 
               <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
@@ -2699,41 +2673,41 @@ rm -f /tmp/cf_install.sh
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">进程数</span><span id="txt-proc" class="stat-val" style="font-weight:bold;">0</span>
                  </div>
-                 <div class="hist-box"><canvas id="chart-proc"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-proc"></canvas></div>
               </div>
 
               <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">网络速度</span><span class="stat-val" style="font-weight:bold;"><span style="color:#10b981;">↓</span> <span id="txt-net-in">0 B/s</span> | <span style="color:#3b82f6;">↑</span> <span id="txt-net-out">0 B/s</span></span>
                  </div>
-                 <div class="hist-box"><canvas id="chart-net"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-net"></canvas></div>
               </div>
 
               <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">TCP / UDP</span><span class="stat-val" style="font-weight:bold;">TCP <span id="txt-tcp">0</span> | UDP <span id="txt-udp">0</span></span>
                  </div>
-                 <div class="hist-box"><canvas id="chart-conn"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-conn"></canvas></div>
               </div>
 
               <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">国内延迟 (ms)</span>
                  </div>
-                 <div class="hist-box hist-box-lg"><canvas id="chart-ping-dom"></canvas></div>
+                 <div style="height: 220px;"><canvas id="chart-ping-dom"></canvas></div>
               </div>
 
               <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">海外延迟 (ms)</span>
                  </div>
-                 <div class="hist-box hist-box-md"><canvas id="chart-ping-ov"></canvas></div>
+                 <div style="height: 180px;"><canvas id="chart-ping-ov"></canvas></div>
               </div>
               <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">国际互联延迟 (ms)</span>
                  </div>
-                 <div class="hist-box hist-box-lg"><canvas id="chart-ping-intl"></canvas></div>
+                 <div style="height: 220px;"><canvas id="chart-ping-intl"></canvas></div>
               </div>
             </div>
             
@@ -2783,240 +2757,51 @@ rm -f /tmp/cf_install.sh
                return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
             };
 
-            // ===== 历史图表 X 轴时间刻度：目标刻度数随 chart 宽度自适应 + 步长随数据跨度自适应（整点对齐，北京时间 UTC+8）=====
-            const HIST_STEP_HOURS = [0.5, 1, 2, 3, 4, 6, 8, 12, 24, 48, 72, 168];
-            const HIST_SAMPLE_MS = 5 * 60 * 1000;   // 无采样时间戳时的兜底采样间隔（5 分钟）
-            const HIST_BJ_OFFSET = 8 * 3600 * 1000; // 北京时间 UTC+8 偏移
-            const HOUR_MS = 3600000;
-            // 目标刻度数：宽度 <420px -> 3；<700px -> 4；<980px -> 5；否则 6（resize 时自动重算）
-            function histTargetTicks(chart) {
-               let w = 0;
-               if (chart) {
-                  if (typeof chart.width === 'number' && chart.width > 0) w = chart.width;
-                  else if (chart.chartArea) w = chart.chartArea.right - chart.chartArea.left;
-                  if (!w && chart.canvas && chart.canvas.clientWidth) w = chart.canvas.clientWidth;
-               }
-               if (w < 420) return 3;
-               if (w < 700) return 4;
-               if (w < 980) return 5;
-               return 6;
-            }
-            // 数据跨度：优先取该图表 __ts 首尾差；无 __ts 时按数据点数 × 5 分钟兜底
-            function histSpanMs(chart) {
-               const ts = (chart && chart.data) ? chart.data.__ts : null;
-               if (Array.isArray(ts) && ts.length >= 2) {
-                  const a = ts[0], b = ts[ts.length - 1];
-                  if (typeof a === 'number' && typeof b === 'number' && isFinite(a) && isFinite(b) && b > a) return b - a;
-               }
-               const n = (chart && chart.data && chart.data.labels) ? chart.data.labels.length : 0;
-               return n >= 2 ? (n - 1) * HIST_SAMPLE_MS : 0;
-            }
-            // 步长自适应：候选步长中取满足「跨度 / 步长 <= 目标刻度数」的最小值
-            function histStepMsOf(chart) {
-               const span = histSpanMs(chart);
-               if (!(span > 0)) return HOUR_MS;
-               const need = span / histTargetTicks(chart);
-               for (let i = 0; i < HIST_STEP_HOURS.length; i++) {
-                  const ms = HIST_STEP_HOURS[i] * HOUR_MS;
-                  if (ms >= need) return ms;
-               }
-               return HIST_STEP_HOURS[HIST_STEP_HOURS.length - 1] * HOUR_MS;
-            }
-            // 解析历史标签（新格式 "MM-DD HH:mm" / 旧脏数据 "HH:MM"）为可比较的伪时间戳；失败返回 null
-            function histLabelMs(lbl) {
-               if (typeof lbl !== 'string') return null;
-               const parts = lbl.split(' ');
-               let dayPart = null, timePart = null;
-               if (parts.length === 2 && parts[0].indexOf('-') > 0) { dayPart = parts[0]; timePart = parts[1]; }
-               else if (parts.length === 1 && parts[0].indexOf(':') > 0) { timePart = parts[0]; }
-               else return null;
-               const hm = timePart.split(':');
-               if (hm.length < 2) return null;
-               const hh = parseInt(hm[0], 10), mi = parseInt(hm[1], 10);
-               if (!isFinite(hh) || !isFinite(mi)) return null;
-               let mo = 0, dd = 0;
-               if (dayPart !== null) {
-                  const dm = dayPart.split('-');
-                  if (dm.length !== 2) return null;
-                  mo = parseInt(dm[0], 10); dd = parseInt(dm[1], 10);
-                  if (!isFinite(mo) || !isFinite(dd)) return null;
-               }
-               return ((mo * 31 + dd) * 24 + hh) * HOUR_MS + mi * 60000;
-            }
-            // 第 index 个采样点的毫秒时间戳：优先 __ts，缺失时回退标签解析
-            function histSampleMs(chart, index) {
-               const ts = (chart && chart.data) ? chart.data.__ts : null;
+            // 由采样时间戳推导「2 小时桶」序号；ts 缺失时回退解析标签，兼容新格式 "MM-DD HH:mm" 与旧脏数据 "HH:MM"
+            function histBucketOf(lbl, ts, index) {
                if (Array.isArray(ts) && typeof index === 'number' && index >= 0 && index < ts.length) {
                   const v = ts[index];
-                  if (typeof v === 'number' && isFinite(v)) return v;
+                  if (typeof v === 'number' && isFinite(v)) return Math.floor(v / 7200000);
                }
-               const labels = (chart && chart.data && chart.data.labels) || [];
-               return histLabelMs(labels[index]);
+               if (typeof lbl !== 'string') return null;
+               let m = /^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(lbl);
+               if (m) return (parseInt(m[1], 10) * 31 + parseInt(m[2], 10)) * 12 + Math.floor((parseInt(m[3], 10) + parseInt(m[4], 10) / 60) / 2);
+               m = /^(\d{2}):(\d{2})$/.exec(lbl);
+               if (m) return Math.floor((parseInt(m[1], 10) + parseInt(m[2], 10) / 60) / 2);
+               return null;
             }
-            // 该图表是否具备与 labels 等长的真实采样时间戳
-            function histHasTs(chart) {
-               const labels = (chart && chart.data && chart.data.labels) || [];
-               const ts = (chart && chart.data) ? chart.data.__ts : null;
-               return Array.isArray(ts) && labels.length > 0 && ts.length === labels.length;
-            }
-            // 刻度文本（北京时间 UTC+8）：步长 >= 24h 或落在 00:00 整点 -> MM-DD，其余 -> HH:mm
-            function histTickLabel(ms, stepMs, realTs) {
-               const p = (n) => String(n).padStart(2, '0');
-               if (realTs) {
-                  const d = new Date(ms + HIST_BJ_OFFSET);
-                  const mo = p(d.getUTCMonth() + 1), dd = p(d.getUTCDate());
-                  const hh = d.getUTCHours(), mi = d.getUTCMinutes();
-                  if (stepMs >= 24 * HOUR_MS) return mo + '-' + dd;
-                  if (hh === 0 && mi === 0) return mo + '-' + dd;
-                  return p(hh) + ':' + p(mi);
-               }
-               const totalMin = Math.floor(ms / 60000);
-               const hh = Math.floor(totalMin / 60) % 24, mi = totalMin % 60;
-               if (stepMs >= 24 * HOUR_MS || (hh === 0 && mi === 0)) {
-                  const days = Math.floor(totalMin / 1440);
-                  const mo = Math.floor(days / 31), dd = days - mo * 31;
-                  return p(mo) + '-' + p(dd);
-               }
-               return p(hh) + ':' + p(mi);
-            }
-            // 还原 tick 对应的采样点下标（category 轴 value 可能为下标或标签字符串）
-            function histTickIndex(chart, value, fallback) {
-               const labels = (chart && chart.data && chart.data.labels) || [];
-               if (typeof value === 'number' && value >= 0 && value < labels.length) return value;
-               if (typeof value === 'string') {
-                  const found = labels.indexOf(value);
-                  if (found >= 0) return found;
-               }
-               return fallback;
-            }
-            // 稀疏刻度过滤：仅保留「跨步长边界」的采样点（bucket = Math.floor(ts / stepMs) 与前一采样点不同），竖网格线随之对齐
-            function histAfterBuildTicks(axis) {
-               const chart = axis && axis.chart;
-               const ticks = (axis && axis.ticks) || [];
-               if (!chart || !ticks.length) return ticks;
-               const stepMs = histStepMsOf(chart);
-               const out = [];
-               let prevBucket = null;
-               for (let i = 0; i < ticks.length; i++) {
-                  const tk = ticks[i];
-                  const ms = histSampleMs(chart, histTickIndex(chart, tk ? tk.value : null, i));
-                  if (ms === null) { out.push(tk); continue; }
-                  const bucket = Math.floor(ms / stepMs);
-                  if (prevBucket === null || bucket !== prevBucket) {
-                     prevBucket = bucket;
-                     out.push(tk);
+            // 刻度文本：有采样时间戳时把标签规整到所在的 2 小时整点（UTC+8），保证刻度为 18:00 / 20:00 这类整点
+            function histTickText(lbl, ts, index) {
+               if (Array.isArray(ts) && typeof index === 'number' && index >= 0 && index < ts.length) {
+                  const v = ts[index];
+                  if (typeof v === 'number' && isFinite(v)) {
+                     const d = new Date(Math.floor(v / 7200000) * 7200000 + 8 * 3600000);
+                     const p = (n) => String(n).padStart(2, '0');
+                     const hh = p(d.getUTCHours()), mo = p(d.getUTCMonth() + 1), dd = p(d.getUTCDate());
+                     return hh === '00' ? (mo + '-' + dd) : (hh + ':' + p(d.getUTCMinutes()));
                   }
                }
-               return out.length ? out : ticks;
+               const m = /^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(String(lbl));
+               if (m) return parseInt(m[3], 10) === 0 ? (m[1] + '-' + m[2]) : (m[3] + ':' + m[4]);
+               return String(lbl);
             }
-            // X 轴刻度配置：颜色随主题，字号随屏宽（手机 9 / 其余 10），不自作旋转
+            // X 轴刻度：每 2 小时一个节点，跨过 2 小时边界的首个采样点显示时间标签
             function histTicks(fontColor) {
-               const small = (typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 480);
                return {
-                  color: fontColor, autoSkip: false, maxRotation: 0, font: { size: small ? 9 : 10 },
+                  color: fontColor, autoSkip: false, maxRotation: 0, font: { size: 10 },
                   callback: function(value, index) {
-                     const chart = (this && this.chart) ? this.chart : ((this && this.scale) ? this.scale.chart : null);
-                     if (!chart) return '';
-                     const idx = histTickIndex(chart, value, index);
-                     const ms = histSampleMs(chart, idx);
-                     if (ms === null) {
-                        const labels = (chart.data && chart.data.labels) || [];
-                        const lb = labels[idx];
-                        return (lb === undefined || lb === null) ? '' : String(lb);
-                     }
-                     const stepMs = histStepMsOf(chart);
-                     return histTickLabel(Math.floor(ms / stepMs) * stepMs, stepMs, histHasTs(chart));
+                     const labels = (this.chart && this.chart.data && this.chart.data.labels) || [];
+                     if (typeof index !== 'number' || index < 0 || index >= labels.length) return '';
+                     const cur = labels[index];
+                     if (cur === undefined || cur === null || cur === '') return '';
+                     const ts = (this.chart && this.chart.data && this.chart.data.__ts) || null;
+                     const curB = histBucketOf(cur, ts, index);
+                     if (curB === null) return String(cur);
+                     const prevB = index > 0 ? histBucketOf(labels[index - 1], ts, index - 1) : null;
+                     if (prevB === null || curB !== prevB) return histTickText(cur, ts, index);
+                     return '';
                   }
                };
-            }
-
-            // tooltip 标题：完整北京时间 YYYY-MM-DD HH:mm
-            function histFullTime(ms) {
-               const p = (n) => String(n).padStart(2, '0');
-               const d = new Date(ms + HIST_BJ_OFFSET);
-               return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
-            }
-            // ===== 时间范围分段控件：近 1 小时 / 近 6 小时 / 近 24 小时 / 全部（默认近 24 小时，localStorage 记忆）=====
-            const HIST_RANGE_KEY = 'cfpro_ping_range';
-            const HIST_RANGE_DEFAULT = 86400000;
-            const HIST_RANGE_VALUES = [3600000, 21600000, 86400000, 0];
-            let lastFullHistory = null;   // 最近一次完整 history 缓存，切换 range 时复用、不额外请求
-            function histRangeMs() {
-               let raw = null;
-               try { raw = localStorage.getItem(HIST_RANGE_KEY); } catch (e) {}
-               const num = parseInt(raw, 10);
-               return HIST_RANGE_VALUES.indexOf(num) >= 0 ? num : HIST_RANGE_DEFAULT;
-            }
-            // 按当前 range 裁剪 history：优先 __ts（ts >= 最新 ts - range），无 __ts 按点数近似（5 分钟一点）
-            function histSliceHistory(history) {
-               const labels = Array.isArray(history.time) ? history.time : [];
-               const ts = Array.isArray(history.ts) ? history.ts : [];
-               const n = labels.length;
-               const rangeMs = histRangeMs();
-               if (!rangeMs || n === 0) return { labels: labels, ts: ts, from: 0 };
-               let from = 0;
-               if (ts.length === n && typeof ts[n - 1] === 'number' && isFinite(ts[n - 1])) {
-                  const edge = ts[n - 1] - rangeMs;
-                  from = n;
-                  for (let i = 0; i < n; i++) {
-                     const v = ts[i];
-                     if (typeof v === 'number' && isFinite(v) && v >= edge) { from = i; break; }
-                  }
-               } else {
-                  from = Math.max(0, n - Math.round(rangeMs / HIST_SAMPLE_MS));
-               }
-               if (n - from < 2) from = Math.max(0, n - 2);   // 过滤后不足 2 点则退回保留 2 点，避免空图
-               return { labels: labels.slice(from), ts: ts.slice(from), from: from };
-            }
-            // 按当前 range 渲染全部历史图表（series 交给 alignSeries 取末尾对齐，无需重复裁剪）
-            function renderHistory(history) {
-               if (!history || !Array.isArray(history.time) || history.time.length === 0) return;
-               const part = histSliceHistory(history);
-               const labels = part.labels;
-               if (!labels.length) return;
-               const tsArr = (part.ts.length === labels.length) ? part.ts : [];
-               Object.keys(charts).forEach((ck) => {
-                  const c = charts[ck];
-                  if (!c || !c.data) return;
-                  if (tsArr.length) c.data.__ts = tsArr;
-                  else delete c.data.__ts;
-               });
-               updateChart(charts.cpu, labels, [history.cpu]);
-               updateChart(charts.ram, labels, [history.ram]);
-               updateChart(charts.proc, labels, [history.proc]);
-               updateChart(charts.net, labels, [history.net_in, history.net_out]);
-               updateChart(charts.conn, labels, [history.tcp, history.udp]);
-               updateChart(charts.pingDom, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd]);
-               updateChart(charts.pingOversea, labels, [history.ping_gg || [], history.ping_cf || []]);
-               updateChart(charts.pingIntl, labels, [history.ping_intl_hk || [], history.ping_intl_tyo || [], history.ping_intl_sin || [], history.ping_intl_syd || [], history.ping_intl_lax || [], history.ping_intl_nyc || [], history.ping_intl_fra || [], history.ping_intl_lon || [], history.ping_intl_ams || [], history.ping_intl_sao || []]);
-            }
-            // 分段控件高亮（按 localStorage 记忆恢复）
-            function histMarkRange() {
-               const box = document.getElementById('hist-range');
-               if (!box) return;
-               const cur = histRangeMs();
-               const btns = box.querySelectorAll('.toggle-btn');
-               for (let i = 0; i < btns.length; i++) {
-                  const v = parseInt(btns[i].getAttribute('data-range'), 10);
-                  if (v === cur) btns[i].classList.add('active');
-                  else btns[i].classList.remove('active');
-               }
-            }
-            // 绑定分段控件：切换仅用缓存重渲染，不发起请求、不重建图表（4s 轮询不受影响）
-            function histBindRange() {
-               const box = document.getElementById('hist-range');
-               if (!box) return;
-               histMarkRange();
-               box.addEventListener('click', (e) => {
-                  let el = e.target;
-                  while (el && el !== box && !el.getAttribute('data-range')) el = el.parentNode;
-                  if (!el || el === box) return;
-                  const v = parseInt(el.getAttribute('data-range'), 10);
-                  if (HIST_RANGE_VALUES.indexOf(v) < 0) return;
-                  try { localStorage.setItem(HIST_RANGE_KEY, String(v)); } catch (err) {}
-                  histMarkRange();
-                  if (lastFullHistory) renderHistory(lastFullHistory);
-               });
             }
 
             function initChart(ctxId, label1, label2, color1, color2, isSpeed = false) {
@@ -3025,17 +2810,14 @@ rm -f /tmp/cf_install.sh
               const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
               const fontColor = isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.6)';
               
-              const xGridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
-              const tipBg = isDark ? 'rgba(28,28,30,0.95)' : 'rgba(255,255,255,0.98)';
-              const tipFg = isDark ? 'rgba(255,255,255,0.92)' : 'rgba(0,0,0,0.85)';
               const datasets = [{
                   label: label1, data: [], borderColor: color1, backgroundColor: color1.replace('1)', '0.1)'),
-                  borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, fill: true, tension: 0.3, spanGaps: true
+                  borderWidth: 2, pointRadius: 0, fill: true, tension: 0.4
               }];
               if (label2) {
                  datasets.push({
                     label: label2, data: [], borderColor: color2, backgroundColor: 'transparent',
-                    borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, fill: false, tension: 0.3, spanGaps: true
+                    borderWidth: 2, pointRadius: 0, fill: false, tension: 0.4
                  });
               }
 
@@ -3046,25 +2828,10 @@ rm -f /tmp/cf_install.sh
                   responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, interaction: { mode: 'index', intersect: false },
                   plugins: {
                     legend: { display: false },
-                    tooltip: {
-                       backgroundColor: tipBg, titleColor: tipFg, bodyColor: tipFg,
-                       borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)', borderWidth: 1, cornerRadius: 10, padding: 10,
-                       callbacks: {
-                          title: function(items) {
-                             if (!items || !items.length) return '';
-                             const it = items[0];
-                             const chart = (it && it.chart) ? it.chart : ((this && this.chart) ? this.chart : null);
-                             const ts = (chart && chart.data) ? chart.data.__ts : null;
-                             const ms = (Array.isArray(ts) && it && typeof it.dataIndex === 'number') ? ts[it.dataIndex] : null;
-                             if (typeof ms === 'number' && isFinite(ms)) return histFullTime(ms);
-                             return (it && it.label) ? String(it.label) : '';
-                          },
-                          label: function(context) { let l = context.dataset.label || ''; if (l) l += ': '; if (context.parsed.y !== null) l += isSpeed ? formatBytesJs(context.parsed.y) + '/s' : context.parsed.y; return l; }
-                       }
-                    }
+                    tooltip: { callbacks: { label: function(context) { let l = context.dataset.label || ''; if (l) l += ': '; if (context.parsed.y !== null) l += isSpeed ? formatBytesJs(context.parsed.y) + '/s' : context.parsed.y; return l; } } }
                   },
                   scales: {
-                    x: { grid: { display: true, drawTicks: false, drawBorder: false, borderDash: [3, 3], color: xGridColor }, afterBuildTicks: histAfterBuildTicks, ticks: histTicks(fontColor) },
+                    x: { grid: { display: false, drawBorder: false }, ticks: histTicks(fontColor) },
                     y: { grid: { color: gridColor, drawBorder: false }, ticks: { color: fontColor, callback: function(value) { return isSpeed ? formatBytesJs(value) : value; } }, beginAtZero: true }
                   }
                 }
@@ -3076,12 +2843,8 @@ rm -f /tmp/cf_install.sh
               const isDark = uiDark();
               const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
               const fontColor = isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.6)';
-              const xGridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
-              const tipBg = isDark ? 'rgba(28,28,30,0.95)' : 'rgba(255,255,255,0.98)';
-              const tipFg = isDark ? 'rgba(255,255,255,0.92)' : 'rgba(0,0,0,0.85)';
-              const small = (typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 480);
               const datasets = (series || []).map((s) => ({
-                     label: s[0], data: [], borderColor: s[1], borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.3, spanGaps: true
+                     label: s[0], data: [], borderColor: s[1], borderWidth: 2, pointRadius: 0, tension: 0.4
               }));
 
               return new Chart(ctx, {
@@ -3089,30 +2852,9 @@ rm -f /tmp/cf_install.sh
                 data: { labels: [], datasets: datasets },
                 options: {
                   responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, interaction: { mode: 'index', intersect: false },
-                  plugins: {
-                    legend: {
-                       position: 'bottom', align: 'center', usePointStyle: true,
-                       labels: { color: fontColor, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 12, font: { size: small ? 8 : 11 } }
-                    },
-                    tooltip: {
-                       backgroundColor: tipBg, titleColor: tipFg, bodyColor: tipFg,
-                       borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)', borderWidth: 1, cornerRadius: 10, padding: 10,
-                       callbacks: {
-                          title: function(items) {
-                             if (!items || !items.length) return '';
-                             const it = items[0];
-                             const chart = (it && it.chart) ? it.chart : ((this && this.chart) ? this.chart : null);
-                             const ts = (chart && chart.data) ? chart.data.__ts : null;
-                             const ms = (Array.isArray(ts) && it && typeof it.dataIndex === 'number') ? ts[it.dataIndex] : null;
-                             if (typeof ms === 'number' && isFinite(ms)) return histFullTime(ms);
-                             return (it && it.label) ? String(it.label) : '';
-                          },
-                          label: function(context) { let l = context.dataset.label || ''; if (l) l += ': '; if (context.parsed.y !== null) l += context.parsed.y + ' ms'; return l; }
-                       }
-                    }
-                  },
+                  plugins: { legend: { labels: { color: fontColor } } },
                   scales: {
-                    x: { grid: { display: true, drawTicks: false, drawBorder: false, borderDash: [3, 3], color: xGridColor }, afterBuildTicks: histAfterBuildTicks, ticks: histTicks(fontColor) },
+                    x: { grid: { display: false }, ticks: histTicks(fontColor) },
                     y: { grid: { color: gridColor }, ticks: { color: fontColor }, beginAtZero: true }
                   }
                 }
@@ -3134,7 +2876,7 @@ rm -f /tmp/cf_install.sh
               chartDefs.forEach((d) => {
                 const c = charts[d.key];
                 if (c) {
-                  keep[d.key] = { labels: (c.data.labels || []).slice(), ts: Array.isArray(c.data.__ts) ? c.data.__ts.slice() : null, ds: (c.data.datasets || []).map((x) => ({ label: x.label, data: x.data.slice(), borderColor: x.borderColor, backgroundColor: x.backgroundColor, borderWidth: x.borderWidth, pointRadius: x.pointRadius, tension: x.tension, fill: x.fill })) };
+                  keep[d.key] = { labels: (c.data.labels || []).slice(), ds: (c.data.datasets || []).map((x) => ({ label: x.label, data: x.data.slice(), borderColor: x.borderColor, backgroundColor: x.backgroundColor, borderWidth: x.borderWidth, pointRadius: x.pointRadius, tension: x.tension, fill: x.fill })) };
                   try { c.destroy(); } catch (e) {}
                 }
               });
@@ -3146,15 +2888,12 @@ rm -f /tmp/cf_install.sh
                   const ch = charts[d.key];
                   ch.data.labels = rec.labels;
                   rec.ds.forEach((x, i) => { if (ch.data.datasets[i]) { ch.data.datasets[i].data = x.data; ch.data.datasets[i].borderColor = x.borderColor; ch.data.datasets[i].backgroundColor = x.backgroundColor; } });
-                  if (Array.isArray(rec.ts) && rec.ts.length === rec.labels.length) ch.data.__ts = rec.ts;
                   ch.update();
                 }
               });
-              if (lastFullHistory) renderHistory(lastFullHistory);
             }
             window.__uiThemeChanged = rebuildDetailCharts;
             document.addEventListener('DOMContentLoaded', () => {
-               histBindRange();
                chartDefs.forEach((d) => { if (d.ping) charts[d.key] = initPingChart(d.canvasId, d.series); else charts[d.key] = initChart(d.canvasId, d.args[0], d.args[1], d.args[2], d.args[3], d.args[4]); });
                fetchData(); setInterval(fetchData, 4000);
             });
@@ -3202,9 +2941,23 @@ rm -f /tmp/cf_install.sh
                   if (!Array.isArray(history.ts)) history.ts = [];
 
                   if (history.time.length > 0) {
-                     // 完整 history 到达：写入缓存并按「当前 range」重新渲染，不重置用户选择；4s 轻量轮询不重建图表
-                     lastFullHistory = history;
-                     renderHistory(history);
+                     const labels = history.time;
+                     // 采样时间戳注入各图表，供 X 轴精确落在 2 小时整点；旧数据无 ts 时自动回退按标签解析
+                     const tsArr = history.ts;
+                     Object.keys(charts).forEach((ck) => {
+                        const c = charts[ck];
+                        if (!c || !c.data) return;
+                        if (tsArr.length === labels.length) c.data.__ts = tsArr;
+                        else delete c.data.__ts;
+                     });
+                     updateChart(charts.cpu, labels, [history.cpu]);
+                     updateChart(charts.ram, labels, [history.ram]);
+                     updateChart(charts.proc, labels, [history.proc]);
+                     updateChart(charts.net, labels, [history.net_in, history.net_out]);
+                     updateChart(charts.conn, labels, [history.tcp, history.udp]);
+                     updateChart(charts.pingDom, labels, [history.ping_ct, history.ping_cu, history.ping_cm, history.ping_bd]);
+                     updateChart(charts.pingOversea, labels, [history.ping_gg || [], history.ping_cf || []]);
+                     updateChart(charts.pingIntl, labels, [history.ping_intl_hk || [], history.ping_intl_tyo || [], history.ping_intl_sin || [], history.ping_intl_syd || [], history.ping_intl_lax || [], history.ping_intl_nyc || [], history.ping_intl_fra || [], history.ping_intl_lon || [], history.ping_intl_ams || [], history.ping_intl_sao || []]);
                   }
                } catch (e) {}
             }
