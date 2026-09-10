@@ -2309,47 +2309,87 @@ rm -f /tmp/cf_install.sh
         const lastHistTime = history.last_time || 0;
         
         if (nowMs - lastHistTime >= 300000 || !history.time) {
-            const maxPoints = 288; 
-            const updateArr = (arr, val) => {
-                if (!Array.isArray(arr)) arr = [];
-                arr.push(val);
-                if (arr.length > maxPoints) arr.shift();
-                return arr;
+            const maxPoints = 576; // 采样点上限，兜底防止异常膨胀
+            const HIST_WINDOW_MS = 48 * 60 * 60 * 1000; // 详情页展示区间：最近 48 小时
+            // 统一的历史序列注册表：新增曲线字段只需在此登记，保证各数组长度与 time 严格一致
+            const PING_SERIES = ['ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'ping_gg', 'ping_cf',
+                'ping_intl_hk', 'ping_intl_tyo', 'ping_intl_sin', 'ping_intl_syd', 'ping_intl_lax',
+                'ping_intl_nyc', 'ping_intl_fra', 'ping_intl_lon', 'ping_intl_ams', 'ping_intl_sao'];
+            const HIST_SERIES = ['cpu', 'ram', 'proc', 'net_in', 'net_out', 'tcp', 'udp'].concat(PING_SERIES);
+            // 失败值（探针上报 fail/空）统一清洗为 null，前端断线显示，不再与真实 0ms 混淆
+            const toNum = (v) => {
+                if (v === null || v === undefined || v === '') return null;
+                const n = parseFloat(v);
+                return isFinite(n) ? n : null;
             };
-            const updateLabels = (arr) => {
-                if (!Array.isArray(arr)) arr = [];
-                const d = new Date(nowMs + 8 * 60 * 60000); 
-                const timeLabel = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
-                arr.push(timeLabel);
-                if (arr.length > maxPoints) arr.shift();
-                return arr;
+            const cleanArr = (arr) => (Array.isArray(arr) ? arr.slice(-maxPoints) : []);
+            // 关键修复：写入前把每个历史序列补齐到 time 的当前长度（不足者在头部补 null）。
+            // 历史遗留问题：海外(ping_gg/ping_cf)与国际互联(ping_intl_*)是后续加入的字段，
+            // 其数组远短于 time，前端按索引绘制会整体左移、曲线停在旧时刻，无法显示最新值。
+            let timeArr = cleanArr(history.time);
+            const alignLen = timeArr.length;
+            const padTo = (arr) => {
+                const a = cleanArr(arr);
+                return a.length >= alignLen ? a.slice(-alignLen) : new Array(alignLen - a.length).fill(null).concat(a);
             };
-
-            history.cpu = updateArr(history.cpu, parseFloat(metrics.cpu) || 0);
-            history.ram = updateArr(history.ram, parseFloat(metrics.ram) || 0);
-            history.proc = updateArr(history.proc, parseInt(metrics.processes) || 0);
-            history.net_in = updateArr(history.net_in, parseFloat(metrics.net_in_speed) || 0);
-            history.net_out = updateArr(history.net_out, parseFloat(metrics.net_out_speed) || 0);
-            history.tcp = updateArr(history.tcp, parseInt(metrics.tcp_conn) || 0);
-            history.udp = updateArr(history.udp, parseInt(metrics.udp_conn) || 0);
-            history.ping_ct = updateArr(history.ping_ct, parseInt(metrics.ping_ct) || 0);
-            history.ping_cu = updateArr(history.ping_cu, parseInt(metrics.ping_cu) || 0);
-            history.ping_cm = updateArr(history.ping_cm, parseInt(metrics.ping_cm) || 0);
-            history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
-            history.ping_gg = updateArr(history.ping_gg, parseInt(metrics.ping_gg) || 0);
-            history.ping_cf = updateArr(history.ping_cf, parseInt(metrics.ping_cf) || 0);
-            history.ping_intl_hk = updateArr(history.ping_intl_hk, parseInt(metrics.ping_intl_hk) || 0);
-            history.ping_intl_tyo = updateArr(history.ping_intl_tyo, parseInt(metrics.ping_intl_tyo) || 0);
-            history.ping_intl_sin = updateArr(history.ping_intl_sin, parseInt(metrics.ping_intl_sin) || 0);
-            history.ping_intl_syd = updateArr(history.ping_intl_syd, parseInt(metrics.ping_intl_syd) || 0);
-            history.ping_intl_lax = updateArr(history.ping_intl_lax, parseInt(metrics.ping_intl_lax) || 0);
-            history.ping_intl_nyc = updateArr(history.ping_intl_nyc, parseInt(metrics.ping_intl_nyc) || 0);
-            history.ping_intl_fra = updateArr(history.ping_intl_fra, parseInt(metrics.ping_intl_fra) || 0);
-            history.ping_intl_lon = updateArr(history.ping_intl_lon, parseInt(metrics.ping_intl_lon) || 0);
-            history.ping_intl_ams = updateArr(history.ping_intl_ams, parseInt(metrics.ping_intl_ams) || 0);
-            history.ping_intl_sao = updateArr(history.ping_intl_sao, parseInt(metrics.ping_intl_sao) || 0);
-            history.time = updateLabels(history.time);
+            const pushVal = (arr, val) => {
+                const a = padTo(arr);
+                a.push(val);
+                if (a.length > maxPoints) a.shift();
+                return a;
+            };
+            const metricVals = {
+                cpu: toNum(metrics.cpu),
+                ram: toNum(metrics.ram),
+                proc: toNum(metrics.processes),
+                net_in: toNum(metrics.net_in_speed),
+                net_out: toNum(metrics.net_out_speed),
+                tcp: toNum(metrics.tcp_conn),
+                udp: toNum(metrics.udp_conn),
+                ping_ct: toNum(metrics.ping_ct),
+                ping_cu: toNum(metrics.ping_cu),
+                ping_cm: toNum(metrics.ping_cm),
+                ping_bd: toNum(metrics.ping_bd),
+                ping_gg: toNum(metrics.ping_gg),
+                ping_cf: toNum(metrics.ping_cf),
+                ping_intl_hk: toNum(metrics.ping_intl_hk),
+                ping_intl_tyo: toNum(metrics.ping_intl_tyo),
+                ping_intl_sin: toNum(metrics.ping_intl_sin),
+                ping_intl_syd: toNum(metrics.ping_intl_syd),
+                ping_intl_lax: toNum(metrics.ping_intl_lax),
+                ping_intl_nyc: toNum(metrics.ping_intl_nyc),
+                ping_intl_fra: toNum(metrics.ping_intl_fra),
+                ping_intl_lon: toNum(metrics.ping_intl_lon),
+                ping_intl_ams: toNum(metrics.ping_intl_ams),
+                ping_intl_sao: toNum(metrics.ping_intl_sao)
+            };
+            for (const k of HIST_SERIES) history[k] = pushVal(history[k], metricVals[k]);
+            // 时间标签带上日期，48 小时跨天可区分，供前端 2 小时刻度对齐：MM-DD HH:mm（北京时间 UTC+8）
+            const p2 = (n) => String(n).padStart(2, '0');
+            const tbj = new Date(nowMs + 8 * 60 * 60000);
+            timeArr.push(p2(tbj.getUTCMonth() + 1) + '-' + p2(tbj.getUTCDate()) + ' ' + p2(tbj.getUTCHours()) + ':' + p2(tbj.getUTCMinutes()));
+            history.time = timeArr;
             history.last_time = nowMs;
+            // 采样时间戳（epoch ms）与各序列一一对应：既用于后端按真实时间裁剪 48 小时窗口，
+            // 也供前端 X 轴精确落在 2 小时整点上（不依赖标签字符串解析）
+            let tsArr = padTo(history.ts);
+            tsArr.push(nowMs);
+            const minTs = nowMs - HIST_WINDOW_MS;
+            let cut = 0;
+            while (cut < tsArr.length && tsArr[cut] !== null && tsArr[cut] < minTs) cut++;
+            if (cut > 0) {
+                tsArr = tsArr.slice(cut);
+                timeArr = timeArr.slice(cut);
+                for (const k of HIST_SERIES) history[k] = history[k].slice(cut);
+            }
+            // maxPoints 仅作兜底上限，防止历史脏数据或异常高频写入导致体积膨胀
+            while (tsArr.length > maxPoints) {
+                tsArr.shift();
+                timeArr.shift();
+                for (const k of HIST_SERIES) history[k].shift();
+            }
+            history.ts = tsArr;
+            history.time = timeArr;
         }
 
         const historyStr = JSON.stringify(history);
@@ -2717,6 +2757,53 @@ rm -f /tmp/cf_install.sh
                return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
             };
 
+            // 由采样时间戳推导「2 小时桶」序号；ts 缺失时回退解析标签，兼容新格式 "MM-DD HH:mm" 与旧脏数据 "HH:MM"
+            function histBucketOf(lbl, ts, index) {
+               if (Array.isArray(ts) && typeof index === 'number' && index >= 0 && index < ts.length) {
+                  const v = ts[index];
+                  if (typeof v === 'number' && isFinite(v)) return Math.floor(v / 7200000);
+               }
+               if (typeof lbl !== 'string') return null;
+               let m = /^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(lbl);
+               if (m) return (parseInt(m[1], 10) * 31 + parseInt(m[2], 10)) * 12 + Math.floor((parseInt(m[3], 10) + parseInt(m[4], 10) / 60) / 2);
+               m = /^(\d{2}):(\d{2})$/.exec(lbl);
+               if (m) return Math.floor((parseInt(m[1], 10) + parseInt(m[2], 10) / 60) / 2);
+               return null;
+            }
+            // 刻度文本：有采样时间戳时把标签规整到所在的 2 小时整点（UTC+8），保证刻度为 18:00 / 20:00 这类整点
+            function histTickText(lbl, ts, index) {
+               if (Array.isArray(ts) && typeof index === 'number' && index >= 0 && index < ts.length) {
+                  const v = ts[index];
+                  if (typeof v === 'number' && isFinite(v)) {
+                     const d = new Date(Math.floor(v / 7200000) * 7200000 + 8 * 3600000);
+                     const p = (n) => String(n).padStart(2, '0');
+                     const hh = p(d.getUTCHours()), mo = p(d.getUTCMonth() + 1), dd = p(d.getUTCDate());
+                     return hh === '00' ? (mo + '-' + dd) : (hh + ':' + p(d.getUTCMinutes()));
+                  }
+               }
+               const m = /^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(String(lbl));
+               if (m) return parseInt(m[3], 10) === 0 ? (m[1] + '-' + m[2]) : (m[3] + ':' + m[4]);
+               return String(lbl);
+            }
+            // X 轴刻度：每 2 小时一个节点，跨过 2 小时边界的首个采样点显示时间标签
+            function histTicks(fontColor) {
+               return {
+                  color: fontColor, autoSkip: false, maxRotation: 0, font: { size: 10 },
+                  callback: function(value, index) {
+                     const labels = (this.chart && this.chart.data && this.chart.data.labels) || [];
+                     if (typeof index !== 'number' || index < 0 || index >= labels.length) return '';
+                     const cur = labels[index];
+                     if (cur === undefined || cur === null || cur === '') return '';
+                     const ts = (this.chart && this.chart.data && this.chart.data.__ts) || null;
+                     const curB = histBucketOf(cur, ts, index);
+                     if (curB === null) return String(cur);
+                     const prevB = index > 0 ? histBucketOf(labels[index - 1], ts, index - 1) : null;
+                     if (prevB === null || curB !== prevB) return histTickText(cur, ts, index);
+                     return '';
+                  }
+               };
+            }
+
             function initChart(ctxId, label1, label2, color1, color2, isSpeed = false) {
               const ctx = document.getElementById(ctxId).getContext('2d');
               const isDark = uiDark();
@@ -2744,7 +2831,7 @@ rm -f /tmp/cf_install.sh
                     tooltip: { callbacks: { label: function(context) { let l = context.dataset.label || ''; if (l) l += ': '; if (context.parsed.y !== null) l += isSpeed ? formatBytesJs(context.parsed.y) + '/s' : context.parsed.y; return l; } } }
                   },
                   scales: {
-                    x: { grid: { display: false, drawBorder: false }, ticks: { color: fontColor, maxTicksLimit: 6 } },
+                    x: { grid: { display: false, drawBorder: false }, ticks: histTicks(fontColor) },
                     y: { grid: { color: gridColor, drawBorder: false }, ticks: { color: fontColor, callback: function(value) { return isSpeed ? formatBytesJs(value) : value; } }, beginAtZero: true }
                   }
                 }
@@ -2767,7 +2854,7 @@ rm -f /tmp/cf_install.sh
                   responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, interaction: { mode: 'index', intersect: false },
                   plugins: { legend: { labels: { color: fontColor } } },
                   scales: {
-                    x: { grid: { display: false }, ticks: { color: fontColor, maxTicksLimit: 8 } },
+                    x: { grid: { display: false }, ticks: histTicks(fontColor) },
                     y: { grid: { color: gridColor }, ticks: { color: fontColor }, beginAtZero: true }
                   }
                 }
@@ -2844,11 +2931,25 @@ rm -f /tmp/cf_install.sh
                   document.getElementById('txt-tcp').innerText = data.tcp_conn;
                   document.getElementById('txt-udp').innerText = data.udp_conn;
 
-                  let history = { time: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [], ping_gg: [], ping_cf: [], ping_intl_hk: [], ping_intl_tyo: [], ping_intl_sin: [], ping_intl_syd: [], ping_intl_lax: [], ping_intl_nyc: [], ping_intl_fra: [], ping_intl_lon: [], ping_intl_ams: [], ping_intl_sao: [] };
-                  try { if (data.history) history = JSON.parse(data.history); } catch(e) {}
-                  
-                  if (history.time && history.time.length > 0) {
+                  let history = { time: [], ts: [], cpu: [], ram: [], proc: [], net_in: [], net_out: [], tcp: [], udp: [], ping_ct: [], ping_cu: [], ping_cm: [], ping_bd: [], ping_gg: [], ping_cf: [], ping_intl_hk: [], ping_intl_tyo: [], ping_intl_sin: [], ping_intl_syd: [], ping_intl_lax: [], ping_intl_nyc: [], ping_intl_fra: [], ping_intl_lon: [], ping_intl_ams: [], ping_intl_sao: [] };
+                  try {
+                     if (data.history) history = (typeof data.history === 'string') ? JSON.parse(data.history) : data.history;
+                  } catch(e) {}
+                  if (!history || typeof history !== 'object') history = { time: [], ts: [] };
+                  // 历史脏数据容错：旧版本遗留的空值/错位字段不应导致渲染异常
+                  if (!Array.isArray(history.time)) history.time = [];
+                  if (!Array.isArray(history.ts)) history.ts = [];
+
+                  if (history.time.length > 0) {
                      const labels = history.time;
+                     // 采样时间戳注入各图表，供 X 轴精确落在 2 小时整点；旧数据无 ts 时自动回退按标签解析
+                     const tsArr = history.ts;
+                     Object.keys(charts).forEach((ck) => {
+                        const c = charts[ck];
+                        if (!c || !c.data) return;
+                        if (tsArr.length === labels.length) c.data.__ts = tsArr;
+                        else delete c.data.__ts;
+                     });
                      updateChart(charts.cpu, labels, [history.cpu]);
                      updateChart(charts.ram, labels, [history.ram]);
                      updateChart(charts.proc, labels, [history.proc]);
@@ -2861,9 +2962,20 @@ rm -f /tmp/cf_install.sh
                } catch (e) {}
             }
 
+            // 序列按时间轴右侧对齐：历史脏数据里若某字段数组偏短（旧版本遗留），
+            // 在头部补 null，保证曲线末端始终对齐当前时刻，而不是整体左移到旧时间
+            function alignSeries(data, len) {
+               let a = Array.isArray(data) ? data.slice(-len) : [];
+               if (a.length < len) a = new Array(len - a.length).fill(null).concat(a);
+               return a;
+            }
             function updateChart(chart, labels, datasetsData) {
-               chart.data.labels = labels;
-               datasetsData.forEach((data, i) => { if (chart.data.datasets[i]) chart.data.datasets[i].data = data; });
+               const n = (labels || []).length;
+               chart.data.labels = labels || [];
+               (datasetsData || []).forEach((data, i) => {
+                  if (!chart.data.datasets[i]) return;
+                  chart.data.datasets[i].data = alignSeries(data, n);
+               });
                chart.update();
             }
           </script>
