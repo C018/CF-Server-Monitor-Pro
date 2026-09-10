@@ -334,6 +334,56 @@ export default {
     if (currentThemeObj.has_custom_css || currentThemeObj.id === 'theme6') themeOverrides += `\n${sys.custom_css || ''}`;
 
     const themeStyles = `
+      /* ================= 设计系统：CSS 变量体系 ================= */
+      :root {
+        --bg: #f5f5f7; --card: #ffffff; --card2: #f2f2f7; --card3: #e8e8ed;
+        --text: #1d1d1f; --text2: #86868b; --text3: #aeaeb2;
+        --separator: rgba(0,0,0,0.08); --separator-strong: rgba(0,0,0,0.18);
+        --accent: #0071e3; --green: #34c759; --orange: #ff9500; --red: #ff3b30;
+        --purple: #af52de; --pink: #ff2d55; --teal: #5ac8fa; --indigo: #5856d6;
+        --radius: 18px; --radius-s: 10px; --radius-xs: 8px;
+        --shadow: 0 2px 16px rgba(0,0,0,0.05); --shadow-hover: 0 8px 28px rgba(0,0,0,0.12);
+        --chart-grid: rgba(0,0,0,0.06); --chart-text: rgba(0,0,0,0.55);
+        --hover: rgba(0,0,0,0.045); --map-inactive: #e3e3e8; --map-stroke: #ffffff;
+        --seg-bg: rgba(120,120,128,0.12);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #000000; --card: #1c1c1e; --card2: #2c2c2e; --card3: #3a3a3c;
+          --text: #f5f5f7; --text2: #98989d; --text3: #636366;
+          --separator: rgba(255,255,255,0.14); --separator-strong: rgba(255,255,255,0.28);
+          --shadow: 0 4px 24px rgba(0,0,0,0.5); --shadow-hover: 0 10px 34px rgba(0,0,0,0.7);
+          --chart-grid: rgba(255,255,255,0.1); --chart-text: rgba(255,255,255,0.55);
+          --hover: rgba(255,255,255,0.08); --map-inactive: #26262a; --map-stroke: #0d0d0f;
+        }
+      }
+      /* 深色主题类（theme2/4/5/6/8）强制暗色变量，优先级高于 prefers-color-scheme */
+      body.theme2, body.theme4, body.theme5, body.theme6, body.theme8, body.forced-dark {
+        --bg: #000000; --card: #1c1c1e; --card2: #2c2c2e; --card3: #3a3a3c;
+        --text: #f5f5f7; --text2: #98989d; --text3: #636366;
+        --separator: rgba(255,255,255,0.14); --separator-strong: rgba(255,255,255,0.28);
+        --shadow: 0 4px 24px rgba(0,0,0,0.5); --shadow-hover: 0 10px 34px rgba(0,0,0,0.7);
+        --chart-grid: rgba(255,255,255,0.1); --chart-text: rgba(255,255,255,0.55);
+        --hover: rgba(255,255,255,0.08); --map-inactive: #26262a; --map-stroke: #0d0d0f;
+      }
+      /* uiDark 切换时强制亮色（跟随系统主题临时覆盖类） */
+      body.forced-light {
+        --bg: #f5f5f7; --card: #ffffff; --card2: #f2f2f7; --card3: #e8e8ed;
+        --text: #1d1d1f; --text2: #86868b; --text3: #aeaeb2;
+        --separator: rgba(0,0,0,0.08); --separator-strong: rgba(0,0,0,0.18);
+        --shadow: 0 2px 16px rgba(0,0,0,0.05); --shadow-hover: 0 8px 28px rgba(0,0,0,0.12);
+        --chart-grid: rgba(0,0,0,0.06); --chart-text: rgba(0,0,0,0.55);
+        --hover: rgba(0,0,0,0.045); --map-inactive: #e3e3e8; --map-stroke: #ffffff;
+      }
+      /* body 基础：字体 / 背景 / 文字 */
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+        background-color: var(--bg) !important;
+        color: var(--text);
+        transition: background-color 0.25s ease, color 0.25s ease;
+        -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+      }
+      a { color: var(--accent); }
       .ping-box { font-size:11px; margin-top:10px; display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:5px 12px; padding: 6px 8px; border-radius: 4px; background: rgba(150,150,150,0.1); border: 1px solid rgba(150,150,150,0.2); }
       .ping-box > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
       .ping-group { font-size:11px; margin-top:10px; padding: 6px 8px; border-radius: 4px; background: rgba(150,150,150,0.08); border: 1px solid rgba(150,150,150,0.2); }
@@ -356,41 +406,124 @@ export default {
         .stat-bar, .stat-bar-full { background: rgba(0,0,0,0.12) !important; }
       ` : ''}
 
-      .view-controls { display: flex; gap: 8px; background: rgba(0,0,0,0.05); padding: 4px; border-radius: 8px; }
-      .toggle-btn { display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: none; background: transparent; cursor: pointer; border-radius: 6px; font-size: 13px; font-weight: 600; color: #64748b; transition: all 0.2s; }
-      .toggle-btn:hover { color: #0f172a; }
-      .toggle-btn.active { background: white; color: #3b82f6; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-      .custom-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
-      .custom-table th { background: #f8fafc; padding: 14px 16px; color: #64748b; font-weight: 600; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }
-      .custom-table td { padding: 12px 16px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
-      .custom-table tr:hover { background: #f8fafc; }
-      .os-text { color: #64748b; font-size: 12px; }
+      /* ================= 苹果风组件 ================= */
+      .header-card, .chart-card, .global-stats { background: var(--card); border: 1px solid var(--separator); border-radius: var(--radius); box-shadow: var(--shadow); }
+      .view-controls { display: flex; gap: 2px; background: var(--seg-bg); padding: 3px; border-radius: 10px; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; }
+      .view-controls::-webkit-scrollbar { display: none; }
+      .toggle-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 14px; border: none; background: transparent; cursor: pointer; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text2); transition: all 0.2s; white-space: nowrap; flex-shrink: 0; }
+      .toggle-btn:hover { color: var(--text); }
+      .toggle-btn.active { background: var(--card); color: var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,0.14); }
+      .custom-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; background: var(--card); border-radius: var(--radius-s); overflow: hidden; box-shadow: var(--shadow); }
+      .custom-table th { background: transparent; padding: 13px 16px; color: var(--text2); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--separator); white-space: nowrap; }
+      .custom-table td { padding: 12px 16px; border-bottom: 1px solid var(--separator); vertical-align: middle; }
+      .custom-table tbody tr:last-child td { border-bottom: none; }
+      .custom-table tbody tr { height: 44px; }
+      .custom-table tr:hover { background: var(--hover); }
+      .os-text { color: var(--text2); font-size: 12px; }
       .table-responsive { width: 100%; overflow-x: auto; }
-      .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-      .filter-tag { display: inline-flex; align-items: center; gap: 5px; background: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; color: #475569; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid transparent; cursor:pointer; transition: all 0.2s;}
-      .filter-tag:hover { background: #f1f5f9; }
-      .filter-tag.active { background: #3b82f6; color: white; border-color: #3b82f6; }
-      #map-container { width: 100%; height: 500px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); overflow: hidden; border: 1px solid #e5e7eb; background-color: #b1c2d4; background-image: linear-gradient(rgba(255,255,255,0.2) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.2) 1px, transparent 1px); background-size: 20px 20px; z-index: 1; }
-      .custom-map-badge div { background-color: #10b981; color: white; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
+      .filter-bar { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+      .filter-tag { display: inline-flex; align-items: center; gap: 5px; background: var(--card); padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--text2); border: 1px solid var(--separator); cursor: pointer; transition: all 0.2s; }
+      .filter-tag:hover { background: var(--hover); color: var(--text); }
+      .filter-tag.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+      .header h1 { margin: 0; font-size: 32px; font-weight: 700; letter-spacing: -0.5px; }
+      #bj-clock { font-size: 13px; color: var(--text2); background: var(--card2); padding: 5px 12px; border-radius: 999px; white-space: nowrap; }
+      .admin-btn { padding: 8px 18px; background: var(--accent); color: #fff; text-decoration: none; border-radius: 999px; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; }
+      .admin-btn:hover { opacity: 0.9; }
+      .group-header { font-size: 18px; font-weight: 600; color: var(--text); margin: 25px 0 15px 5px; border-left: 4px solid var(--accent); border-radius: 2px; padding-left: 10px; }
+      .g-val { color: var(--text); }
+      .g-label { color: var(--text2); }
+      .g-sub { color: var(--text3); }
+      .vps-card { background: var(--card); border: 1px solid var(--separator); border-radius: var(--radius); box-shadow: var(--shadow); transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease; }
+      .vps-card:hover { border-color: var(--separator-strong); transform: translateY(-1px); box-shadow: var(--shadow-hover); }
+      .card-title-text { font-weight: 600; letter-spacing: -0.2px; }
+      .card-meta { color: var(--text2); }
+      .card-badges { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+      .badge { padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; color: #fff; letter-spacing: 0.2px; }
+      .badge-bw { background: var(--accent); } .badge-tf { background: var(--green); } .badge-v4 { background: var(--purple); } .badge-v6 { background: var(--pink); }
+      .stat-bar-full { height: 6px; background: var(--card3); border-radius: 3px; }
+      .stat-bar { height: 4px; background: var(--card3); border-radius: 2px; }
+      .stat-subtext { font-size: 11px; color: var(--text3); }
+      .card-right { border-left: 1px solid var(--separator); }
+      .stat-label { color: var(--text2); }
+      .ping-box, .ping-group { background: var(--card2); border: 1px solid var(--separator); }
+      .ping-group-title { color: var(--text2); }
+      .ping-group-title::after { background: var(--separator); }
+      /* 地图容器：设计系统圆角阴影 + 响应式高度 */
+      #map-container { width: 100%; height: 420px; border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; border: 1px solid var(--separator); background-color: var(--map-inactive); background-image: linear-gradient(rgba(128,128,128,0.09) 1px, transparent 1px), linear-gradient(90deg, rgba(128,128,128,0.09) 1px, transparent 1px); background-size: 20px 20px; z-index: 1; }
+      /* 数字角标：苹果风胶囊徽标 */
+      .custom-map-badge div { background-color: var(--accent); color: #fff; border-radius: 999px; height: 22px; line-height: 22px; text-align: center; font-size: 11px; font-weight: 700; padding: 0 7px; box-shadow: 0 2px 6px rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.4); box-sizing: border-box; white-space: nowrap; }
+      /* RegionBoard 地区速览 */
+      .region-board { display: flex; gap: 10px; margin-bottom: 14px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: none; -ms-overflow-style: none; }
+      .region-board::-webkit-scrollbar { display: none; }
+      .rb-card { flex: 0 0 auto; width: 150px; background: var(--card); border: 1px solid var(--separator); border-radius: var(--radius-s); box-shadow: var(--shadow); padding: 10px 12px; cursor: pointer; transition: all 0.2s ease; box-sizing: border-box; }
+      .rb-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-hover); }
+      .rb-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0,113,227,0.25); }
+      .rb-card .rb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-width: 0; }
+      .rb-card .rb-head img { width: 30px; height: 20px; object-fit: cover; border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); flex-shrink: 0; }
+      .rb-card .rb-name { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .rb-card .rb-num { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; color: var(--text); line-height: 1.1; margin-top: 2px; }
+      .rb-card .rb-num small { font-size: 11px; font-weight: 500; color: var(--text2); letter-spacing: 0; margin-left: 3px; }
+      .rb-bar { height: 3px; background: var(--card3); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+      .rb-bar > div { height: 100%; border-radius: 2px; background: linear-gradient(90deg, rgba(0,113,227,0.5), var(--accent)); }
+      .rb-empty { padding: 26px 12px; color: var(--text3); font-size: 13px; background: var(--card); border: 1px dashed var(--separator-strong); border-radius: var(--radius-s); text-align: center; }
+      /* Modal / 其他浮层走变量 */
+      .modal-content { background: var(--card); color: var(--text); border: 1px solid var(--separator); box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
       .view-panel { display: none; } .view-panel.active { display: block; animation: fadeIn 0.3s ease; }
       @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
       
       .stat-group { display: flex; flex-direction: column; margin-bottom: 8px; }
       .stat-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: inherit; }
-      .stat-bar-full { width: 100%; height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
+      .stat-bar-full { width: 100%; height: 6px; background: var(--card3); border-radius: 3px; overflow: hidden; }
       .stat-bar-full > div { height: 100%; border-radius: 3px; transition: width 0.3s; }
-      .stat-subtext { font-size: 11px; color: #6b7280; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
-      
-      .stat-bar { width: 100%; height: 4px; background: #e5e7eb; border-radius: 2px; overflow: hidden; }
+      .stat-subtext { font-size: 11px; color: var(--text3); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid var(--separator); min-width: 0; }
+      .stat-bar { width: 100%; height: 4px; background: var(--card3); border-radius: 2px; overflow: hidden; }
       .stat-bar > div { height: 100%; border-radius: 2px; transition: width 0.3s; }
-
-      .global-stats { display: flex; flex-direction: column; gap: 15px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; }
+      .global-stats { display: flex; flex-direction: column; gap: 15px; background: var(--card); padding: 20px; border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; border: 1px solid var(--separator); }
       .stats-row { display: flex; justify-content: center; width: 100%; align-items: center; }
-      .stats-row.bottom-row { border-top: 1px dashed rgba(150,150,150,0.2); padding-top: 15px; }
-      .stats-row .g-item { flex: 1; border-right: 1px dashed rgba(150,150,150,0.2); min-width: 0; box-sizing: border-box; position: relative; padding: 0 10px; }
+      .stats-row.bottom-row { border-top: 1px dashed var(--separator-strong); padding-top: 15px; }
+      .stats-row .g-item { flex: 1; border-right: 1px dashed var(--separator-strong); min-width: 0; box-sizing: border-box; position: relative; padding: 0 10px; }
       .stats-row .g-item:last-child { border-right: none; }
-      @media (max-width: 768px) { .stats-row { flex-direction: column; gap: 15px; } .stats-row.bottom-row { border-top: none; padding-top: 0; } .stats-row .g-item { border-right: none !important; border-bottom: 1px dashed rgba(150,150,150,0.2); padding-bottom: 15px; } .stats-row .g-item:last-child { border-bottom: none; padding-bottom: 0; } }
+      /* 详情页 stat 卡网格（手机 2 列） */
+      .stat-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+      /* ===== 响应式：平板 / 手机 / 小屏 ===== */
+      @media (max-width: 1023px) {
+        .container { padding: 16px !important; }
+        .grid-container { grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); }
+        #map-container { height: 340px; }
+      }
+      @media (max-width: 767px) {
+        body { padding: 0 !important; }
+        .container { padding: 12px !important; }
+        .header { flex-direction: column; align-items: flex-start; gap: 12px; }
+        .header h1 { font-size: 26px; }
+        .view-controls { max-width: 100%; }
+        .header > div:last-child { width: 100%; justify-content: space-between; }
+        .filter-bar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; -ms-overflow-style: none; }
+        .filter-bar::-webkit-scrollbar { display: none; }
+        .filter-tag { flex-shrink: 0; }
+        .grid-container { grid-template-columns: 1fr; }
+        .vps-card { flex-direction: column; }
+        .card-right { padding-left: 0; border-left: none; border-top: 1px solid var(--separator); margin-top: 15px; padding-top: 15px; }
+        .stats-row { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
+        .stats-row.bottom-row { border-top: 1px dashed var(--separator-strong); padding-top: 15px; }
+        .stats-row .g-item { border-right: none !important; border-bottom: none; padding-bottom: 0; }
+        .g-val { font-size: 19px; }
+        .detail-grid { grid-template-columns: 1fr; }
+        .stat-card-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+        #map-container { height: 280px; }
+        .region-board .rb-card { width: 134px; }
+        .rb-card .rb-num { font-size: 19px; }
+      }
+      @media (max-width: 480px) {
+        .container { padding: 10px !important; }
+        .header h1 { font-size: 24px; }
+        .card-meta { font-size: 11px; }
+        .g-val { font-size: 17px; }
+        .stat-subtext, .os-text { font-size: 11px; }
+        .custom-table th, .custom-table td { padding: 10px 12px; }
+        .rb-card { width: 128px; }
+      }
 
       ${themeOverrides}
     `;
@@ -1399,14 +1532,14 @@ while ($true) {
     }
     
     if ($LOOP_COUNT % 6 -eq 0) {
-        $idx = $LOOP_COUNT % 3
-        if ($idx -eq 0) { $D_CT="bj-ct-dualstack.ip.zstaticcdn.com"; $D_CU="bj-cu-dualstack.ip.zstaticcdn.com"; $D_CM="bj-cm-dualstack.ip.zstaticcdn.com" }
-        elseif ($idx -eq 1) { $D_CT="sh-ct-dualstack.ip.zstaticcdn.com"; $D_CU="sh-cu-dualstack.ip.zstaticcdn.com"; $D_CM="sh-cm-dualstack.ip.zstaticcdn.com" }
-        else { $D_CT="gd-ct-dualstack.ip.zstaticcdn.com"; $D_CU="gd-cu-dualstack.ip.zstaticcdn.com"; $D_CM="gd-cm-dualstack.ip.zstaticcdn.com" }
+        $D_CT="119.29.29.29"; $D_CU="223.5.5.5"; $D_CM="211.136.25.153"
         
         $c_ct = if ($PING_NODE_CT -eq "default") { $D_CT } else { $PING_NODE_CT }
         $c_cu = if ($PING_NODE_CU -eq "default") { $D_CU } else { $PING_NODE_CU }
         $c_cm = if ($PING_NODE_CM -eq "default") { $D_CM } else { $PING_NODE_CM }
+        $c_ct = (($c_ct -replace '^https?://','') -replace '/.*$','').Trim()
+        $c_cu = (($c_cu -replace '^https?://','') -replace '/.*$','').Trim()
+        $c_cm = (($c_cm -replace '^https?://','') -replace '/.*$','').Trim()
 
         $PING_CT = Get-HttpPing $c_ct
         $PING_CU = Get-HttpPing $c_cu
@@ -1642,12 +1775,7 @@ while true; do
   fi
   
   if [ \\$((LOOP_COUNT % 6)) -eq 0 ]; then
-    idx=\\$((LOOP_COUNT % 3))
-    case \\$idx in
-      0) D_CT="bj-ct-dualstack.ip.zstaticcdn.com"; D_CU="bj-cu-dualstack.ip.zstaticcdn.com"; D_CM="bj-cm-dualstack.ip.zstaticcdn.com" ;;
-      1) D_CT="sh-ct-dualstack.ip.zstaticcdn.com"; D_CU="sh-cu-dualstack.ip.zstaticcdn.com"; D_CM="sh-cm-dualstack.ip.zstaticcdn.com" ;;
-      2) D_CT="gd-ct-dualstack.ip.zstaticcdn.com"; D_CU="gd-cu-dualstack.ip.zstaticcdn.com"; D_CM="gd-cm-dualstack.ip.zstaticcdn.com" ;;
-    esac
+    D_CT="119.29.29.29"; D_CU="223.5.5.5"; D_CM="211.136.25.153"
     
     CT_NODE="\\$PING_NODE_CT"
     CU_NODE="\\$PING_NODE_CU"
@@ -1660,6 +1788,11 @@ while true; do
     [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
     [ "\\$GG_NODE" = "default" ] && GG_NODE="www.google.com"
     [ "\\$CF_NODE" = "default" ] && CF_NODE="www.cloudflare.com"
+    CT_NODE=\\$(printf '%s' "\\$CT_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
+    CU_NODE=\\$(printf '%s' "\\$CU_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
+    CM_NODE=\\$(printf '%s' "\\$CM_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
+    GG_NODE=\\$(printf '%s' "\\$GG_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
+    CF_NODE=\\$(printf '%s' "\\$CF_NODE" | sed -e 's#^https\?://##' -e 's#/.*##' | tr -d ' \r')
 
     PING_CT=\\$(get_http_ping "\\$CT_NODE")
     PING_CU=\\$(get_http_ping "\\$CU_NODE")
@@ -2085,37 +2218,62 @@ rm -f /tmp/cf_install.sh
         <html>
         <head>
           <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
           <title>${server.name} - ${esc(sys.site_title)}</title>
+          <script>
+          (function(){
+            var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
+            function uiDark(){
+              var cls = document.body ? document.body.className : '';
+              for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
+              if (cls.indexOf('forced-dark') !== -1) return true;
+              if (cls.indexOf('forced-light') !== -1) return false;
+              return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            }
+            window.uiDark = uiDark;
+            try {
+              var mql = window.matchMedia('(prefers-color-scheme: dark)');
+              var onSchemeChange = function(){
+                if (!document.body) return;
+                var cls = document.body.className;
+                var hardDark = false;
+                for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) hardDark = true; }
+                document.body.classList.remove('forced-dark','forced-light');
+                if (hardDark) document.body.classList.add('forced-dark');
+                else if (mql.matches) document.body.classList.add('forced-dark');
+                else document.body.classList.add('forced-light');
+                if (window.__uiThemeChanged) window.__uiThemeChanged();
+              };
+              if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
+              else if (mql.addListener) mql.addListener(onSchemeChange);
+            } catch(e){}
+          })();
+          </script>
           ${sys.custom_head || ''}
           <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 0; }
             ${themeStyles}
-            .stat-label { color: #888; margin-bottom: 5px; font-size: 12px; }
-            .stat-val { font-weight: bold; font-size: 14px; color: inherit; }
+            .stat-label { color: var(--text2); margin-bottom: 5px; font-size: 12px; }
+            .stat-val { font-weight: 600; font-size: 14px; color: inherit; }
             .header-card .stat-label { color: inherit; opacity: 0.7; }
-            .theme2 .stat-label, .theme5 .stat-label, .theme4 .stat-label, .theme8 .stat-label { color: rgba(255,255,255,0.6); }
-            .theme2 .stat-val, .theme5 .stat-val, .theme4 .stat-val, .theme8 .stat-val { color: #fff; }
             .chart-full canvas { max-height: 250px !important; }
             .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; margin-bottom: 30px; }
+            @media (max-width: 767px) { .detail-grid { grid-template-columns: 1fr; } }
           </style>
         </head>
         <body class="${sys.theme || 'theme1'}">
           <div class="container" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
             <div style="margin-bottom: 20px;">
-              <a href="/" style="color: #3b82f6; text-decoration: none; font-weight: bold; font-size: 16px; display:inline-flex; align-items:center;">← 返回大盘</a>
+              <a href="/" style="color: var(--accent); text-decoration: none; font-weight: 600; font-size: 15px; display:inline-flex; align-items:center;">← 返回大盘</a>
             </div>
             
-            <div class="header-card" style="padding: 25px; border-radius: 12px; margin-bottom: 20px;">
-              <div style="display:flex; justify-content:flex-end; margin-bottom: 12px;">
-                <span id="bj-clock" style="font-size:13px; color:#888; background: rgba(150,150,150,0.12); padding:4px 10px; border-radius:8px;">北京时间加载中...</span>
-              </div>
-              <div style="font-size: 24px; font-weight: bold; margin-bottom: 20px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div class="header-card" style="padding: 25px; border-radius: var(--radius); margin-bottom: 20px;">
+                <div style="font-size: 26px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 20px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px;">
                 ${flagHtml} ${server.name}
                 <span id="d-status-wrap">${statusHtml}</span>
-                <span id="d-lastupd" style="font-size: 12px; font-weight: normal; color: #888;">最后更新: ${lastUpdText}</span>
+                <span id="d-lastupd" style="font-size: 12px; font-weight: normal; color: var(--text2);">最后更新: ${lastUpdText}</span>
               </div>
-              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px;">
+              <div class="stat-card-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px;">
                 <div><div class="stat-label">运行时间</div><div class="stat-val" id="d-uptime">${server.uptime || '-'}</div></div>
                 <div><div class="stat-label">架构</div><div class="stat-val" id="d-arch">${server.arch || '-'}</div></div>
                 <div><div class="stat-label">系统</div><div class="stat-val" id="d-os">${server.os || '-'}</div></div>
@@ -2128,60 +2286,60 @@ rm -f /tmp/cf_install.sh
             </div>
 
             <div class="detail-grid">
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">CPU</span><span id="txt-cpu" class="stat-val" style="font-weight:bold;">0%</span>
                  </div>
                  <div style="height: 180px;"><canvas id="chart-cpu"></canvas></div>
               </div>
               
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">内存</span><span id="txt-ram" class="stat-val" style="font-weight:bold;">0%</span>
                  </div>
-                 <div style="font-size: 12px; color: #888; position: absolute; top: 45px; left: 20px;">Swap: <span id="txt-swap">0 / 0</span></div>
+                 <div style="font-size: 12px; color: var(--text2); position: absolute; top: 45px; left: 20px;">Swap: <span id="txt-swap">0 / 0</span></div>
                  <div style="height: 180px;"><canvas id="chart-ram"></canvas></div>
               </div>
 
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px;">
                    <span class="card-title" style="font-weight:bold;">磁盘</span><span id="txt-disk" class="stat-val" style="font-weight:bold;">0%</span>
                  </div>
                  <div class="stat-bar-full" style="height: 24px; border-radius: 12px; background: rgba(150,150,150,0.1); border: 1px solid rgba(150,150,150,0.2); overflow: hidden;">
                     <div id="bar-disk" style="height: 100%; border-radius: 12px; background: #3b82f6; width: 0%; transition: width 0.5s;"></div>
                  </div>
-                 <div style="text-align: right; font-size: 13px; color: #888; margin-top: 15px;" id="txt-disk-detail">0 / 0</div>
+                 <div style="text-align: right; font-size: 13px; color: var(--text2); margin-top: 15px;" id="txt-disk-detail">0 / 0</div>
               </div>
 
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">进程数</span><span id="txt-proc" class="stat-val" style="font-weight:bold;">0</span>
                  </div>
                  <div style="height: 180px;"><canvas id="chart-proc"></canvas></div>
               </div>
 
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">网络速度</span><span class="stat-val" style="font-weight:bold;"><span style="color:#10b981;">↓</span> <span id="txt-net-in">0 B/s</span> | <span style="color:#3b82f6;">↑</span> <span id="txt-net-out">0 B/s</span></span>
                  </div>
                  <div style="height: 180px;"><canvas id="chart-net"></canvas></div>
               </div>
 
-              <div class="chart-card" style="padding: 20px; border-radius: 12px; position: relative;">
+              <div class="chart-card" style="padding: 20px; border-radius: var(--radius); position: relative;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">TCP / UDP</span><span class="stat-val" style="font-weight:bold;">TCP <span id="txt-tcp">0</span> | UDP <span id="txt-udp">0</span></span>
                  </div>
                  <div style="height: 180px;"><canvas id="chart-conn"></canvas></div>
               </div>
 
-              <div class="chart-card chart-full" style="padding: 20px; border-radius: 12px; position: relative; grid-column: 1 / -1;">
+              <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">国内延迟 (ms)</span>
                  </div>
                  <div style="height: 220px;"><canvas id="chart-ping-dom"></canvas></div>
               </div>
 
-              <div class="chart-card chart-full" style="padding: 20px; border-radius: 12px; position: relative; grid-column: 1 / -1;">
+              <div class="chart-card chart-full" style="padding: 20px; border-radius: var(--radius); position: relative; grid-column: 1 / -1;">
                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                    <span class="card-title" style="font-weight:bold;">海外延迟 (ms)</span>
                  </div>
@@ -2206,10 +2364,8 @@ rm -f /tmp/cf_install.sh
             };
             const OFFLINE_THRES = ${offlineThresMs};
             let lastUpdTs = ${server.last_updated ? server.last_updated : 0};
-            function tickBjClock() {
+            function tickStatus() {
                const nowMs = Date.now();
-               const clockEl = document.getElementById('bj-clock');
-               if (clockEl) clockEl.textContent = '北京时间 ' + fmtBJ(nowMs);
                if (lastUpdTs > 0) {
                  const diff = Math.max(0, Math.round((nowMs - lastUpdTs) / 1000));
                  const luEl = document.getElementById('d-lastupd');
@@ -2225,8 +2381,8 @@ rm -f /tmp/cf_install.sh
                  }
                }
             }
-            setInterval(tickBjClock, 1000);
-            tickBjClock();
+            setInterval(tickStatus, 1000);
+            tickStatus();
 
             const formatBytesJs = (bytes) => {
                const b = parseInt(bytes);
@@ -2239,7 +2395,7 @@ rm -f /tmp/cf_install.sh
 
             function initChart(ctxId, label1, label2, color1, color2, isSpeed = false) {
               const ctx = document.getElementById(ctxId).getContext('2d');
-              const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4') || document.body.className.includes('theme8') || document.body.className.includes('theme6');
+              const isDark = uiDark();
               const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
               const fontColor = isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.6)';
               
@@ -2273,7 +2429,7 @@ rm -f /tmp/cf_install.sh
 
             function initPingChart(canvasId, series) {
               const ctx = document.getElementById(canvasId).getContext('2d');
-              const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4') || document.body.className.includes('theme8') || document.body.className.includes('theme6');
+              const isDark = uiDark();
               const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
               const fontColor = isDark ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.6)';
               const datasets = (series || []).map((s) => ({
@@ -2294,14 +2450,39 @@ rm -f /tmp/cf_install.sh
               });
             }
 
+            const chartDefs = [
+              { key: 'cpu', canvasId: 'chart-cpu', args: ['CPU (%)', null, '#3b82f6'] },
+              { key: 'ram', canvasId: 'chart-ram', args: ['内存 (%)', null, '#10b981'] },
+              { key: 'proc', canvasId: 'chart-proc', args: ['进程数', null, '#8b5cf6'] },
+              { key: 'net', canvasId: 'chart-net', args: ['下载', '上传', '#10b981', '#3b82f6', true] },
+              { key: 'conn', canvasId: 'chart-conn', args: ['TCP', 'UDP', '#f59e0b', '#ec4899'] },
+              { key: 'pingDom', canvasId: 'chart-ping-dom', ping: true, series: [['电信', '#3b82f6'], ['联通', '#f59e0b'], ['移动', '#10b981'], ['字节', '#ef4444']] },
+              { key: 'pingOversea', canvasId: 'chart-ping-ov', ping: true, series: [['Google', '#8b5cf6'], ['Cloudflare', '#06b6d4']] }
+            ];
+            function rebuildDetailCharts() {
+              const keep = {};
+              chartDefs.forEach((d) => {
+                const c = charts[d.key];
+                if (c) {
+                  keep[d.key] = { labels: (c.data.labels || []).slice(), ds: (c.data.datasets || []).map((x) => ({ label: x.label, data: x.data.slice(), borderColor: x.borderColor, backgroundColor: x.backgroundColor, borderWidth: x.borderWidth, pointRadius: x.pointRadius, tension: x.tension, fill: x.fill })) };
+                  try { c.destroy(); } catch (e) {}
+                }
+              });
+              chartDefs.forEach((d) => {
+                const rec = keep[d.key];
+                if (d.ping) charts[d.key] = initPingChart(d.canvasId, d.series);
+                else charts[d.key] = initChart(d.canvasId, d.args[0], d.args[1], d.args[2], d.args[3], d.args[4]);
+                if (rec && rec.labels && rec.labels.length) {
+                  const ch = charts[d.key];
+                  ch.data.labels = rec.labels;
+                  rec.ds.forEach((x, i) => { if (ch.data.datasets[i]) { ch.data.datasets[i].data = x.data; ch.data.datasets[i].borderColor = x.borderColor; ch.data.datasets[i].backgroundColor = x.backgroundColor; } });
+                  ch.update();
+                }
+              });
+            }
+            window.__uiThemeChanged = rebuildDetailCharts;
             document.addEventListener('DOMContentLoaded', () => {
-               charts.cpu = initChart('chart-cpu', 'CPU (%)', null, 'rgba(59, 130, 246, 1)');
-               charts.ram = initChart('chart-ram', '内存 (%)', null, 'rgba(16, 185, 129, 1)');
-               charts.proc = initChart('chart-proc', '进程数', null, 'rgba(139, 92, 246, 1)');
-               charts.net = initChart('chart-net', '下载', '上传', 'rgba(16, 185, 129, 1)', 'rgba(59, 130, 246, 1)', true);
-               charts.conn = initChart('chart-conn', 'TCP', 'UDP', 'rgba(245, 158, 11, 1)', 'rgba(236, 72, 153, 1)');
-               charts.pingDom = initPingChart('chart-ping-dom', [['电信', '#3b82f6'], ['联通', '#f59e0b'], ['移动', '#10b981'], ['字节', '#ef4444']]);
-               charts.pingOversea = initPingChart('chart-ping-ov', [['Google', '#8b5cf6'], ['Cloudflare', '#06b6d4']]);
+               chartDefs.forEach((d) => { if (d.ping) charts[d.key] = initPingChart(d.canvasId, d.series); else charts[d.key] = initChart(d.canvasId, d.args[0], d.args[1], d.args[2], d.args[3], d.args[4]); });
                fetchData(); setInterval(fetchData, 4000);
             });
 
@@ -2312,7 +2493,7 @@ rm -f /tmp/cf_install.sh
                   const res = await fetch('/api/server?id=' + serverId + (needHistory ? '' : '&no_history=1'));
                   if (!res.ok) return;
                   const data = await res.json();
-                  if (data.last_updated) { lastUpdTs = parseInt(data.last_updated) || lastUpdTs; tickBjClock(); }
+                  if (data.last_updated) { lastUpdTs = parseInt(data.last_updated) || lastUpdTs; tickStatus(); }
 
                   document.getElementById('d-uptime').innerText = data.uptime;
                   document.getElementById('d-os').innerText = data.os;
@@ -2452,7 +2633,7 @@ rm -f /tmp/cf_install.sh
       const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
 
       if (Object.keys(groups).length === 0) {
-        cardContentHtml = '<p style="text-align:center; width: 100%; color:#888;">暂无公开服务器</p>';
+        cardContentHtml = '<p style="text-align:center; width: 100%; color: var(--text2);">暂无公开服务器</p>';
       } else {
         for (const [grpName, grpServers] of Object.entries(groups)) {
           cardContentHtml += `<div class="group-header">${esc(grpName)}</div><div class="grid-container">`;
@@ -2541,12 +2722,12 @@ rm -f /tmp/cf_install.sh
                     <div class="stat-subtext">${diskUsedStr} / ${diskTotalStr}</div>
                   </div>
                   
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-top: 2px;">
+                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 2px;">
                     <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 5px;" title="${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}">${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}</div>
                     <div style="white-space: nowrap; flex-shrink: 0;">TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
                   </div>
                   
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-top: 4px; white-space: nowrap; gap: 8px;">
+                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 4px; white-space: nowrap; gap: 8px;">
                     <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="c-in-${server.id}" data-val="${netInSpeedRaw}">0 B/s</span></div>
                     <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="c-out-${server.id}" data-val="${netOutSpeedRaw}">0 B/s</span></div>
                   </div>
@@ -2593,13 +2774,42 @@ rm -f /tmp/cf_install.sh
       <html>
       <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
         <title>${esc(sys.site_title)}</title>
+        <script>
+        (function(){
+          var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
+          function uiDark(){
+            var cls = document.body ? document.body.className : '';
+            for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
+            if (cls.indexOf('forced-dark') !== -1) return true;
+            if (cls.indexOf('forced-light') !== -1) return false;
+            return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          }
+          window.uiDark = uiDark;
+          try {
+            var mql = window.matchMedia('(prefers-color-scheme: dark)');
+            var onSchemeChange = function(){
+              if (!document.body) return;
+              var cls = document.body.className;
+              var hardDark = false;
+              for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) hardDark = true; }
+              document.body.classList.remove('forced-dark','forced-light');
+              if (hardDark) document.body.classList.add('forced-dark');
+              else if (mql.matches) document.body.classList.add('forced-dark');
+              else document.body.classList.add('forced-light');
+              if (window.__uiThemeChanged) window.__uiThemeChanged();
+            };
+            if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
+            else if (mql.addListener) mql.addListener(onSchemeChange);
+          } catch(e){}
+        })();
+        </script>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
         <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
         ${sys.custom_head || ''}
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 20px; }
           .container { max-width: 1200px; margin: 0 auto; }
           
           .group-header { font-size: 18px; font-weight: 600; color: #444; margin: 25px 0 15px 5px; border-left: 4px solid #3b82f6; padding-left: 10px; }
@@ -2622,7 +2832,7 @@ rm -f /tmp/cf_install.sh
           /* Modal 通用 CSS */
           .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; backdrop-filter: blur(4px); }
           .modal-content { background: white; padding: 20px; border-radius: 12px; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
-          .theme2 .modal-content, .theme5 .modal-content, .theme4 .modal-content, .theme8 .modal-content, .theme6 .modal-content { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; }
+          .theme2 .modal-content, .theme5 .modal-content, .theme4 .modal-content, .theme8 .modal-content, .theme6 .modal-content { background: var(--card); color: var(--text); border: 1px solid var(--separator); }
           
           /* 上下两行自适应 Grid CSS */
           .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
@@ -2647,7 +2857,7 @@ rm -f /tmp/cf_install.sh
             <h1 style="margin:0;">${esc(sys.site_title)}</h1>
             
             <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
-              <span id="bj-clock" style="font-size:13px; color:#888; background: rgba(150,150,150,0.12); padding:4px 10px; border-radius:8px;">北京时间加载中...</span>
+              <span id="bj-clock">北京时间加载中...</span>
               <div class="view-controls">
                 <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片
@@ -2678,7 +2888,7 @@ rm -f /tmp/cf_install.sh
 
               <div class="g-item">
                 <div class="g-label">本机可见数字资产 (${sys.asset_currency || '元'})</div>
-                <div class="g-val">${visibleAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${visibleRemAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div>
+                <div class="g-val">${visibleAsset.toFixed(2)} <span style="font-size:16px;color: var(--text2);">总</span> | ${visibleRemAsset.toFixed(2)} <span style="font-size:16px;color: var(--text2);">余</span></div>
               </div>
             </div>
             
@@ -2713,6 +2923,7 @@ rm -f /tmp/cf_install.sh
           </div>
 
           <div id="view-map" class="view-panel">
+            <div class="region-board" id="region-board" aria-label="地区速览"></div>
             <div id="map-container"></div>
           </div>
           
@@ -2841,9 +3052,75 @@ rm -f /tmp/cf_install.sh
           let markersLayer; let geoJsonLayer; let worldGeoJson = null; let currentMapDataStr = "";
 
           const countryCoords = {
-            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 'PH': [12.87, 121.77], 'ID': [-0.78, 113.92]
+            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'MO': [22.20, 113.55], 'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 'PH': [12.87, 121.77], 'ID': [-0.78, 113.92], 'UA': [48.38, 31.17], 'CZ': [49.74, 15.34], 'NZ': [-40.90, 174.89], 'MX': [23.63, -102.55], 'IR': [32.43, 53.68]
           };
-          const iso2To3 = { "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR", "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF", "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR", "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM", "PH":"PHL","ID":"IDN" };
+          const iso2To3 = { "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","MO":"MAC","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR", "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF", "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR", "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM", "PH":"PHL","ID":"IDN","UA":"UKR","CZ":"CZE","NZ":"NZL","MX":"MEX","IR":"IRN" };
+          const iso3ToIso2 = {};
+          for (const _k in iso2To3) { iso3ToIso2[iso2To3[_k]] = _k; }
+          const REGION_NAMES = {
+            'US':'美国','CN':'中国','JP':'日本','HK':'中国香港','TW':'中国台湾','MO':'中国澳门','SG':'新加坡','KR':'韩国','DE':'德国','GB':'英国','NL':'荷兰','FR':'法国','CA':'加拿大','AU':'澳大利亚','IN':'印度','BR':'巴西','RU':'俄罗斯','ZA':'南非','IT':'意大利','SE':'瑞典','CH':'瑞士','ES':'西班牙','PL':'波兰','FI':'芬兰','TH':'泰国','MY':'马来西亚','VN':'越南','ID':'印尼','PH':'菲律宾','AE':'阿联酋','TR':'土耳其','IR':'伊朗','UA':'乌克兰','CZ':'捷克','IE':'爱尔兰','AT':'奥地利','NO':'挪威','DK':'丹麦','NZ':'新西兰','MX':'墨西哥'
+          };
+          window.__mapSelCode = null;
+
+          function selectRegion(code) {
+            window.__mapSelCode = code;
+            const cards = document.querySelectorAll('#region-board .rb-card');
+            for (let i = 0; i < cards.length; i++) {
+              if (cards[i].dataset.code === code) cards[i].classList.add('active');
+              else cards[i].classList.remove('active');
+            }
+          }
+
+          function renderRegionBoard(data) {
+            const board = document.getElementById('region-board');
+            if (!board) return;
+            board.innerHTML = '';
+            const ranked = [];
+            let total = 0;
+            for (const code in data) {
+              const c = parseInt(data[code]) || 0;
+              if (c <= 0) continue;
+              total += c;
+              if (countryCoords[code]) ranked.push({ code: code, count: c });
+            }
+            if (total <= 0 || ranked.length === 0) {
+              board.innerHTML = '<div class="rb-empty">暂无地区数据</div>';
+              return;
+            }
+            ranked.sort(function(a, b) { return b.count - a.count; });
+            const top = ranked.slice(0, 12);
+            const rest = ranked.slice(12);
+            let restTotal = 0;
+            for (let i = 0; i < rest.length; i++) restTotal += rest[i].count;
+
+            for (let i = 0; i < top.length; i++) {
+              const o = top[i];
+              const nm = REGION_NAMES[o.code] || o.code;
+              const fcode = o.code === 'TW' ? 'cn' : o.code.toLowerCase();
+              const pct = Math.max(Math.round(o.count / total * 100), 1);
+              const card = document.createElement('div');
+              card.className = 'rb-card';
+              card.dataset.code = o.code;
+              card.innerHTML = '<div class="rb-head"><img src="https://flagcdn.com/48x36/' + fcode + '.png" alt="' + nm + '" loading="lazy"><span class="rb-name" title="' + nm + '">' + nm + '</span></div><div class="rb-num">' + o.count + '<small>台</small></div><div class="rb-bar"><div style="width:' + pct + '%"></div></div>';
+              card.addEventListener('click', (function(code, cnt, nmv) {
+                return function() {
+                  selectRegion(code);
+                  if (countryCoords[code]) {
+                    if (window.myMap) window.myMap.flyTo(countryCoords[code], Math.max(window.myMap.getZoom() || 2, 4), { duration: 0.8 });
+                    if (cnt > 0) window.myMap.openPopup('<b>' + nmv + '</b><br>' + cnt + ' 台', countryCoords[code], { closeButton: false });
+                  }
+                };
+              })(o.code, o.count, nm));
+              board.appendChild(card);
+            }
+
+            if (rest.length > 0) {
+              const card = document.createElement('div');
+              card.className = 'rb-card';
+              card.innerHTML = '<div class="rb-head"><span class="rb-name">其余 ' + rest.length + ' 国</span></div><div class="rb-num">' + restTotal + '<small>台</small></div><div class="rb-bar"><div style="width:' + Math.max(Math.round(restTotal / total * 100), 1) + '%"></div></div>';
+              board.appendChild(card);
+            }
+          }
 
           async function initMap() {
             window.myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
@@ -2853,6 +3130,11 @@ rm -f /tmp/cf_install.sh
                 drawMarkers();
             } catch (e) {}
           }
+
+          window.__uiThemeChanged = function() {
+            currentMapDataStr = '';
+            if (window.myMap && worldGeoJson) drawMarkers();
+          };
 
           function drawMarkers() {
             if(!window.myMap || !worldGeoJson) return;
@@ -2864,7 +3146,9 @@ rm -f /tmp/cf_install.sh
             if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(window.myMap);
 
             const data = JSON.parse(newDataStr);
-            const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4') || document.body.className.includes('theme8') || document.body.className.includes('theme6');
+            renderRegionBoard(data);
+            const dark = window.uiDark ? window.uiDark() : false;
+
             const activeIso3 = {}; 
             for (const code in data) { 
                if (iso2To3[code]) activeIso3[iso2To3[code]] = true; 
@@ -2880,15 +3164,38 @@ rm -f /tmp/cf_install.sh
 
             geoJsonLayer = L.geoJSON(worldGeoJson, {
                 style: function(feature) {
-                    const isActive = activeIso3[feature.id];
-                    return { fillColor: isActive ? '#10b981' : (isDark ? '#2a303c' : '#d5dce2'), weight: 1, opacity: 1, color: isDark ? '#1a202c' : '#ffffff', fillOpacity: 1 };
+                    const id = feature.id;
+                    const isActive = !!activeIso3[id];
+                    if (isActive) {
+                      const code = iso3ToIso2[id];
+                      const cnt = code ? (parseInt(data[code]) || 1) : 1;
+                      const alpha = Math.min(0.25 + cnt * 0.07, 0.8);
+                      return { fillColor: 'rgba(0,113,227,' + alpha.toFixed(2) + ')', weight: 1, opacity: 1, color: dark ? '#3a3a3c' : '#ffffff', fillOpacity: 1 };
+                    }
+                    return { fillColor: dark ? '#2c2c2e' : '#e9e9ed', weight: 1, opacity: 1, color: dark ? '#000000' : '#ffffff', fillOpacity: 1 };
+                },
+                onEachFeature: function(feature, layer) {
+                  layer.on('click', function() {
+                    const code = iso3ToIso2[feature.id];
+                    if (!code) return;
+                    selectRegion(code);
+                    const cnt = data[code] ? parseInt(data[code]) : 0;
+                    const nm = REGION_NAMES[code] || code;
+                    if (cnt > 0) layer.bindPopup('<b>' + nm + '</b><br>' + cnt + ' 台').openPopup();
+                    if (countryCoords[code]) window.myMap.flyTo(countryCoords[code], Math.max(window.myMap.getZoom() || 2, 4), { duration: 0.8 });
+                  });
                 }
             }).addTo(window.myMap);
 
             for (const [code, count] of Object.entries(data)) {
               if(countryCoords[code]) {
-                const icon = L.divIcon({ className: 'custom-map-badge', html: \`<div>\${count}</div>\`, iconSize: [22,22] });
-                L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer);
+                const c = parseInt(count) || 0;
+                if (c <= 0) continue;
+                const len = String(c).length;
+                const w = len <= 1 ? 22 : (len === 2 ? 27 : 32);
+                const icon = L.divIcon({ className: 'custom-map-badge', html: \`<div>\${c}</div>\`, iconSize: [w, 22], iconAnchor: [w / 2, 11] });
+                const mk = L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer);
+                mk.bindTooltip((REGION_NAMES[code] || code) + ' · ' + c + ' 台', { direction: 'top', offset: L.point(0, -14) });
               }
             }
           }
