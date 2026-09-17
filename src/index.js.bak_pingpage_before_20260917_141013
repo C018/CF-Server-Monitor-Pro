@@ -3168,22 +3168,6 @@ ${customScript}</body>
             }
           } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
         }
-        else if (data.action === 'ping_snapshot') {
-          // 延迟测速页（独立菜单）：只读拉取节点最近一次上报的延迟结果与探测方式；不触发远端重测（Worker 无法反向调度探针）
-          const PING_COLS = ['id', 'name', 'server_group', 'last_updated', 'is_hidden',
-            'ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'ping_gg', 'ping_cf',
-            'ping_intl_hk', 'ping_intl_tyo', 'ping_intl_sin', 'ping_intl_syd', 'ping_intl_lax',
-            'ping_intl_nyc', 'ping_intl_fra', 'ping_intl_lon', 'ping_intl_ams', 'ping_intl_sao',
-            'ping_ct_m', 'ping_cu_m', 'ping_cm_m', 'ping_bd_m', 'ping_gg_m', 'ping_cf_m'];
-          const pingSel = 'SELECT ' + PING_COLS.join(', ') + ' FROM servers';
-          let pingRows;
-          if (data.id) {
-            pingRows = (await env.DB.prepare(pingSel + ' WHERE id = ?').bind(String(data.id)).all()).results || [];
-          } else {
-            pingRows = (await env.DB.prepare(pingSel + ' ORDER BY sort_order ASC, rowid ASC').all()).results || [];
-          }
-          return new Response(JSON.stringify({ success: true, now: Date.now(), count: pingRows.length, items: pingRows }), { headers: { 'Content-Type': 'application/json' } });
-        }
         else if (typeof data.action === 'string' && data.action.indexOf('notify_') === 0) {
           // 通知中心 / 模板中心 JSON 接口（第4步A）：统一信封 { success, ... }，仅返回 JSON，不做整页渲染
           const notifyOut = await handleNotifyAdminApi(data, env);
@@ -3414,43 +3398,6 @@ ${customScript}</body>
           .ntf-tpl-pv-body { font-size: 12px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
           .ntf-tpl-var { display: inline-block; font-size: 11px; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 2px 7px; margin: 0 5px 5px 0; border: 1px solid var(--separator-strong); border-radius: 10px; background: var(--card2); color: var(--text); cursor: pointer; }
           .ntf-tpl-var:hover { border-color: var(--text2); }
-          /* ===== 延迟测速页（独立菜单，沿用 themeTokenCss 设计令牌） ===== */
-          .ping-tip { font-size:13px; line-height:1.8; color: var(--text2); background: var(--card2); border:1px dashed var(--separator-strong); border-radius: var(--radius-xs); padding:10px 13px; margin-bottom:16px; }
-          .ping-sec { border:1px solid var(--separator); border-radius: var(--radius-s); padding:16px 18px; margin-bottom:16px; background: var(--card); box-shadow: var(--shadow); }
-          .ping-sec-title { font-size:14px; font-weight:600; margin-bottom:12px; color: var(--text); }
-          .ping-cfg-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 20px; }
-          .ping-hint { font-size:12px; color: var(--text2); line-height:1.7; margin-top:8px; }
-          .ping-chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color: var(--text2); cursor:pointer; white-space:nowrap; }
-          .ping-flex-spacer { flex:1 1 auto; }
-          .ping-progress { position:relative; height:10px; border-radius:6px; background: var(--card2); border:1px solid var(--separator); margin:6px 0 10px 0; overflow:hidden; }
-          .ping-progress-bar { height:100%; width:0%; background: var(--accent); transition: width .2s ease; }
-          .ping-progress-txt { display:block; font-size:12px; color: var(--text2); margin:6px 0 10px 0; }
-          .ping-summary { font-size:12px; color: var(--text2); margin:2px 0 8px 0; line-height:1.8; }
-          .ping-summary .ping-sum-chip { display:inline-block; border:1px solid var(--separator-strong); border-radius:10px; padding:2px 9px; margin:0 6px 4px 0; }
-          .ping-table th { white-space:nowrap; }
-          .ping-table th.ping-sortable { cursor:pointer; user-select:none; }
-          .ping-table th.ping-sortable:hover { background: var(--hover); }
-          .ping-table td.ping-c { text-align:center; white-space:nowrap; font-variant-numeric: tabular-nums; }
-          .ping-table tr.is-off td { opacity:.62; }
-          .ping-table tr.is-hot td { background: rgba(255,59,48,0.07); }
-          .ping-cell { display:inline-block; min-width:62px; padding:2px 6px; border-radius:6px; }
-          .ping-cell.is-g { color: var(--green); background: rgba(48,209,88,0.12); }
-          .ping-cell.is-y { color: var(--orange); background: rgba(255,159,10,0.14); }
-          .ping-cell.is-r { color: var(--red); background: rgba(255,59,48,0.12); }
-          .ping-cell.is-f { color: var(--text2); background: var(--card2); }
-          .ping-cell .ping-mode { display:block; font-size:10px; opacity:.8; }
-          .ping-node-name { font-weight:600; }
-          .ping-node-sub { font-size:11px; color: var(--text2); margin-top:2px; word-break:break-all; }
-          .ping-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--separator-strong); color: var(--text2); }
-          .ping-badge.is-on { color:#fff; background: var(--green); border-color: var(--green); }
-          .ping-badge.is-off { color:#fff; background: var(--text2); border-color: var(--text2); }
-          .ping-delta { display:block; font-size:10px; margin-top:1px; }
-          .ping-delta.is-up { color: var(--red); }
-          .ping-delta.is-down { color: var(--green); }
-          .ping-actions { white-space:nowrap; text-align:right; }
-          .ping-actions .btn { margin-left:0; margin-right:0; padding:5px 10px; }
-          .ping-legend { font-size:11px; color: var(--text2); margin-top:10px; line-height:1.9; }
-          .ping-legend span { margin-right:12px; }
         </style>
         <script>
         ${buildThemeBootJs(darkThemeIds)}
@@ -3463,7 +3410,6 @@ ${customScript}</body>
         <div class="adm-nav" id="adm-nav">
           <a class="adm-nav-item is-active" href="#settings" data-adm-nav="settings" onclick="return admGo('settings')">⚙️ 全局设置</a>
           <a class="adm-nav-item" href="#notify" data-adm-nav="notify" onclick="return admGo('notify')">🔔 通知中心</a>
-          <a class="adm-nav-item" href="#ping" data-adm-nav="ping" onclick="return admGo('ping')">📡 延迟测速</a>
         </div>
 
         <div id="adm-page-settings">
@@ -3574,8 +3520,12 @@ ${customScript}</body>
               <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789"></div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--purple);">📡 延迟测速（已迁移为独立菜单，与「通知中心」并列）</label>
-              <p style="font-size: 12px; color: var(--text2); margin: 0; line-height: 1.7;">测速目标配置、延迟结果总览、单节点重测与批量测试已统一收敛到独立页面「延迟测速」，此处不再重复渲染（相关控件 id 保持不变，保存逻辑不受影响）。<a href="#ping" onclick="return admGo('ping')" style="color: var(--accent); font-weight: 600; text-decoration: none;">前往延迟测速 →</a></p>
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--purple);">📡 延迟测试节点选择 (动态下发更新)</label>
+              <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
+              <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
+              <div class="form-group"><label>移动 (CM) 测速节点</label><select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select></div>
+              <div class="form-group"><label>Google / 8.8.4.4 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_gg" value="${sys.ping_node_gg || 'default'}" placeholder="default = 8.8.4.4（ICMP ping 失败时回退 TCP ping），或填写自定义域名/IP"></div>
+              <div class="form-group"><label>Cloudflare / 1.0.0.1 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_cf" value="${sys.ping_node_cf || 'default'}" placeholder="default = 1.0.0.1（ICMP ping 失败时回退 TCP ping），或填写自定义域名/IP"></div>
             </div>
           </div>
           <button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
@@ -3847,55 +3797,6 @@ ${customScript}</body>
         </div>
         </div>
 
-        <div class="card" id="adm-page-ping" style="display:none;" data-offline-sec="${parseInt(sys.offline_threshold || '30') || 30}">
-          <h2>📡 延迟测速</h2>
-          <div style="font-size:13px; color:var(--text2); margin:-6px 0 12px 0;">独立延迟测速页：测速目标配置、全节点延迟结果总览、单节点重测与批量测试（数据来源为各节点探针最近一次上报）。</div>
-
-          <div class="ping-tip">
-            <b>关于「重测 / 批量测试」</b>：延迟由各节点探针按上报间隔自动测量并上报，Worker 无法反向调度探针，因此本页的测试动作 = 重新拉取探针最新上报值，并与上一次快照对比给出变化（Δ）与失败原因；测速目标（CT / CU / CM / GG / CF）修改后需点击下方「保存测速配置」，探针将在下一次上报时生效。
-          </div>
-
-          <div class="ping-sec">
-            <div class="ping-sec-title">① 测速目标配置（动态下发到探针）</div>
-            <div class="ping-cfg-grid">
-              <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
-              <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
-              <div class="form-group"><label>移动 (CM) 测速节点</label><select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select></div>
-              <div class="form-group"><label>Google / 8.8.4.4 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_gg" value="${sys.ping_node_gg || 'default'}" placeholder="default = 8.8.4.4（ICMP ping 失败时回退 TCP ping）"></div>
-              <div class="form-group"><label>Cloudflare / 1.0.0.1 测速目标 (ICMP + TCP)</label><input type="text" id="cfg_ping_node_cf" value="${sys.ping_node_cf || 'default'}" placeholder="default = 1.0.0.1（ICMP ping 失败时回退 TCP ping）"></div>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:4px;">
-              <button type="button" class="btn btn-blue" onclick="pingSaveConfig()">💾 保存测速配置</button>
-              <span class="ntf-msg" id="ping-cfg-msg"></span>
-            </div>
-            <div class="ping-hint">节点池（CT / CU / CM 下拉候选）数据可在「⚙️ 全局设置 → 🎨 前端主题风格」行内点击「🔄 手动更新测速/主题数据」刷新。</div>
-          </div>
-
-          <div class="ping-sec">
-            <div class="ping-sec-title">② 延迟结果总览与批量测试</div>
-            <div class="ntf-toolbar ntf-filter-bar">
-              <input type="text" id="ping-f-kw" placeholder="按节点名 / 分组筛选" oninput="pingApplyFilter()" style="font-size:12px; padding:5px 8px; border:1px solid var(--separator-strong); border-radius:6px; background:var(--card); color:var(--text); width:180px;">
-              <select id="ping-f-group" onchange="pingApplyFilter()"><option value="">全部分组</option></select>
-              <select id="ping-f-online" onchange="pingApplyFilter()"><option value="">在线 + 离线</option><option value="on">仅在线</option><option value="off">仅离线</option></select>
-              <select id="ping-f-state" onchange="pingApplyFilter()"><option value="">全部结果</option><option value="abn">仅异常（超时 / 未上报）</option><option value="ok">仅全部正常</option></select>
-              <select id="ping-f-tier" onchange="pingApplyFilter()"><option value="">全部延迟档</option><option value="g">优（&lt;100ms）</option><option value="y">良（100-199ms）</option><option value="r">差（≥200ms）</option></select>
-              <select id="ping-f-sort" onchange="pingSortChange()"><option value="avg">排序：平均延迟</option><option value="ping_ct">排序：电信延迟</option><option value="ping_cu">排序：联通延迟</option><option value="ping_cm">排序：移动延迟</option><option value="ping_bd">排序：BD 延迟</option><option value="ping_gg">排序：Google 延迟</option><option value="ping_cf">排序：CF 延迟</option><option value="status">排序：在线状态</option><option value="name">排序：节点名</option></select>
-              <select id="ping-f-dir" onchange="pingSortChange()"><option value="1">升序</option><option value="-1">降序</option></select>
-              <label class="ping-chk"><input type="checkbox" id="ping-show-intl" onchange="pingRender()">显示国际互联（10 城）</label>
-              <span class="ping-flex-spacer"></span>
-              <button type="button" class="btn btn-gray" onclick="pingLoad(true)">🔄 刷新</button>
-              <button type="button" class="btn btn-yellow" id="ping-retest-fail-btn" onclick="pingRetestFail()">⚡ 仅重测异常节点</button>
-              <button type="button" class="btn btn-green" id="ping-batch-btn" onclick="pingBatch()">📡 批量测试（当前筛选）</button>
-            </div>
-            <div class="ping-progress" id="ping-progress" style="display:none;"><div class="ping-progress-bar" id="ping-progress-bar"></div></div>
-            <div class="ping-progress-txt" id="ping-progress-txt" style="display:none;"></div>
-            <div class="ntf-msg" id="ping-msg"></div>
-            <div class="ping-summary" id="ping-summary"></div>
-            <div id="ping-table-host"></div>
-            <div class="ping-legend"><span>图例：<b style="color:var(--green);">优 &lt;100ms</b></span><span><b style="color:var(--orange);">良 100-199ms</b></span><span><b style="color:var(--red);">差 ≥200ms</b></span><span><b style="color:var(--text2);">超时 / 未上报</b></span><span>延迟单元第二行为探针实际探测方式（ICMP / TCP）；点击表头亦可排序。</span></div>
-          </div>
-        </div>
-
         ${getFooterHtml(sys)}
 `,
         scripts: `        <script>
@@ -4049,20 +3950,18 @@ ${customScript}</body>
           }
           // ===== 通知中心前端骨架（第4步B-1a-i：仅导航/hash 切换与 tab 占位，不接数据） =====
           function admRoute() {
-            const h = location.hash === '#notify' ? 'notify' : (location.hash === '#ping' ? 'ping' : 'settings');
-            const pages = { settings: 'adm-page-settings', notify: 'adm-page-notify', ping: 'adm-page-ping' };
-            Object.keys(pages).forEach(function (k) {
-              const el = document.getElementById(pages[k]);
-              if (el) el.style.display = (k === h) ? 'block' : 'none';
-            });
+            const isNotify = location.hash === '#notify';
+            const page = document.getElementById('adm-page-notify');
+            if (page) page.style.display = isNotify ? 'block' : 'none';
+            const pageSet = document.getElementById('adm-page-settings');
+            if (pageSet) pageSet.style.display = isNotify ? 'none' : 'block';
             document.querySelectorAll('[data-adm-nav]').forEach(function (el) {
-              el.classList.toggle('is-active', el.getAttribute('data-adm-nav') === h);
+              el.classList.toggle('is-active', el.getAttribute('data-adm-nav') === (isNotify ? 'notify' : 'settings'));
             });
-            if (h === 'ping' && typeof pingEnsure === 'function') pingEnsure();
           }
           function admGo(page) {
-            const h = (page === 'notify' || page === 'ping') ? '#' + page : '';
-            if (location.hash !== h) location.hash = h;
+            if (page === 'notify') { if (location.hash !== '#notify') location.hash = '#notify'; }
+            else { location.hash = ''; }
             admRoute();
             return false;
           }
@@ -4082,393 +3981,6 @@ ${customScript}</body>
           }
           if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', admRoute); } else { admRoute(); }
           window.addEventListener('hashchange', admRoute);
-          // ===== 延迟测速页（独立菜单）：结果排序/筛选/分档着色/单节点重测/批量回测/失败原因（第5步-1） =====
-          var pingItems = [], pingLoaded = false, pingBusy = false, pingDelta = {}, pingLastAt = 0;
-          var PING_MAIN = [
-            { k: 'ping_ct', label: '电信' }, { k: 'ping_cu', label: '联通' }, { k: 'ping_cm', label: '移动' },
-            { k: 'ping_bd', label: 'BD' }, { k: 'ping_gg', label: 'Google' }, { k: 'ping_cf', label: 'CF' }
-          ];
-          var PING_INTL = [
-            { k: 'ping_intl_hk', label: '香港' }, { k: 'ping_intl_tyo', label: '东京' }, { k: 'ping_intl_sin', label: '新加坡' },
-            { k: 'ping_intl_syd', label: '悉尼' }, { k: 'ping_intl_lax', label: '洛杉矶' }, { k: 'ping_intl_nyc', label: '纽约' },
-            { k: 'ping_intl_fra', label: '法兰克福' }, { k: 'ping_intl_lon', label: '伦敦' }, { k: 'ping_intl_ams', label: '阿姆斯特丹' },
-            { k: 'ping_intl_sao', label: '圣保罗' }
-          ];
-          function pingEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-          function pingOfflineMs() {
-            var host = document.getElementById('adm-page-ping');
-            var sec = parseInt(host && host.getAttribute('data-offline-sec'), 10);
-            if (!sec || isNaN(sec)) sec = 30;
-            return sec * 1000;
-          }
-          function pingNum(v) { var p = parseInt(String(v == null ? '' : v).trim(), 10); return isNaN(p) ? null : p; }
-          function pingFailKind(v) {
-            var s = String(v == null ? '' : v).trim().toLowerCase();
-            if (!s || s === 'null' || s === 'undefined') return '未上报';
-            if (s === 'fail') return '超时';
-            var p = parseInt(s, 10);
-            if (isNaN(p)) return '异常值';
-            if (p <= 0) return '未上报';
-            return '';
-          }
-          function pingIsFail(v) { return pingFailKind(v) !== ''; }
-          function pingTier(v) { var p = pingNum(v); if (pingIsFail(v) || p == null) return 'f'; if (p < 100) return 'g'; if (p < 200) return 'y'; return 'r'; }
-          function pingModeLabel(m) {
-            var s = String(m == null ? '' : m).trim().toLowerCase();
-            if (!s || s === 'fail') return '探测失败';
-            if (s === 'icmp') return 'ICMP';
-            if (s === 'tcp') return 'TCP';
-            if (s === 'http') return 'HTTP';
-            return s.toUpperCase();
-          }
-          function pingOnline(it) {
-            var lu = parseFloat(it && it.last_updated);
-            if (!lu || isNaN(lu)) return false;
-            var age = Date.now() - lu * 1000;
-            return age >= 0 && age < pingOfflineMs();
-          }
-          function pingAgeText(it) {
-            var lu = parseFloat(it && it.last_updated);
-            if (!lu || isNaN(lu)) return '从未上报';
-            var sec = Math.floor((Date.now() - lu * 1000) / 1000);
-            if (sec < 0) sec = 0;
-            if (sec < 60) return sec + ' 秒前';
-            if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
-            if (sec < 86400) return Math.floor(sec / 3600) + ' 小时前';
-            return Math.floor(sec / 86400) + ' 天前';
-          }
-          function pingAvg(it) {
-            var vals = [], i;
-            for (i = 0; i < PING_MAIN.length; i++) {
-              var v = it[PING_MAIN[i].k];
-              if (!pingIsFail(v)) { var p = pingNum(v); if (p != null) vals.push(p); }
-            }
-            if (!vals.length) return null;
-            var s = 0;
-            for (i = 0; i < vals.length; i++) s += vals[i];
-            return Math.round(s / vals.length);
-          }
-          function pingBadCount(it) {
-            var n = 0, i;
-            for (i = 0; i < PING_MAIN.length; i++) if (pingIsFail(it[PING_MAIN[i].k])) n++;
-            return n;
-          }
-          function pingStateText(it) {
-            var bad = pingBadCount(it);
-            if (!pingOnline(it)) return '离线（' + pingAgeText(it) + '）';
-            if (bad === 0) return '正常';
-            if (bad === PING_MAIN.length) return '全部超时';
-            return bad + ' 项异常';
-          }
-          function pingShowIntl() { var cb = document.getElementById('ping-show-intl'); return !!(cb && cb.checked); }
-          function pingSetMsg(id, text, kind) {
-            var el = document.getElementById(id);
-            if (!el) return;
-            el.className = 'ntf-msg' + (text ? ' is-' + (kind || 'info') : '');
-            el.textContent = text || '';
-          }
-          function pingVal(id) { var el = document.getElementById(id); return el ? el.value : ''; }
-          function pingPassFilter(it) {
-            var kw = pingVal('ping-f-kw').trim().toLowerCase();
-            if (kw) {
-              var hay = String(it.name == null ? '' : it.name).toLowerCase() + ' ' + String(it.server_group == null ? '' : it.server_group).toLowerCase();
-              if (hay.indexOf(kw) < 0) return false;
-            }
-            var g = pingVal('ping-f-group');
-            if (g && String(it.server_group == null ? '' : it.server_group) !== g) return false;
-            var on = pingVal('ping-f-online'), isOn = pingOnline(it);
-            if (on === 'on' && !isOn) return false;
-            if (on === 'off' && isOn) return false;
-            var st = pingVal('ping-f-state'), bad = pingBadCount(it);
-            if (st === 'abn' && !(bad > 0 || !isOn)) return false;
-            if (st === 'ok' && (bad > 0 || !isOn)) return false;
-            var tr = pingVal('ping-f-tier');
-            if (tr) {
-              var hit = false, i;
-              for (i = 0; i < PING_MAIN.length; i++) if (pingTier(it[PING_MAIN[i].k]) === tr) { hit = true; break; }
-              if (!hit) return false;
-            }
-            return true;
-          }
-          function pingFiltered() {
-            var out = [], i;
-            for (i = 0; i < pingItems.length; i++) if (pingPassFilter(pingItems[i])) out.push(pingItems[i]);
-            return out;
-          }
-          function pingSortKey() { return pingVal('ping-f-sort') || 'avg'; }
-          function pingSortDir() { return pingVal('ping-f-dir') === '-1' ? -1 : 1; }
-          function pingSortValue(it, key) {
-            if (key === 'name') return null;
-            if (key === 'status') return pingOnline(it) ? 0 : 1;
-            if (key === 'avg') return pingAvg(it);
-            if (pingIsFail(it[key])) return null;
-            return pingNum(it[key]);
-          }
-          function pingList() {
-            var arr = pingFiltered(), key = pingSortKey(), dir = pingSortDir();
-            arr.sort(function (a, b) {
-              if (key === 'name') return String(a.name == null ? '' : a.name).localeCompare(String(b.name == null ? '' : b.name)) * dir;
-              var na = pingSortValue(a, key), nb = pingSortValue(b, key);
-              if (na == null && nb == null) return 0;
-              if (na == null) return 1;
-              if (nb == null) return -1;
-              if (na === nb) return 0;
-              return (na < nb ? -1 : 1) * dir;
-            });
-            return arr;
-          }
-          function pingCellHtml(it, k) {
-            var raw = it[k], m = it[k + '_m'], failKind = pingFailKind(raw);
-            var txt = failKind ? failKind : (pingNum(raw) + 'ms');
-            var mode;
-            if (failKind) mode = (m && String(m).toLowerCase() !== 'fail') ? pingModeLabel(m) : '探针回传 fail';
-            else mode = pingModeLabel(m);
-            var d = pingDelta[it.id] ? pingDelta[it.id][k] : null;
-            var dHtml = '';
-            if (d && d.diff) dHtml = '<span class="ping-delta ' + (d.diff > 0 ? 'is-up' : 'is-down') + '">' + (d.diff > 0 ? '+' : '') + d.diff + 'ms</span>';
-            return '<td class="ping-c"><span class="ping-cell is-' + pingTier(raw) + '">' + pingEsc(txt) + '<span class="ping-mode">' + pingEsc(mode) + '</span>' + dHtml + '</span></td>';
-          }
-          function pingRender() {
-            var host = document.getElementById('ping-table-host');
-            if (!host) return;
-            pingSetSummary();
-            if (!pingItems.length) {
-              host.innerHTML = '<div class="ntf-empty">暂无节点数据，点击「🔄 刷新」重试。</div>';
-              return;
-            }
-            var arr = pingList(), showIntl = pingShowIntl(), cols = [], i;
-            cols.push({ k: 'status', label: '状态' });
-            cols.push({ k: 'name', label: '节点' });
-            for (i = 0; i < PING_MAIN.length; i++) cols.push(PING_MAIN[i]);
-            if (showIntl) for (i = 0; i < PING_INTL.length; i++) cols.push(PING_INTL[i]);
-            cols.push({ k: 'avg', label: '平均' });
-            var key = pingSortKey(), dir = pingSortDir();
-            var h = '<table class="ntf-table ping-table"><thead><tr>';
-            for (i = 0; i < cols.length; i++) {
-              var c = cols[i];
-              var sortable = (c.k === 'name' || c.k === 'status' || c.k === 'avg' || c.k.indexOf('ping_') === 0);
-              var arrow = (key === c.k) ? (dir === 1 ? ' ▲' : ' ▼') : '';
-              h += '<th' + (sortable ? ' class="ping-sortable" data-ping-sort="' + c.k + '"' : '') + '>' + pingEsc(c.label) + arrow + '</th>';
-            }
-            h += '<th>操作</th></tr></thead><tbody>';
-            for (i = 0; i < arr.length; i++) {
-              var it = arr[i], bad = pingBadCount(it), on = pingOnline(it);
-              var rowCls = !on ? ' class="is-off"' : (bad > 0 ? ' class="is-hot"' : '');
-              h += '<tr' + rowCls + '>';
-              h += '<td class="ping-c"><span class="ping-badge ' + (on ? 'is-on' : 'is-off') + '">' + (on ? '在线' : '离线') + '</span><span class="ping-node-sub">' + pingEsc(pingStateText(it)) + '</span></td>';
-              h += '<td><div class="ping-node-name">' + pingEsc(it.name) + '</div><div class="ping-node-sub">' + pingEsc(it.server_group || '默认分组') + '</div></td>';
-              for (var j = 0; j < PING_MAIN.length; j++) h += pingCellHtml(it, PING_MAIN[j].k);
-              if (showIntl) for (var m2 = 0; m2 < PING_INTL.length; m2++) h += pingCellHtml(it, PING_INTL[m2].k);
-              var av = pingAvg(it);
-              h += '<td class="ping-c"><span class="ping-cell is-' + (av == null ? 'f' : (av < 100 ? 'g' : (av < 200 ? 'y' : 'r'))) + '">' + (av == null ? '无有效值' : av + 'ms') + '</span></td>';
-              h += '<td class="ping-actions"><button type="button" class="btn btn-blue" data-ping-act="retest" data-ping-id="' + pingEsc(it.id) + '">重测</button></td>';
-              h += '</tr>';
-            }
-            h += '</tbody></table>';
-            host.innerHTML = h;
-          }
-          function pingSetSummary() {
-            var el = document.getElementById('ping-summary');
-            if (!el) return;
-            var arr = pingFiltered(), i, j, on = 0, bad = 0, g = 0, y = 0, r = 0, f = 0, vals = [];
-            for (i = 0; i < arr.length; i++) {
-              if (pingOnline(arr[i])) on++;
-              var itemBad = 0;
-              for (j = 0; j < PING_MAIN.length; j++) {
-                var t = pingTier(arr[i][PING_MAIN[j].k]);
-                if (t === 'f') { f++; itemBad++; } else if (t === 'g') g++; else if (t === 'y') y++; else r++;
-              }
-              if (itemBad > 0) bad++;
-              var av = pingAvg(arr[i]);
-              if (av != null) vals.push(av);
-            }
-            vals.sort(function (a, b) { return a - b; });
-            var med = vals.length ? vals[Math.floor(vals.length / 2)] : null;
-            var chips = ['筛选结果 ' + arr.length + ' / ' + pingItems.length + ' 个节点', '在线 ' + on, '异常节点 ' + bad,
-              '探测点 优 ' + g + ' / 良 ' + y + ' / 差 ' + r + ' / 超时 ' + f];
-            if (med != null) chips.push('平均延迟中位数 ' + med + 'ms');
-            if (pingLastAt) chips.push('数据时间 ' + new Date(pingLastAt).toLocaleTimeString());
-            var h = '';
-            for (i = 0; i < chips.length; i++) h += '<span class="ping-sum-chip">' + pingEsc(chips[i]) + '</span>';
-            el.innerHTML = h;
-          }
-          function pingFillGroups() {
-            var sel = document.getElementById('ping-f-group');
-            if (!sel) return;
-            var cur = sel.value, seen = {}, list = [], i;
-            for (i = 0; i < pingItems.length; i++) {
-              var g = String(pingItems[i].server_group == null ? '' : pingItems[i].server_group).trim();
-              if (!g || seen[g]) continue;
-              seen[g] = 1; list.push(g);
-            }
-            list.sort();
-            var h = '<option value="">全部分组</option>';
-            for (i = 0; i < list.length; i++) h += '<option value="' + pingEsc(list[i]) + '">' + pingEsc(list[i]) + '</option>';
-            sel.innerHTML = h;
-            sel.value = cur || '';
-          }
-          function pingSortBy(k) {
-            var s = document.getElementById('ping-f-sort'), d = document.getElementById('ping-f-dir');
-            if (s && s.value !== k) { s.value = k; if (d) d.value = '1'; }
-            else if (d) d.value = (d.value === '1' ? '-1' : '1');
-            pingRender();
-          }
-          function pingSortChange() { pingRender(); }
-          function pingApplyFilter() { pingRender(); }
-          function pingSetBusy(on) {
-            pingBusy = !!on;
-            var b = document.getElementById('ping-batch-btn');
-            if (b) b.disabled = !!on;
-            var b2 = document.getElementById('ping-retest-fail-btn');
-            if (b2) b2.disabled = !!on;
-          }
-          function pingBindTable() {
-            var host = document.getElementById('ping-table-host');
-            if (!host || host.__pingBound) return;
-            host.__pingBound = true;
-            host.addEventListener('click', function (ev) {
-              var t = ev.target;
-              var sEl = (t && t.closest) ? t.closest('[data-ping-sort]') : null;
-              if (sEl) { pingSortBy(sEl.getAttribute('data-ping-sort')); return; }
-              var aEl = (t && t.closest) ? t.closest('[data-ping-act]') : null;
-              if (aEl && aEl.getAttribute('data-ping-act') === 'retest') pingRetest(aEl.getAttribute('data-ping-id'));
-            });
-          }
-          async function pingFetch(id) {
-            var body = { action: 'ping_snapshot' };
-            if (id) body.id = id;
-            var res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-            var out = await res.json();
-            if (!out || out.success !== true) throw new Error((out && out.error) || ('HTTP ' + res.status));
-            return out;
-          }
-          async function pingLoad(manual) {
-            if (pingBusy) return;
-            pingSetBusy(true);
-            pingSetMsg('ping-msg', '正在拉取探针最新上报的延迟结果…', 'info');
-            try {
-              var out = await pingFetch(null);
-              pingItems = out.items || [];
-              pingLastAt = out.now || Date.now();
-              pingDelta = {};
-              pingFillGroups();
-              pingRender();
-              pingSetMsg('ping-msg', manual ? ('已刷新：共 ' + pingItems.length + ' 个节点。') : ('已加载 ' + pingItems.length + ' 个节点的最新上报结果。'), 'ok');
-            } catch (e) {
-              pingSetMsg('ping-msg', '拉取失败：' + String((e && e.message) || e), 'err');
-            } finally {
-              pingSetBusy(false);
-            }
-          }
-          function pingEnsure() { pingBindTable(); if (!pingLoaded && !pingBusy) { pingLoaded = true; pingLoad(false); } }
-          function pingDiffOf(oldIt, newIt) {
-            var out = {}, changed = 0, i;
-            for (i = 0; i < PING_MAIN.length; i++) {
-              var k = PING_MAIN[i].k;
-              var a = pingIsFail(oldIt[k]) ? null : pingNum(oldIt[k]);
-              var b = pingIsFail(newIt[k]) ? null : pingNum(newIt[k]);
-              if (a == null && b == null) continue;
-              if (a == null || b == null) { out[k] = { from: a, to: b, diff: 0 }; changed++; continue; }
-              if (a !== b) { out[k] = { from: a, to: b, diff: b - a }; changed++; }
-            }
-            return { delta: out, changed: changed };
-          }
-          function pingBrief(it) {
-            var parts = [], i;
-            for (i = 0; i < PING_MAIN.length; i++) {
-              var k = PING_MAIN[i].k, v = it[k];
-              parts.push(PING_MAIN[i].label + ' ' + (pingIsFail(v) ? pingFailKind(v) : (pingNum(v) + 'ms')));
-            }
-            return parts.join(' / ');
-          }
-          function pingReplaceItem(fresh) {
-            var i;
-            for (i = 0; i < pingItems.length; i++) if (String(pingItems[i].id) === String(fresh.id)) { pingItems[i] = fresh; return true; }
-            return false;
-          }
-          async function pingRetest(id) {
-            if (pingBusy) { pingSetMsg('ping-msg', '正在进行批量测试，请稍候再单节点重测。', 'info'); return; }
-            pingSetMsg('ping-msg', '正在重测该节点…', 'info');
-            try {
-              var out = await pingFetch(id);
-              var fresh = (out.items || [])[0];
-              if (!fresh) throw new Error('节点已不存在');
-              var old = null, i;
-              for (i = 0; i < pingItems.length; i++) if (String(pingItems[i].id) === String(id)) { old = pingItems[i]; break; }
-              var res = old ? pingDiffOf(old, fresh) : { delta: {}, changed: 0 };
-              pingDelta = {};
-              pingDelta[id] = res.delta;
-              pingReplaceItem(fresh);
-              pingLastAt = out.now || Date.now();
-              pingRender();
-              var nm = fresh.name || id;
-              if (!old) pingSetMsg('ping-msg', '节点「' + nm + '」重测完成：' + pingBrief(fresh), 'ok');
-              else if (res.changed === 0) pingSetMsg('ping-msg', '节点「' + nm + '」重测完成：与上一次快照一致，无变化（' + pingBrief(fresh) + '）。', 'ok');
-              else pingSetMsg('ping-msg', '节点「' + nm + '」重测完成：' + res.changed + ' 项发生变化（表中已标注 Δ）——' + pingBrief(fresh), 'ok');
-            } catch (e) {
-              pingSetMsg('ping-msg', '重测失败：' + String((e && e.message) || e), 'err');
-            }
-          }
-          function pingAbnormal() {
-            var arr = pingFiltered(), out = [], i;
-            for (i = 0; i < arr.length; i++) if (!pingOnline(arr[i]) || pingBadCount(arr[i]) > 0) out.push(arr[i]);
-            return out;
-          }
-          async function pingBatchRun(list, label) {
-            if (pingBusy) { pingSetMsg('ping-msg', '已有测试任务进行中，请稍候…', 'info'); return; }
-            if (!list.length) { pingSetMsg('ping-msg', '当前筛选结果为空，没有可测试的节点。', 'info'); return; }
-            pingSetBusy(true);
-            var bar = document.getElementById('ping-progress'), barIn = document.getElementById('ping-progress-bar'), txt = document.getElementById('ping-progress-txt');
-            if (bar) bar.style.display = 'block';
-            if (txt) txt.style.display = 'block';
-            var done = 0, changedNodes = 0, failNodes = 0, i, c, q;
-            pingDelta = {};
-            for (i = 0; i < list.length; i += 3) {
-              var chunk = list.slice(i, i + 3);
-              var outs = await Promise.all(chunk.map(function (it) {
-                return pingFetch(it.id).then(function (r) { return { it: it, ok: true, r: r }; }).catch(function (e) { return { it: it, ok: false, err: e }; });
-              }));
-              for (c = 0; c < outs.length; c++) {
-                done++;
-                var o = outs[c];
-                var fresh = o.ok ? (o.r.items || [])[0] : null;
-                if (!fresh) { failNodes++; continue; }
-                var d = pingDiffOf(o.it, fresh);
-                if (d.changed) { changedNodes++; pingDelta[o.it.id] = d.delta; }
-                pingReplaceItem(fresh);
-              }
-              var pct = Math.round(done * 100 / list.length);
-              if (barIn) barIn.style.width = pct + '%';
-              if (txt) txt.textContent = '测试进行中 ' + done + ' / ' + list.length + '（' + pct + '%）· 有变化 ' + changedNodes + ' 个 · 请求失败 ' + failNodes + ' 个';
-              pingRender();
-            }
-            pingLastAt = Date.now();
-            if (bar) bar.style.display = 'none';
-            if (txt) txt.textContent = '批量测试完成：共 ' + list.length + ' 个节点，' + changedNodes + ' 个有新变化（表中标注 Δ），' + failNodes + ' 个请求失败。';
-            pingRender();
-            pingSetMsg('ping-msg', label + '批量测试完成：' + list.length + ' 个节点，' + changedNodes + ' 个有新变化，' + failNodes + ' 个请求失败。', failNodes ? 'info' : 'ok');
-            pingSetBusy(false);
-          }
-          function pingBatch() { pingBatchRun(pingFiltered(), ''); }
-          function pingRetestFail() {
-            var list = pingAbnormal();
-            if (!list.length) { pingSetMsg('ping-msg', '当前（筛选范围内）没有异常或离线节点。', 'ok'); return; }
-            pingBatchRun(list, '异常节点 ');
-          }
-          function pingSaveConfig() {
-            var map = { ping_node_ct: 'cfg_ping_node_ct', ping_node_cu: 'cfg_ping_node_cu', ping_node_cm: 'cfg_ping_node_cm', ping_node_gg: 'cfg_ping_node_gg', ping_node_cf: 'cfg_ping_node_cf' };
-            var settings = {}, k, el;
-            for (k in map) { el = document.getElementById(map[k]); if (!el) { pingSetMsg('ping-cfg-msg', '页面控件缺失，无法保存。', 'err'); return; } settings[k] = el.value; }
-            pingSetMsg('ping-cfg-msg', '正在保存测速配置…', 'info');
-            fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'save_settings', settings: settings }) })
-              .then(function (r) { return r.json(); })
-              .then(function (out) {
-                if (out && out.success !== false) pingSetMsg('ping-cfg-msg', '测速配置已保存，探针将在下一次上报时生效。', 'ok');
-                else pingSetMsg('ping-cfg-msg', '保存失败：' + String((out && out.error) || '未知错误'), 'err');
-              })
-              .catch(function (e) { pingSetMsg('ping-cfg-msg', '保存失败：' + String((e && e.message) || e), 'err'); });
-          }
-
           // ===== 通知中心 · 通道管理列表（第4步B-1a-ii-1：只读列表 + 启停 + 删除，局部渲染，禁止整页刷新） =====
           let ntfChannelCache = [], ntfChannelsLoaded = false;
           function ntfEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
