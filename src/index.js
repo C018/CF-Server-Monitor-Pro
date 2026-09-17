@@ -3411,6 +3411,8 @@ ${customScript}</body>
           <a class="adm-nav-item is-active" href="#settings" data-adm-nav="settings" onclick="return admGo('settings')">⚙️ 全局设置</a>
           <a class="adm-nav-item" href="#notify" data-adm-nav="notify" onclick="return admGo('notify')">🔔 通知中心</a>
         </div>
+
+        <div id="adm-page-settings">
         <div class="card">
           <h2>🛠️ 全局设置与高级自定义</h2>
           <div class="settings-grid">
@@ -3546,6 +3548,7 @@ ${customScript}</body>
             ${trs || '<tr><td colspan="5" style="text-align:center; padding: 30px; color:var(--text2);">暂无服务器，请在上方添加</td></tr>'}
           </table>
         </div>
+        </div>
 
         <div id="editModal" class="modal">
           <div class="modal-content">
@@ -3575,6 +3578,8 @@ ${customScript}</body>
               <button onclick="saveEdit()" class="btn btn-blue" style="padding: 8px 15px;">保存更改</button>
              </div>
           </div>
+        </div>
+
         <div class="card" id="adm-page-notify" style="display:none;">
           <h2>🔔 通知中心</h2>
           <div style="font-size:13px; color:var(--text2); margin:-6px 0 4px 0;">多通道通知引擎、规则引擎与投递可靠性的统一管理入口（通道 / 规则 / 绑定 / 日志 / 队列 / 模板，切换时按需加载）。</div>
@@ -3792,8 +3797,6 @@ ${customScript}</body>
         </div>
         </div>
 
-        </div>
-        
         ${getFooterHtml(sys)}
 `,
         scripts: `        <script>
@@ -3950,6 +3953,8 @@ ${customScript}</body>
             const isNotify = location.hash === '#notify';
             const page = document.getElementById('adm-page-notify');
             if (page) page.style.display = isNotify ? 'block' : 'none';
+            const pageSet = document.getElementById('adm-page-settings');
+            if (pageSet) pageSet.style.display = isNotify ? 'none' : 'block';
             document.querySelectorAll('[data-adm-nav]').forEach(function (el) {
               el.classList.toggle('is-active', el.getAttribute('data-adm-nav') === (isNotify ? 'notify' : 'settings'));
             });
