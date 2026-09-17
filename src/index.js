@@ -1,46 +1,2097 @@
 // Telegram 告警专用转义（模块顶层，供 Cron 定时扫描复用）
 const tgEsc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-// 独立定时掉线扫描：不依赖探针上报流量，Cron 每 1 分钟触发一次
-async function scheduledAlertCheck(env) {
+// ===== 通知中心多通道引擎（通知重构第2步A：Provider 抽象 + 统一发送入口，纯新增，不接管现有调用链） =====
+// Provider 接口约定：
+//   { id, type, name, configSchema, validate(cfg) -> {ok, error}, send(payload, cfg) -> {ok, status, retryAfter, error} }
+// payload 约定：{ text, title?, markdown?, level?, keyboard?, edit?, message_id?, chat_id?, timestamp? }
+const NOTIFY_DEFAULT_TIMEOUT_MS = 10000;
+const notifyProviders = new Map();
+function notifyRegisterProvider(provider) {
+  if (provider && provider.type) notifyProviders.set(String(provider.type), provider);
+  return provider;
+}
+function notifyListProviders() {
+  return Array.from(notifyProviders.values()).map(p => ({ id: p.id, type: p.type, name: p.name, configSchema: p.configSchema || {} }));
+}
+function notifyGetProvider(type) {
+  return notifyProviders.get(String(type || '')) || null;
+}
+function notifyNormalizeConfig(cfg) {
+  if (!cfg) return {};
+  if (typeof cfg === 'string') { try { const o = JSON.parse(cfg); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; } }
+  return (typeof cfg === 'object') ? cfg : {};
+}
+function notifyTimeoutMs(cfg) {
+  const t = parseInt((cfg || {}).timeout_ms, 10);
+  return (isNaN(t) || t <= 0) ? NOTIFY_DEFAULT_TIMEOUT_MS : t;
+}
+function notifyFail(error, status) { return { ok: false, status: status || 0, retryAfter: 0, error: String(error || '') }; }
+
+// ---- 内置 Provider 1/2：Telegram（请求形态与后台机器人 tgSend / tgEdit 一致：HTML parse_mode + inline keyboard） ----
+notifyRegisterProvider({
+  id: 'telegram', type: 'telegram', name: 'Telegram',
+  configSchema: {
+    bot_token: { label: 'Bot Token', type: 'password', required: true },
+    chat_id: { label: 'Chat ID', type: 'string', required: true },
+    api_base: { label: 'API 网关', type: 'string', default: 'https://api.telegram.org' },
+    parse_mode: { label: '解析模式', type: 'select', options: ['HTML', 'MarkdownV2', 'none'], default: 'HTML' },
+    disable_notification: { label: '静默推送', type: 'boolean', default: false },
+    timeout_ms: { label: '超时(ms)', type: 'number', default: NOTIFY_DEFAULT_TIMEOUT_MS }
+  },
+  validate(cfg) {
+    if (!cfg || !cfg.bot_token) return { ok: false, error: 'missing_bot_token' };
+    if (!cfg.chat_id) return { ok: false, error: 'missing_chat_id' };
+    return { ok: true, error: '' };
+  },
+  async send(payload, cfg) {
+    const p = payload || {};
+    const isEdit = !!(p.edit && p.message_id);
+    const method = isEdit ? 'editMessageText' : 'sendMessage';
+    const parseMode = (cfg.parse_mode === undefined || cfg.parse_mode === null) ? 'HTML' : String(cfg.parse_mode);
+    const body = { chat_id: (p.chat_id || cfg.chat_id), text: String(p.text == null ? '' : p.text) };
+    if (parseMode && parseMode !== 'none') body.parse_mode = parseMode;
+    if (isEdit) body.message_id = p.message_id;
+    const kb = p.keyboard || p.reply_markup;
+    if (kb) body.reply_markup = kb;
+    if (cfg.disable_notification && !isEdit) body.disable_notification = true;
+    let res;
+    try {
+      res = await fetch(`${cfg.api_base || 'https://api.telegram.org'}/bot${cfg.bot_token}/${method}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(notifyTimeoutMs(cfg))
+      });
+    } catch (e) { return notifyFail((e && e.message) || e); }
+    let data = null;
+    try { data = await res.json(); } catch (e) {}
+    if (res.ok && data && data.ok) return { ok: true, status: res.status, retryAfter: 0, error: '' };
+    const retryAfter = (data && data.parameters && parseInt(data.parameters.retry_after, 10)) || 0;
+    return { ok: false, status: res.status, retryAfter, error: (data && data.description) || ('http_' + res.status) };
+  }
+});
+
+// ---- 内置 Provider 2/2：通用 Webhook（POST JSON，覆盖 Bark / Server酱 / PushPlus / 钉钉 / 飞书 / 企业微信 / ntfy / 自建） ----
+const NOTIFY_WEBHOOK_PRESETS = ['custom', 'bark', 'serverchan', 'pushplus', 'dingtalk', 'feishu', 'wecom', 'ntfy'];
+function notifyWebhookRequest(payload, cfg) {
+  const p = payload || {};
+  const preset = String(cfg.preset || 'custom').toLowerCase();
+  const title = String(p.title || 'CF-Server-Monitor-Pro 通知');
+  const text = String(p.text == null ? '' : p.text);
+  const headers = Object.assign({}, cfg.headers || {});
+  if (!headers['User-Agent']) headers['User-Agent'] = 'CF-Server-Monitor-Pro/Notify';
+  let bodyObj = null, rawBody = null;
+  if (preset === 'bark') {
+    bodyObj = { title, body: text, group: cfg.group || 'CF监控', level: p.level || 'active' };
+  } else if (preset === 'serverchan') {
+    bodyObj = { title, desp: text };
+  } else if (preset === 'pushplus') {
+    bodyObj = { token: cfg.token || '', title, content: text, template: 'html' };
+  } else if (preset === 'dingtalk') {
+    bodyObj = p.markdown ? { msgtype: 'markdown', markdown: { title, text } } : { msgtype: 'text', text: { content: title + '\n' + text } };
+  } else if (preset === 'feishu' || preset === 'lark') {
+    bodyObj = p.markdown
+      ? { msg_type: 'interactive', card: { header: { title: { tag: 'plain_text', content: title } }, elements: [{ tag: 'markdown', content: text }] } }
+      : { msg_type: 'text', content: { text: title + '\n' + text } };
+  } else if (preset === 'wecom') {
+    bodyObj = { msgtype: 'text', text: { content: title + '\n' + text } };
+  } else if (preset === 'ntfy') {
+    if (!headers['Title']) headers['Title'] = encodeURIComponent(title);
+    if (cfg.token && !headers['Authorization']) headers['Authorization'] = 'Bearer ' + cfg.token;
+    headers['Content-Type'] = 'text/plain; charset=utf-8';
+    rawBody = title + '\n' + text;
+  } else {
+    bodyObj = { title, text, content: text, level: p.level || 'info', markdown: !!p.markdown, channel: cfg.name || '', source: 'CF-Server-Monitor-Pro', timestamp: p.timestamp || Date.now() };
+  }
+  if (rawBody === null) {
+    if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    rawBody = JSON.stringify(bodyObj);
+  }
+  return { url: String(cfg.url || ''), method: String(cfg.method || 'POST').toUpperCase(), headers, body: rawBody };
+}
+notifyRegisterProvider({
+  id: 'webhook', type: 'webhook', name: '通用 Webhook',
+  configSchema: {
+    preset: { label: '平台预设', type: 'select', options: NOTIFY_WEBHOOK_PRESETS, default: 'custom' },
+    url: { label: '推送地址', type: 'string', required: true },
+    method: { label: '请求方法', type: 'select', options: ['POST', 'PUT', 'GET'], default: 'POST' },
+    headers: { label: '自定义请求头', type: 'object', default: {} },
+    token: { label: 'Token / Key', type: 'string' },
+    timeout_ms: { label: '超时(ms)', type: 'number', default: NOTIFY_DEFAULT_TIMEOUT_MS }
+  },
+  validate(cfg) {
+    if (!cfg || !cfg.url) return { ok: false, error: 'missing_url' };
+    if (!/^https?:\/\//i.test(String(cfg.url))) return { ok: false, error: 'invalid_url' };
+    return { ok: true, error: '' };
+  },
+  async send(payload, cfg) {
+    const req = notifyWebhookRequest(payload, cfg);
+    const opts = { method: req.method, headers: req.headers, signal: AbortSignal.timeout(notifyTimeoutMs(cfg)) };
+    let url = req.url;
+    if (req.method === 'GET') url += (url.indexOf('?') === -1 ? '?' : '&') + 'data=' + encodeURIComponent(req.body);
+    else opts.body = req.body;
+    let res;
+    try { res = await fetch(url, opts); } catch (e) { return notifyFail((e && e.message) || e); }
+    if (res.ok) return { ok: true, status: res.status, retryAfter: 0, error: '' };
+    let tip = '';
+    try { tip = String((await res.text()) || '').slice(0, 200); } catch (e) {}
+    return { ok: false, status: res.status, retryAfter: 0, error: tip || ('http_' + res.status) };
+  }
+});
+
+// ---- 统一发送入口：入参为 notify_channels 的一行（或等价对象），config 支持对象或 JSON 字符串 ----
+async function sendViaChannel(channel, payload) {
+  const out = { ok: false, status: 0, retryAfter: 0, error: '', provider: '', channel_id: '', channel_type: '' };
+  if (!channel) { out.error = 'missing_channel'; return out; }
+  out.channel_id = String(channel.id || '');
+  out.channel_type = String(channel.type || '');
+  if (channel.enabled === 0 || channel.enabled === '0' || channel.enabled === false) { out.error = 'channel_disabled'; return out; }
+  const provider = notifyGetProvider(channel.type);
+  if (!provider) { out.error = 'provider_not_found:' + String(channel.type || ''); return out; }
+  out.provider = provider.id || provider.type;
+  const cfg = notifyNormalizeConfig(channel.config);
+  const v = provider.validate(cfg);
+  if (!v || v.ok !== true) { out.error = (v && v.error) || 'config_invalid'; return out; }
+  let r;
+  try { r = await provider.send(payload || {}, cfg); } catch (e) { return Object.assign(out, notifyFail((e && e.message) || e)); }
+  out.ok = !!(r && r.ok);
+  out.status = (r && r.status) || 0;
+  out.retryAfter = (r && r.retryAfter) || 0;
+  out.error = (r && r.error) || '';
+  return out;
+}
+// 按通道 ID 从 notify_channels 读取配置后发送（DB 行 → sendViaChannel）
+async function sendViaChannelId(env, channelId, payload) {
   try {
-    const cfg = {};
-    try { const { results } = await env.DB.prepare('SELECT * FROM settings').all(); if (results) results.forEach(r => cfg[r.key] = r.value); } catch (e) {}
-    if (cfg.tg_notify !== 'true' || !cfg.tg_bot_token || !cfg.tg_chat_id) return;
-    const lastRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_alert_check_at'").first();
-    const lastAt = lastRow ? parseInt(lastRow.value || '0', 10) : 0;
-    if (Date.now() - lastAt < 30000) return;
-    const { results: servers } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
-    if (!servers || servers.length === 0) return;
-    let alertState = {};
-    const stateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
-    if (stateRow) { try { alertState = JSON.parse(stateRow.value) || {}; } catch (e) {} }
-    let changed = false;
-    const now = Date.now();
-    const thresMs = parseInt(cfg.alert_threshold || '120', 10) * 1000;
-    const send = async (msg) => {
-      try {
-        await fetch(`https://api.telegram.org/bot${cfg.tg_bot_token}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: cfg.tg_chat_id, text: msg, parse_mode: 'HTML' }),
-          signal: AbortSignal.timeout(10000)
-        });
-      } catch (e) {}
+    const row = await env.DB.prepare('SELECT id, type, name, config, enabled FROM notify_channels WHERE id = ?').bind(String(channelId)).first();
+    if (!row) return { ok: false, status: 0, retryAfter: 0, error: 'channel_not_found', provider: '', channel_id: String(channelId), channel_type: '' };
+    return await sendViaChannel(row, payload);
+  } catch (e) { return notifyFail((e && e.message) || e); }
+}
+// 解析当前生效的 Telegram 通道：优先 notify_channels 中启用的 telegram 通道（默认通道优先），
+// 通道缺失或配置不完整时回退旧 settings（tg_bot_token / tg_chat_id）映射
+async function notifyResolveTelegramChannel(env, settings) {
+  try {
+    const { results } = await env.DB.prepare("SELECT id, type, name, config, enabled FROM notify_channels WHERE type = 'telegram' AND enabled = 1 ORDER BY created_at ASC").all();
+    if (results && results.length) {
+      const pick = results.find(r => r.id === 'ch_telegram_default') || results[0];
+      const cfg = notifyNormalizeConfig(pick.config);
+      if (cfg.bot_token && cfg.chat_id) return pick;
+    }
+  } catch (e) {}
+  return buildLegacyTelegramChannel(settings);
+}
+// 把旧 settings（tg_bot_token / tg_chat_id）映射为通道对象，供后续步骤接棒时复用
+function buildLegacyTelegramChannel(settings) {
+  const s = settings || {};
+  const cfg = {};
+  if (s.tg_bot_token) cfg.bot_token = s.tg_bot_token;
+  if (s.tg_chat_id) cfg.chat_id = s.tg_chat_id;
+  cfg.parse_mode = 'HTML';
+  return { id: 'ch_telegram_default', type: 'telegram', name: '默认 Telegram 通道', config: cfg, enabled: 1, legacy: true };
+}
+// ===== 通知中心多通道引擎 END =====
+
+// ===== 通知规则引擎（通知重构第3步A-1：纯函数骨架 + offline / recover 两类基础规则，无副作用、不发送） =====
+// 入口：evaluateNotifyRules(rules, servers, state, now) -> events[]
+//   rules   : notify_rules 行数组 {id,name,enabled,type,scope,params,severity,cooldown,silent_window,recover_notify}
+//   servers : 节点数组 {id,name,group,tags,last_updated,...}
+//   state   : 状态表快照 { "<rule_id>::<server_id>": {state,since,last_notified_at,fire_count} }
+//   now     : 当前时间戳(ms)
+// 约定：不读写外部资源、不修改入参；需要落库的变更以 state_op 挂在事件上（collectNotifyStateOps 折叠）；
+//       仅 deliverable === true 的事件需要发送，其余为抑制/清理事件。
+const NOTIFY_SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
+const NOTIFY_OFFLINE_DEFAULT_THRESHOLD = 120;
+const NOTIFY_TRAFFIC_DEFAULT_THRESHOLD = 90;
+const NOTIFY_EXPIRE_DEFAULT_DAYS = 7;
+function notifyStateKey(ruleId, serverId) { return String(ruleId) + '::' + String(serverId); }
+function notifyToNum(v) { if (v === null || v === undefined || v === '') return null; const n = (typeof v === 'number') ? v : parseFloat(v); return isNaN(n) ? null : n; }
+function notifyTruthy(v) { return v === true || v === 1 || v === '1' || v === 'true'; }
+function notifySeverityRank(sev) { const r = NOTIFY_SEVERITY_RANK[String(sev || 'warning')]; return (r === undefined) ? 1 : r; }
+// scope 匹配：{all, groups[], ids[], tags[]}，三类列表皆空或 all!==false 视为全量
+function notifyMatchScope(scope, server) {
+  const s = (scope && typeof scope === 'object') ? scope : (notifyNormalizeConfig(scope) || {});
+  if (s.all === false) return false;
+  const groups = Array.isArray(s.groups) ? s.groups.map(String) : [];
+  const ids = Array.isArray(s.ids) ? s.ids.map(String) : [];
+  const tags = Array.isArray(s.tags) ? s.tags.map(String) : [];
+  if (!groups.length && !ids.length && !tags.length) return true;
+  const sv = server || {};
+  if (ids.indexOf(String(sv.id)) !== -1) return true;
+  if (groups.length && groups.indexOf(String(sv.group || '')) !== -1) return true;
+  const stags = Array.isArray(sv.tags) ? sv.tags.map(String) : [];
+  for (const t of tags) { if (stags.indexOf(t) !== -1) return true; }
+  return false;
+}
+// 免打扰时段：'22:00-08:00' / 多段以 , 或 ; 分隔；空/off/none 表示关闭；按中国上海时区判定
+function notifyShanghaiMinutes(now) {
+  try {
+    const t = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(now));
+    const p = String(t).split(':');
+    return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+  } catch (e) { const d = new Date(now + 8 * 3600 * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes(); }
+}
+function notifySilentWindowActive(spec, now) {
+  const s = String(spec === null || spec === undefined ? '' : spec).trim().toLowerCase();
+  if (!s || s === 'off' || s === 'none' || s === '0' || s === 'false') return false;
+  const mins = notifyShanghaiMinutes(now);
+  for (const tok of s.split(/[,;]/)) {
+    const m = String(tok).trim().match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    if (!m) continue;
+    const a = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    const b = parseInt(m[3], 10) * 60 + parseInt(m[4], 10);
+    if (a === b) return true;
+    if (a < b) { if (mins >= a && mins < b) return true; }
+    else { if (mins >= a || mins < b) return true; }
+  }
+  return false;
+}
+function notifyEventTime(now) { return new Date(now).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }); }
+function notifyOfflineThresholdMs(rule) {
+  const p = notifyNormalizeConfig((rule || {}).params);
+  const thr = notifyToNum(p.threshold);
+  const extra = notifyToNum(p.forDuration === undefined ? p.for_duration : p.forDuration) || 0;
+  const base = (thr === null || thr < 0) ? NOTIFY_OFFLINE_DEFAULT_THRESHOLD : thr;
+  return { baseMs: base * 1000, forMs: extra * 1000, thresholdSec: base, forDurationSec: extra };
+}
+function notifyCollectStateOps(events) {
+  const patch = { upsert: [], remove: [] };
+  const list = Array.isArray(events) ? events : [];
+  for (const ev of list) {
+    const op = ev && ev.state_op;
+    if (!op) continue;
+    if (op.op === 'delete') patch.remove.push({ rule_id: op.rule_id, server_id: op.server_id, key: op.key });
+    else if (op.op === 'upsert') patch.upsert.push(op.row);
+  }
+  return patch;
+}
+// 事件构造骨架
+function notifyBuildEvent(rule, over) {
+  return Object.assign({
+    rule_id: String((rule || {}).id || ''), rule_name: String((rule || {}).name || ''), rule_type: String((rule || {}).type || ''),
+    kind: 'fire', deliverable: false, suppressed_by: null,
+    severity: String((rule || {}).severity || 'warning'), severity_rank: notifySeverityRank((rule || {}).severity),
+    server_id: null, server_name: '', group: '',
+    title: '', text: '', html: '', metrics: null, state_op: null, dedupe_key: '', at: 0
+  }, over || {});
+}
+// metric 规则辅助：指标字段映射 / 阈值解析 / 取值与比较（复用骨架既有语义）
+const NOTIFY_METRIC_FIELDS = {
+  cpu: { key: 'cpu', field: 'cpu', label: 'CPU 使用率', unit: '%' },
+  ram: { key: 'ram', field: 'ram', label: '内存使用率', unit: '%' },
+  disk: { key: 'disk', field: 'disk', label: '磁盘使用率', unit: '%' },
+  load: { key: 'load', field: 'load_avg', label: '系统负载', unit: '' }
+};
+function notifyMetricField(metric) {
+  const k = String(metric === null || metric === undefined ? '' : metric).trim().toLowerCase();
+  return NOTIFY_METRIC_FIELDS[k] || null;
+}
+function notifyMetricSpec(rule, meta) {
+  const p = notifyNormalizeConfig((rule || {}).params);
+  const thr = notifyToNum(p.threshold);
+  const forRaw = (p.forDuration === undefined ? p.for_duration : p.forDuration);
+  const extra = notifyToNum(forRaw) || 0;
+  const clearRaw = (p.clear_threshold === undefined ? p.clearThreshold : p.clear_threshold);
+  const clearNum = notifyToNum(clearRaw);
+  // 未显式给出恢复阈值时，回退为与触发阈值同值（靠 forDuration 与去抖动阈值分离实现防抖）
+  const clear = (clearNum === null) ? thr : clearNum;
+  return {
+    metric: meta ? meta.key : null, label: meta ? meta.label : '', unit: meta ? meta.unit : '',
+    threshold: thr, clearThreshold: clear, forMs: extra * 1000, forDurationSec: extra,
+    hasThreshold: thr !== null
+  };
+}
+function notifyMetricValue(server, meta) {
+  if (!server || !meta) return null;
+  return notifyToNum(server[meta.field]);
+}
+function notifyMetricBreached(value, spec) {
+  if (!spec || !spec.hasThreshold || value === null) return false;
+  return value > spec.threshold;
+}
+function notifyMetricCleared(value, spec) {
+  if (!spec || spec.clearThreshold === null || value === null) return false;
+  return value <= spec.clearThreshold;
+}
+function notifyMetricEventText(server, meta, spec, value, kind, nowMs) {
+  const name = String((server || {}).name || '');
+  const label = meta ? meta.label : '指标';
+  const unit = meta ? meta.unit : '';
+  const cur = (value === null || value === undefined) ? '-' : (value + unit);
+  const thr = (spec && spec.threshold !== null && spec.threshold !== undefined) ? (spec.threshold + unit) : '-';
+  const cthr = (spec && spec.clearThreshold !== null && spec.clearThreshold !== undefined) ? (spec.clearThreshold + unit) : '-';
+  const time = notifyEventTime(nowMs);
+  const isRec = (kind === 'recover' || kind === 'clear');
+  const isPend = (kind === 'pending');
+  const title = isRec ? '指标恢复通知' : (isPend ? '指标待确认' : '指标告警');
+  const stateLabel = isRec ? '已回落' : (isPend ? '超阈值待确认' : '超阈值');
+  const limitLabel = isRec ? '恢复阈值' : '触发阈值';
+  const limitVal = isRec ? cthr : thr;
+  const icon = isRec ? '✅' : '⚠️';
+  const plain = title + '\n\n节点名称: ' + name + '\n状态: ' + label + ' ' + stateLabel + '\n当前值: ' + cur + '\n' + limitLabel + ': ' + limitVal + '\n时间: ' + time;
+  const html = icon + ' <b>' + title + '</b>\n\n<b>节点名称:</b> ' + tgEsc(name) + '\n<b>状态:</b> ' + label + ' ' + stateLabel + '\n<b>当前值:</b> ' + cur + '\n<b>' + limitLabel + ':</b> ' + limitVal + '\n<b>时间:</b> ' + time;
+  return { title: title, text: plain, html: html };
+}
+// traffic_ratio / expire_days 规则辅助：字节解析与格式化 / 阈值解析 / 到期日解析 / 事件文案
+const NOTIFY_BYTES_UNITS = { b: 1, kb: 1024, mb: 1048576, gb: 1073741824, tb: 1099511627776, pb: 1125899906842624 };
+function notifyParseBytes(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return (isFinite(v) && v > 0) ? v : null;
+  const str = String(v).trim();
+  if (!str) return null;
+  const m = str.match(/^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)$/);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  if (!isFinite(num) || num <= 0) return null;
+  const u = String(m[2] || '').trim().toLowerCase();
+  if (!u) return num;
+  const alias = { k: 'kb', kb: 'kb', m: 'mb', mb: 'mb', g: 'gb', gb: 'gb', t: 'tb', tb: 'tb', p: 'pb', pb: 'pb', b: 'b', byte: 'b', bytes: 'b' };
+  const key = alias[u];
+  return (key && NOTIFY_BYTES_UNITS[key]) ? num * NOTIFY_BYTES_UNITS[key] : null;
+}
+function notifyFormatBytes(v) {
+  if (v === null || v === undefined || !isFinite(v)) return '-';
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let n = Number(v), i = 0;
+  while (n >= 1024 && i < sizes.length - 1) { n = n / 1024; i++; }
+  return (i === 0 ? Math.round(n) : Math.round(n * 100) / 100) + ' ' + sizes[i];
+}
+function notifyRatioSpec(rule) {
+  const p = notifyNormalizeConfig((rule || {}).params);
+  let thr = notifyToNum(p.threshold);
+  if (thr === null) thr = NOTIFY_TRAFFIC_DEFAULT_THRESHOLD;
+  if (thr > 0 && thr <= 1) thr = thr * 100; // 兼容 0.8 形式的比例写法
+  const clearRaw = (p.clear_threshold === undefined ? p.clearThreshold : p.clear_threshold);
+  let clear = notifyToNum(clearRaw);
+  if (clear === null) clear = thr;
+  else if (clear > 0 && clear <= 1) clear = clear * 100;
+  return { threshold: thr, clearThreshold: clear };
+}
+function notifyTrafficUsed(server) {
+  const rx = notifyToNum(server ? server.monthly_rx : null);
+  const tx = notifyToNum(server ? server.monthly_tx : null);
+  if (rx === null && tx === null) return null;
+  return (rx || 0) + (tx || 0);
+}
+function notifyParseDateMs(v) {
+  const str = String(v === null || v === undefined ? '' : v).trim();
+  if (!str) return null;
+  const m = str.match(/(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (m) {
+    const t = Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+    return isNaN(t) ? null : t;
+  }
+  const t2 = new Date(str).getTime();
+  return isNaN(t2) ? null : t2;
+}
+function notifyExpireSpec(rule) {
+  const p = notifyNormalizeConfig((rule || {}).params);
+  const thr = notifyToNum(p.threshold);
+  const clearRaw = (p.clear_threshold === undefined ? p.clearThreshold : p.clear_threshold);
+  const clearNum = notifyToNum(clearRaw);
+  const base = (thr === null || thr < 0) ? NOTIFY_EXPIRE_DEFAULT_DAYS : thr;
+  return { threshold: base, clearThreshold: (clearNum === null) ? base : clearNum };
+}
+function notifyTrafficEventText(server, spec, metrics, kind, nowMs) {
+  const name = String((server || {}).name || '');
+  const isRec = (kind === 'recover' || kind === 'clear');
+  const title = isRec ? '流量恢复通知' : '流量告警';
+  const icon = isRec ? '✅' : '⚠️';
+  const used = notifyFormatBytes(metrics ? metrics.used_bytes : null);
+  const limit = notifyFormatBytes(metrics ? metrics.limit_bytes : null);
+  const rp = (metrics && metrics.ratio_percent !== null && metrics.ratio_percent !== undefined) ? (Math.round(metrics.ratio_percent * 10) / 10 + '%') : '-';
+  const limitLabel = isRec ? '恢复阈值' : '告警阈值';
+  const limitVal = (isRec ? spec.clearThreshold : spec.threshold) + '%';
+  const stateLabel = isRec ? '已回落' : '用量超阈值';
+  const time = notifyEventTime(nowMs);
+  const plain = title + '\n\n节点名称: ' + name + '\n状态: 月流量 ' + stateLabel + '\n已用流量: ' + used + ' / ' + limit + '\n当前占比: ' + rp + '\n' + limitLabel + ': ' + limitVal + '\n时间: ' + time;
+  const html = icon + ' <b>' + title + '</b>\n\n<b>节点名称:</b> ' + tgEsc(name) + '\n<b>状态:</b> 月流量 ' + stateLabel + '\n<b>已用流量:</b> ' + used + ' / ' + limit + '\n<b>当前占比:</b> ' + rp + '\n<b>' + limitLabel + ':</b> ' + limitVal + '\n<b>时间:</b> ' + time;
+  return { title: title, text: plain, html: html };
+}
+function notifyExpireEventText(server, spec, metrics, kind, nowMs) {
+  const name = String((server || {}).name || '');
+  const isRec = (kind === 'recover' || kind === 'clear');
+  const title = isRec ? '到期提醒解除' : '到期提醒';
+  const icon = isRec ? '✅' : '⚠️';
+  const days = (metrics && metrics.days_left !== null && metrics.days_left !== undefined) ? metrics.days_left : null;
+  const dayText = (days === null) ? '-' : (days < 0 ? ('已过期 ' + Math.abs(days) + ' 天') : (days + ' 天'));
+  const limitLabel = isRec ? '解除阈值' : '提醒阈值';
+  const limitVal = (isRec ? spec.clearThreshold : spec.threshold) + ' 天';
+  const stateLabel = isRec ? '已解除' : '临近到期';
+  const expText = String((server || {}).expire_date || '-');
+  const time = notifyEventTime(nowMs);
+  const plain = title + '\n\n节点名称: ' + name + '\n状态: ' + stateLabel + '\n到期日期: ' + expText + '\n剩余时间: ' + dayText + '\n' + limitLabel + ': ' + limitVal + '\n时间: ' + time;
+  const html = icon + ' <b>' + title + '</b>\n\n<b>节点名称:</b> ' + tgEsc(name) + '\n<b>状态:</b> ' + stateLabel + '\n<b>到期日期:</b> ' + tgEsc(expText) + '\n<b>剩余时间:</b> ' + dayText + '\n<b>' + limitLabel + ':</b> ' + limitVal + '\n<b>时间:</b> ' + time;
+  return { title: title, text: plain, html: html };
+}
+function evaluateNotifyRules(rules, servers, state, now) {
+  const nowMs = notifyToNum(now) === null ? Date.now() : notifyToNum(now);
+  const ruleList = (Array.isArray(rules) ? rules : []).filter(r => r && r.enabled !== 0 && r.enabled !== '0' && r.enabled !== false);
+  const serverList = Array.isArray(servers) ? servers : [];
+  const stateMap = (state && typeof state === 'object' && !Array.isArray(state)) ? state : {};
+  const readState = (ruleId, serverId) => { const v = stateMap[notifyStateKey(ruleId, serverId)]; return (v && typeof v === 'object') ? v : null; };
+  const byId = new Map();
+  for (const r of ruleList) byId.set(String(r.id), r);
+  // recover 规则最后处理（需先收集归属规则已产出的恢复事件）
+  const ordered = ruleList.slice().sort((a, b) => (String(a.type) === 'recover' ? 1 : 0) - (String(b.type) === 'recover' ? 1 : 0));
+  const events = [];
+  const ownerRecovered = new Set();
+  for (const rule of ordered) {
+    const type = String(rule.type || '');
+    if (type !== 'offline' && type !== 'recover' && type !== 'metric' && type !== 'traffic_ratio' && type !== 'expire_days') continue;
+    const scope = notifyNormalizeConfig(rule.scope);
+    const cooldownSec = notifyToNum(rule.cooldown) || 0;
+    const silentSpec = rule.silent_window;
+    const silentNow = notifySilentWindowActive(silentSpec, nowMs);
+    const recoverNotify = notifyTruthy(rule.recover_notify);
+    const matched = serverList.filter(s => notifyMatchScope(scope, s));
+    const emit = (server, kind, metrics, action) => {
+      const sid = String(server.id);
+      const isRecover = (kind === 'recover');
+      const plain = isRecover
+        ? `节点恢复通知\n\n节点名称: ${server.name}\n状态: 恢复在线\n时间: ${notifyEventTime(nowMs)}`
+        : `节点离线告警\n\n节点名称: ${server.name}\n状态: 离线 (超过判定阈值未上报)\n时间: ${notifyEventTime(nowMs)}`;
+      const html = isRecover
+        ? `✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${tgEsc(server.name)}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${notifyEventTime(nowMs)}`
+        : `⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${tgEsc(server.name)}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${notifyEventTime(nowMs)}`;
+      events.push(notifyBuildEvent(rule, {
+        kind, deliverable: false, server_id: sid, server_name: String(server.name || ''), group: String(server.group || ''),
+        title: isRecover ? '节点恢复通知' : '节点离线告警', text: plain, html,
+        metrics: metrics || null, state_op: action || null,
+        dedupe_key: [String(rule.id), sid, kind].join('::'), at: nowMs
+      }));
+      return events[events.length - 1];
     };
-    for (const s of servers) {
-      const diff = now - s.last_updated;
-      const isOffline = diff > thresMs;
-      if (isOffline && !alertState[s.id]) {
-        await send(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${tgEsc(s.name)}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-        alertState[s.id] = true; changed = true;
-      } else if (!isOffline && alertState[s.id]) {
-        await send(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${tgEsc(s.name)}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-        delete alertState[s.id]; changed = true;
+    const gateFire = (ev, prev, fireCount, since) => {
+      const sid2 = String(ev.server_id);
+      if (cooldownSec > 0 && prev && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) {
+        ev.deliverable = false; ev.suppressed_by = 'cooldown';
+        ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid2, state: 'firing', since: since, last_notified_at: notifyToNum(prev.last_notified_at), fire_count: fireCount } };
+      } else if (silentNow) {
+        ev.deliverable = false; ev.suppressed_by = 'silent_window';
+        ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid2, state: 'firing', since: since, last_notified_at: notifyToNum(prev && prev.last_notified_at) || 0, fire_count: fireCount } };
+      } else ev.deliverable = true;
+      return ev;
+    };
+    const gateRecover = (ev, prev) => {
+      if (!recoverNotify) return ev;
+      ownerRecovered.add(notifyStateKey(rule.id, String(ev.server_id)));
+      if (silentNow) { ev.deliverable = false; ev.suppressed_by = 'silent_window'; }
+      else if (cooldownSec > 0 && prev && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) { ev.deliverable = false; ev.suppressed_by = 'cooldown'; }
+      else ev.deliverable = true;
+      return ev;
+    };
+    if (type === 'offline') {
+      const thr = notifyOfflineThresholdMs(rule);
+      for (const s of matched) {
+        const sid = String(s.id);
+        const last = notifyToNum(s.last_updated);
+        const stale = (last === null) ? null : (nowMs - last);
+        const isOffline = (stale === null) ? false : (stale > thr.baseMs + thr.forMs);
+        const prev = readState(rule.id, sid);
+        const firing = !!(prev && prev.state === 'firing');
+        const metrics = { stale_ms: stale, threshold_sec: thr.thresholdSec, for_duration_sec: thr.forDurationSec, last_updated: last };
+        if (isOffline && !firing) {
+          const since = (prev && notifyToNum(prev.since)) || nowMs;
+          const fireCount = ((prev && notifyToNum(prev.fire_count)) || 0) + 1;
+          const ev = emit(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since, last_notified_at: nowMs, fire_count: fireCount } });
+          if (cooldownSec > 0 && prev && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) {
+            ev.deliverable = false; ev.suppressed_by = 'cooldown';
+            ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since, last_notified_at: notifyToNum(prev.last_notified_at), fire_count: fireCount } };
+          } else if (silentNow) {
+            ev.deliverable = false; ev.suppressed_by = 'silent_window';
+            ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since, last_notified_at: notifyToNum(prev && prev.last_notified_at) || 0, fire_count: fireCount } };
+          } else ev.deliverable = true;
+        } else if (!isOffline && firing) {
+          const ev = emit(s, recoverNotify ? 'recover' : 'clear', metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) });
+          if (recoverNotify) {
+            ownerRecovered.add(notifyStateKey(rule.id, sid));
+            if (silentNow) { ev.deliverable = false; ev.suppressed_by = 'silent_window'; }
+            else if (cooldownSec > 0 && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) { ev.deliverable = false; ev.suppressed_by = 'cooldown'; }
+            else ev.deliverable = true;
+          }
+        }
+      }
+    } else if (type === 'recover') {
+      // 兜底恢复：仅对“归属规则未在本轮产出恢复事件”的 firing 状态补发
+      const thrSecDefault = NOTIFY_OFFLINE_DEFAULT_THRESHOLD;
+      for (const key of Object.keys(stateMap)) {
+        const row = stateMap[key];
+        if (!row || typeof row !== 'object' || row.state !== 'firing') continue;
+        const ownerId = String(row.rule_id || String(key).split('::')[0]);
+        const ownerRule = byId.get(ownerId);
+        // 守卫：兜底恢复仅处理 owner 规则类型为 offline 的 firing 状态，避免误清除 metric / traffic_ratio / expire_days 等规则的状态
+        if (ownerRule) {
+          if (String(ownerRule.type) !== 'offline') continue;
+          if (notifyTruthy(ownerRule.recover_notify)) continue;
+        }
+        if (ownerRecovered.has(notifyStateKey(ownerId, String(row.server_id || String(key).split('::')[1])))) continue;
+        const sid = String(row.server_id || String(key).split('::')[1]);
+        const s = serverList.find(x => String(x.id) === sid);
+        if (!s || !notifyMatchScope(scope, s)) continue;
+        const last = notifyToNum(s.last_updated);
+        const stale = (last === null) ? null : (nowMs - last);
+        let limitSec = thrSecDefault;
+        if (ownerRule) limitSec = notifyOfflineThresholdMs(ownerRule).thresholdSec;
+        if (stale !== null && stale <= limitSec * 1000) {
+          const ev = emit(s, 'recover', { stale_ms: stale, threshold_sec: limitSec }, { op: 'delete', rule_id: ownerId, server_id: sid, key: notifyStateKey(ownerId, sid) });
+          if (silentNow) { ev.deliverable = false; ev.suppressed_by = 'silent_window'; }
+          else if (cooldownSec > 0 && notifyToNum(row.last_notified_at) !== null && (nowMs - notifyToNum(row.last_notified_at)) < cooldownSec * 1000) { ev.deliverable = false; ev.suppressed_by = 'cooldown'; }
+          else ev.deliverable = true;
+        }
+      }
+    } else if (type === 'metric') {
+      const rawMetric = (rule.metric === undefined || rule.metric === null || rule.metric === '') ? rule.metric_name : rule.metric;
+      const meta = notifyMetricField(rawMetric);
+      if (meta) {
+        const spec = notifyMetricSpec(rule, meta);
+        const emitMetric = (server, kind, metrics, action) => {
+          const ev = emit(server, kind, metrics, action);
+          const tx = notifyMetricEventText(server, meta, spec, metrics ? metrics.value : null, kind, nowMs);
+          ev.title = tx.title; ev.text = tx.text; ev.html = tx.html;
+          return ev;
+        };
+        for (const s of matched) {
+          const sid = String(s.id);
+          const value = notifyMetricValue(s, meta);
+          const breached = notifyMetricBreached(value, spec);
+          const cleared = notifyMetricCleared(value, spec);
+          const prev = readState(rule.id, sid);
+          const st = prev ? String(prev.state || '') : '';
+          const metrics = {
+            metric: spec.metric, metric_label: spec.label, unit: spec.unit, value: value,
+            threshold: spec.threshold, clear_threshold: spec.clearThreshold, for_duration_sec: spec.forDurationSec
+          };
+          if (st === 'firing') {
+            if (cleared) {
+              const ev = emitMetric(s, recoverNotify ? 'recover' : 'clear', metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) });
+              if (recoverNotify) {
+                ownerRecovered.add(notifyStateKey(rule.id, sid));
+                if (silentNow) { ev.deliverable = false; ev.suppressed_by = 'silent_window'; }
+                else if (cooldownSec > 0 && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) { ev.deliverable = false; ev.suppressed_by = 'cooldown'; }
+                else ev.deliverable = true;
+              }
+            }
+          } else if (st === 'pending') {
+            const since = (notifyToNum(prev.since) === null) ? nowMs : notifyToNum(prev.since);
+            if (!breached) {
+              emitMetric(s, 'clear', metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) });
+            } else if (nowMs - since >= spec.forMs) {
+              const fireCount = (notifyToNum(prev.fire_count) || 0) + 1;
+              const ev = emitMetric(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: since, last_notified_at: nowMs, fire_count: fireCount } });
+              if (cooldownSec > 0 && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) {
+                ev.deliverable = false; ev.suppressed_by = 'cooldown';
+                ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: since, last_notified_at: notifyToNum(prev.last_notified_at), fire_count: fireCount } };
+              } else if (silentNow) {
+                ev.deliverable = false; ev.suppressed_by = 'silent_window';
+                ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: since, last_notified_at: notifyToNum(prev.last_notified_at) || 0, fire_count: fireCount } };
+              } else ev.deliverable = true;
+            }
+          } else if (breached) {
+            if (spec.forMs <= 0) {
+              const fireCount = (notifyToNum(prev && prev.fire_count) || 0) + 1;
+              const ev = emitMetric(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: nowMs, last_notified_at: nowMs, fire_count: fireCount } });
+              if (cooldownSec > 0 && prev && notifyToNum(prev.last_notified_at) !== null && (nowMs - notifyToNum(prev.last_notified_at)) < cooldownSec * 1000) {
+                ev.deliverable = false; ev.suppressed_by = 'cooldown';
+                ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: nowMs, last_notified_at: notifyToNum(prev.last_notified_at), fire_count: fireCount } };
+              } else if (silentNow) {
+                ev.deliverable = false; ev.suppressed_by = 'silent_window';
+                ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: nowMs, last_notified_at: notifyToNum(prev && prev.last_notified_at) || 0, fire_count: fireCount } };
+              } else ev.deliverable = true;
+            } else {
+              emitMetric(s, 'pending', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'pending', since: nowMs, last_notified_at: notifyToNum(prev && prev.last_notified_at) || 0, fire_count: notifyToNum(prev && prev.fire_count) || 0 } });
+            }
+          }
+        }
+      }
+    } else if (type === 'traffic_ratio') {
+      const rSpec = notifyRatioSpec(rule);
+      const emitWith = (server, kind, metrics, action, tx) => {
+        const ev = emit(server, kind, metrics, action);
+        ev.title = tx.title; ev.text = tx.text; ev.html = tx.html;
+        return ev;
+      };
+      for (const s of matched) {
+        const sid = String(s.id);
+        const used = notifyTrafficUsed(s);
+        const limit = notifyParseBytes(s.traffic_limit);
+        if (used === null || limit === null) continue;
+        const ratio = used / limit * 100;
+        const breached = (ratio >= rSpec.threshold);
+        const cleared = (ratio <= rSpec.clearThreshold);
+        const prev = readState(rule.id, sid);
+        const st = prev ? String(prev.state || '') : '';
+        const metrics = { used_bytes: used, limit_bytes: limit, ratio_percent: ratio, threshold: rSpec.threshold, clear_threshold: rSpec.clearThreshold, traffic_limit: String(s.traffic_limit || '') };
+        if (st === 'firing') {
+          if (cleared) {
+            const rk = recoverNotify ? 'recover' : 'clear';
+            const ev = emitWith(s, rk, metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) }, notifyTrafficEventText(s, rSpec, metrics, rk, nowMs));
+            gateRecover(ev, prev);
+          }
+        } else if (breached) {
+          const fireCount = (notifyToNum(prev && prev.fire_count) || 0) + 1;
+          const ev = emitWith(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: nowMs, last_notified_at: nowMs, fire_count: fireCount } }, notifyTrafficEventText(s, rSpec, metrics, 'fire', nowMs));
+          gateFire(ev, prev, fireCount, nowMs);
+        }
+      }
+    } else if (type === 'expire_days') {
+      const eSpec = notifyExpireSpec(rule);
+      const emitWith = (server, kind, metrics, action, tx) => {
+        const ev = emit(server, kind, metrics, action);
+        ev.title = tx.title; ev.text = tx.text; ev.html = tx.html;
+        return ev;
+      };
+      for (const s of matched) {
+        const sid = String(s.id);
+        const expMs = notifyParseDateMs(s.expire_date);
+        if (expMs === null) continue;
+        const daysLeft = Math.ceil((expMs - nowMs) / 86400000);
+        const breached = (daysLeft <= eSpec.threshold);
+        const cleared = (daysLeft > eSpec.clearThreshold);
+        const prev = readState(rule.id, sid);
+        const st = prev ? String(prev.state || '') : '';
+        const metrics = { days_left: daysLeft, expire_ms: expMs, expire_date: String(s.expire_date || ''), threshold: eSpec.threshold, clear_threshold: eSpec.clearThreshold };
+        if (st === 'firing') {
+          if (cleared) {
+            const rk = recoverNotify ? 'recover' : 'clear';
+            const ev = emitWith(s, rk, metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) }, notifyExpireEventText(s, eSpec, metrics, rk, nowMs));
+            gateRecover(ev, prev);
+          }
+        } else if (breached) {
+          const fireCount = (notifyToNum(prev && prev.fire_count) || 0) + 1;
+          const ev = emitWith(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: nowMs, last_notified_at: nowMs, fire_count: fireCount } }, notifyExpireEventText(s, eSpec, metrics, 'fire', nowMs));
+          gateFire(ev, prev, fireCount, nowMs);
+        }
       }
     }
-    if (changed) await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
-    await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("last_alert_check_at", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(String(now)).run();
+  }
+  events.sort((a, b) => (a.severity_rank - b.severity_rank) || String(a.rule_id).localeCompare(String(b.rule_id)) || String(a.server_id).localeCompare(String(b.server_id)) || String(a.kind).localeCompare(String(b.kind)));
+  return events;
+}
+// ===== 通知规则引擎骨架 END =====
+// ===== 通知运行时数据存取层（通知重构第3步B-1：纯新增，不接管现有调用链） =====
+// 职责：把 notify_channels / notify_rules / notify_bindings / alert_state / notify_log / notify_queue 的读写
+//       收敛为少量 helper，供后续步骤（runNotifyCycle 等）接棒；本轮只提供函数，不修改任何既有调用链。
+// 契约：
+//   loadNotifyConfig(env)          -> { channels[], channelsById{}, rules[], rulesById{}, bindings{}, channelsByRule{}, loaded_at }
+//   loadAlertState(env, {ruleIds}) -> { "<rule_id>::<server_id>": {state,since,last_notified_at,fire_count} }（键与 notifyStateKey 对齐）
+//   applyStateOps(env, ops|events) -> { upserted, deleted, failed, errors[] }（upsert 走 ON CONFLICT，delete 走精确主键）
+//   notifyLogWrite(env, entry)     -> { ok, id, inserted, error }
+//   notifyQueueEnqueue(env, item)  -> { ok, id, error }
+const NOTIFY_DB_BATCH_LIMIT = 40; // 单次 D1 batch 语句数上限保护
+function notifyNewId(prefix) {
+  const hasUuid = (typeof crypto !== 'undefined' && crypto && typeof crypto.randomUUID === 'function');
+  const rnd = hasUuid ? crypto.randomUUID().replace(/-/g, '') : (Date.now().toString(16) + Math.random().toString(16).slice(2));
+  return String(prefix || 'nf') + '_' + rnd.slice(0, 24);
+}
+function notifyChunkList(list, size) {
+  const arr = Array.isArray(list) ? list : [];
+  const n = Math.max(1, parseInt(size, 10) || NOTIFY_DB_BATCH_LIMIT);
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+// 通道行 → 归一对象（config 就地 JSON 解析）
+function notifyNormalizeChannelRow(row) {
+  const c = row || {};
+  return {
+    id: String(c.id || ''), type: String(c.type || ''), name: String(c.name || ''),
+    config: notifyNormalizeConfig(c.config), enabled: notifyTruthy(c.enabled) ? 1 : 0,
+    created_at: notifyToNum(c.created_at) || 0
+  };
+}
+// 规则行 → 归一对象（scope/params 就地 JSON 解析，数值/布尔归一，可直接交给 evaluateNotifyRules）
+function notifyNormalizeRuleRow(row) {
+  const r = row || {};
+  return {
+    id: String(r.id || ''), name: String(r.name || ''), enabled: notifyTruthy(r.enabled) ? 1 : 0,
+    type: String(r.type || 'offline'), scope: notifyNormalizeConfig(r.scope), params: notifyNormalizeConfig(r.params),
+    severity: String(r.severity || 'warning'), cooldown: notifyToNum(r.cooldown) || 0,
+    silent_window: String(r.silent_window || ''), digest: String(r.digest || 'off'),
+    recover_notify: notifyTruthy(r.recover_notify) ? 1 : 0, created_at: notifyToNum(r.created_at) || 0,
+    // 指标类规则的目标指标：优先行字段，其次 params.metric（供 evaluateNotifyRules 的 metric 分支解析）
+    metric: String(r.metric || r.metric_name || notifyNormalizeConfig(r.params).metric || '')
+  };
+}
+// ① 一次性加载通道 / 规则 / 订阅关系（按 enabled 过滤；bindings 只保留“启用规则 × 启用通道”的有效订阅）
+async function loadNotifyConfig(env) {
+  const out = { channels: [], channelsById: {}, rules: [], rulesById: {}, bindings: {}, channelsByRule: {}, loaded_at: Date.now() };
+  if (!env || !env.DB) return out;
+  try {
+    const chRes = await env.DB.prepare('SELECT id, type, name, config, enabled, created_at FROM notify_channels ORDER BY created_at ASC').all();
+    for (const row of (chRes && chRes.results) || []) {
+      const c = notifyNormalizeChannelRow(row);
+      if (!c.id || !c.enabled) continue;
+      out.channels.push(c);
+      out.channelsById[c.id] = c;
+    }
   } catch (e) {}
+  try {
+    const rlRes = await env.DB.prepare('SELECT id, name, enabled, type, scope, params, severity, cooldown, silent_window, digest, recover_notify, created_at FROM notify_rules ORDER BY created_at ASC').all();
+    for (const row of (rlRes && rlRes.results) || []) {
+      const r = notifyNormalizeRuleRow(row);
+      if (!r.id || !r.enabled) continue;
+      out.rules.push(r);
+      out.rulesById[r.id] = r;
+    }
+  } catch (e) {}
+  try {
+    const bdRes = await env.DB.prepare('SELECT rule_id, channel_id, enabled, created_at FROM notify_bindings ORDER BY created_at ASC').all();
+    for (const row of (bdRes && bdRes.results) || []) {
+      if (!notifyTruthy(row && row.enabled)) continue;
+      const rid = String((row && row.rule_id) || '');
+      const cid = String((row && row.channel_id) || '');
+      if (!rid || !cid || !out.rulesById[rid] || !out.channelsById[cid]) continue;
+      if (!out.bindings[rid]) out.bindings[rid] = [];
+      if (out.bindings[rid].indexOf(cid) === -1) out.bindings[rid].push(cid);
+      if (!out.channelsByRule[rid]) out.channelsByRule[rid] = [];
+      out.channelsByRule[rid].push(out.channelsById[cid]);
+    }
+  } catch (e) {}
+  return out;
+}
+// ② 读取 alert_state 全量（或指定规则范围）快照，键与 notifyStateKey 对齐
+async function loadAlertState(env, opts) {
+  const map = {};
+  if (!env || !env.DB) return map;
+  const ruleIds = ((opts || {}).ruleIds && Array.isArray(opts.ruleIds)) ? opts.ruleIds.map(String).filter(Boolean) : [];
+  let rows = [];
+  try {
+    if (ruleIds.length > 0) {
+      for (const part of notifyChunkList(ruleIds, NOTIFY_DB_BATCH_LIMIT)) {
+        const ph = part.map(() => '?').join(', ');
+        const res = await env.DB.prepare('SELECT rule_id, server_id, state, since, last_notified_at, fire_count FROM alert_state WHERE rule_id IN (' + ph + ')').bind(...part).all();
+        rows = rows.concat((res && res.results) || []);
+      }
+    } else {
+      const res = await env.DB.prepare('SELECT rule_id, server_id, state, since, last_notified_at, fire_count FROM alert_state').all();
+      rows = (res && res.results) || [];
+    }
+  } catch (e) { return map; }
+  for (const row of rows) {
+    const rid = String(row.rule_id || '');
+    const sid = String(row.server_id || '');
+    if (!rid || !sid) continue;
+    map[notifyStateKey(rid, sid)] = {
+      rule_id: rid, server_id: sid, state: String(row.state || 'ok'),
+      since: notifyToNum(row.since) || 0, last_notified_at: notifyToNum(row.last_notified_at) || 0,
+      fire_count: notifyToNum(row.fire_count) || 0
+    };
+  }
+  return map;
+}
+// 状态行归一：保证 upsert 的 4 个可变字段可用，rule_id/server_id 任一缺失则丢弃
+function notifyNormalizeStateRow(row) {
+  const r = row || {};
+  const rid = String(r.rule_id || '');
+  const sid = String(r.server_id || '');
+  if (!rid || !sid) return null;
+  return {
+    rule_id: rid, server_id: sid, state: String(r.state || 'ok'),
+    since: notifyToNum(r.since) || 0, last_notified_at: notifyToNum(r.last_notified_at) || 0,
+    fire_count: notifyToNum(r.fire_count) || 0
+  };
+}
+// ③ 把规则引擎产出的状态变更落库：入参兼容 notifyCollectStateOps 的 patch 与 events 数组
+//    upsert 用 INSERT ... ON CONFLICT(rule_id, server_id) DO UPDATE 保证并发下不丢更新；
+//    delete 用 (rule_id, server_id) 精确主键，绝不整表清理。
+async function applyStateOps(env, ops) {
+  const result = { upserted: 0, deleted: 0, failed: 0, errors: [] };
+  if (!env || !env.DB || !ops) return result;
+  const patch = Array.isArray(ops) ? notifyCollectStateOps(ops) : ops;
+  const stmts = [];
+  const upsertSql = 'INSERT INTO alert_state (rule_id, server_id, state, since, last_notified_at, fire_count) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(rule_id, server_id) DO UPDATE SET state = excluded.state, since = excluded.since, last_notified_at = excluded.last_notified_at, fire_count = excluded.fire_count';
+  for (const row of (Array.isArray(patch.upsert) ? patch.upsert : [])) {
+    const r = notifyNormalizeStateRow(row);
+    if (!r) continue;
+    stmts.push({ kind: 'upsert', sql: upsertSql, args: [r.rule_id, r.server_id, r.state, r.since, r.last_notified_at, r.fire_count] });
+  }
+  const deleteSql = 'DELETE FROM alert_state WHERE rule_id = ? AND server_id = ?';
+  for (const row of (Array.isArray(patch.remove) ? patch.remove : [])) {
+    const rid = String((row && row.rule_id) || '');
+    const sid = String((row && row.server_id) || '');
+    if (!rid || !sid) continue;
+    stmts.push({ kind: 'delete', sql: deleteSql, args: [rid, sid] });
+  }
+  for (const part of notifyChunkList(stmts, NOTIFY_DB_BATCH_LIMIT)) {
+    try {
+      await env.DB.batch(part.map(s => env.DB.prepare(s.sql).bind(...s.args)));
+      for (const s of part) { if (s.kind === 'upsert') result.upserted++; else result.deleted++; }
+    } catch (e) {
+      // 整批失败时逐条降级重试，避免单条异常拖垮其余状态写入
+      for (const s of part) {
+        try {
+          await env.DB.prepare(s.sql).bind(...s.args).run();
+          if (s.kind === 'upsert') result.upserted++; else result.deleted++;
+        } catch (e2) {
+          result.failed++;
+          if (result.errors.length < 5) result.errors.push({ kind: s.kind, key: s.args[0] + '::' + s.args[1], error: String((e2 && e2.message) || e2) });
+        }
+      }
+    }
+  }
+  return result;
+}
+// ④ 写入一条通知日志：dedupe_key 命中唯一索引或主键重复时按幂等处理（inserted=false），不抛错
+const NOTIFY_LOG_DEFAULT_STATUS = 'pending';
+async function notifyLogWrite(env, entry) {
+  const e = entry || {};
+  const out = { ok: false, id: '', inserted: false, error: '' };
+  if (!env || !env.DB) { out.error = 'db_unavailable'; return out; }
+  const id = String(e.id || '') || notifyNewId('nlog');
+  out.id = id;
+  const dk = (e.dedupe_key === undefined || e.dedupe_key === null || e.dedupe_key === '') ? null : String(e.dedupe_key);
+  try {
+    const res = await env.DB.prepare('INSERT OR IGNORE INTO notify_log (id, rule_id, channel_id, server_id, type, title, content, status, error, dedupe_key, attempts, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(id, String(e.rule_id || ''), String(e.channel_id || ''), String(e.server_id || ''), String(e.type || ''), String(e.title || ''), String(e.content || ''), String(e.status || NOTIFY_LOG_DEFAULT_STATUS), String(e.error || ''), dk, notifyToNum(e.attempts) || 0, notifyToNum(e.created_at) || Date.now(), notifyToNum(e.sent_at) || 0).run();
+    out.inserted = (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0;
+    out.ok = true;
+    return out;
+  } catch (err) {
+    out.error = String((err && err.message) || err);
+    return out;
+  }
+}
+// ⑤ 入队一条待投递任务（payload 支持对象，自动 JSON 序列化）
+async function notifyQueueEnqueue(env, item) {
+  const it = item || {};
+  const out = { ok: false, id: '', error: '' };
+  if (!env || !env.DB) { out.error = 'db_unavailable'; return out; }
+  const id = String(it.id || '') || notifyNewId('nq');
+  out.id = id;
+  let payload = it.payload;
+  if (payload === undefined || payload === null || payload === '') payload = '{}';
+  if (typeof payload !== 'string') { try { payload = JSON.stringify(payload); } catch (e) { payload = '{}'; } }
+  try {
+    await env.DB.prepare('INSERT INTO notify_queue (id, log_id, rule_id, channel_id, server_id, payload, status, attempts, next_retry_at, last_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(id, String(it.log_id || ''), String(it.rule_id || ''), String(it.channel_id || ''), String(it.server_id || ''), payload, String(it.status || NOTIFY_LOG_DEFAULT_STATUS), notifyToNum(it.attempts) || 0, notifyToNum(it.next_retry_at) || 0, String(it.last_error || ''), notifyToNum(it.created_at) || Date.now()).run();
+    out.ok = true;
+    return out;
+  } catch (err) {
+    out.error = String((err && err.message) || err);
+    return out;
+  }
+}
+// ===== 通知运行时数据存取层 END =====
+
+// ===== 通知统一评估与投递主流程（通知重构第3步B-2a：纯新增，不接管现有调用链） =====
+// 职责：runNotifyCycle(env, opts) 串起 配置/状态加载 → 规则评估 → 状态落库 → 文案渲染与多通道投递 → 日志与失败入队
+// 契约：
+//   runNotifyCycle(env, { now?, servers?, notifyConfig?, state?, skipDelivery? }) -> {
+//     ok, now, servers, events, deliverable, aggregated, sent, failed, skipped, enqueued,
+//     state:{upserted,deleted,failed}, errors[]
+//   }
+//   - deliverable 事件按 <rule_id>::<kind> 分组，满足 digest 阈值（同轮多节点同类事件）时聚合为一条，防消息风暴；
+//     聚合去重键按 digest 窗口对齐，保证同一窗口内不重复推送
+//   - 同 dedupe_key 已在 notify_log 落库的投递直接跳过（幂等）
+//   - 投递失败写 notify_log(status=failed) 与 notify_queue(next_retry_at/attempts)，本轮不补发
+// =====
+
+const NOTIFY_RETRY_BASE_MS = 60000;      // 失败重试基础退避 60s
+const NOTIFY_RETRY_MAX_MS = 3600000;     // 失败重试退避上限 1h
+
+// 退避间隔：60s → 120s → 240s … 上限 1h
+function notifyRetryDelayMs(attempts) {
+  const n = Math.max(1, parseInt(attempts, 10) || 1);
+  return Math.min(NOTIFY_RETRY_MAX_MS, NOTIFY_RETRY_BASE_MS * Math.pow(2, n - 1));
+}
+
+// digest 参数解析：rule.digest 为 off/none/0/false/disabled/instant 时关闭聚合
+function notifyDigestSpec(rule) {
+  const r = rule || {};
+  const p = notifyNormalizeConfig(r.params) || {};
+  const raw = String(r.digest === null || r.digest === undefined ? '' : r.digest).trim().toLowerCase();
+  const enabled = !(raw === '' || raw === 'off' || raw === 'none' || raw === '0' || raw === 'false' || raw === 'disabled' || raw === 'instant');
+  const pick = (a, b) => (p[a] !== undefined ? p[a] : p[b]);
+  const windowSec = Math.max(30, notifyToNum(pick('digest_window', 'digestWindow')) || 120);
+  const threshold = Math.max(1, Math.floor(notifyToNum(pick('digest_threshold', 'digestThreshold')) || 3));
+  const maxItems = Math.max(1, Math.floor(notifyToNum(pick('digest_max_items', 'digestMaxItems')) || 10));
+  return { enabled, windowSec, threshold, maxItems };
+}
+
+// 聚合文案：标题 + 明细列表（超出上限折叠）；text 为纯文本，html 为 Telegram HTML
+function notifyDigestPayload(rule, kind, evs, spec, nowMs) {
+  const r = rule || {};
+  const list = Array.isArray(evs) ? evs : [];
+  const isRecover = String(kind) === 'recover';
+  const shown = list.slice(0, spec.maxItems);
+  const name = String(r.name || '通知');
+  const title = name + '：' + list.length + ' 个节点' + (isRecover ? '已恢复' : '触发');
+  const plain = (ev) => String((ev && (ev.server_name || ev.server_id)) || '-') + '：' + String((ev && (ev.title || ev.kind)) || '');
+  const mark = (ev) => '• <b>' + tgEsc(String((ev && (ev.server_name || ev.server_id)) || '-')) + '</b>：' + tgEsc(String((ev && (ev.title || ev.kind)) || ''));
+  const textLines = shown.map(ev => '- ' + plain(ev));
+  const htmlLines = shown.map(ev => mark(ev));
+  if (list.length > shown.length) {
+    const more = list.length - shown.length;
+    textLines.push('- …另有 ' + more + ' 个节点，详见后台通知中心');
+    htmlLines.push('• …另有 ' + more + ' 个节点，详见后台通知中心');
+  }
+  const timeText = notifyEventTime(nowMs);
+  const emoji = isRecover ? '✅ ' : '⚠️ ';
+  return {
+    title,
+    text: emoji + title + '\n\n' + textLines.join('\n') + '\n\n时间: ' + timeText,
+    html: emoji + '<b>' + tgEsc(name) + '</b>：' + list.length + ' 个节点' + (isRecover ? '已恢复' : '触发') + '\n\n' + htmlLines.join('\n') + '\n\n<b>时间:</b> ' + tgEsc(timeText)
+  };
+}
+
+// 单事件 → 投递文案
+function notifyEventPayload(rule, ev) {
+  const r = rule || {};
+  const e = ev || {};
+  return { title: String(e.title || r.name || '通知'), text: String(e.text || ''), html: String(e.html || '') };
+}
+
+// 按通道类型选择最终投递正文（telegram 走 HTML，其余走纯文本）
+function notifyChannelPayload(channel, target) {
+  const t = target || {};
+  const isTg = String((channel || {}).type || '') === 'telegram';
+  const text = isTg ? (String(t.html || '') || String(t.text || '')) : String(t.text || '');
+  return { title: String(t.title || ''), text, markdown: false, level: 'active', timestamp: Date.now() };
+}
+
+// 投递目标构建：达到阈值 → 聚合为一条（窗口对齐去重）；否则逐条投递
+function notifyBuildDeliverables(rule, kind, evs, nowMs) {
+  const r = rule || {};
+  const list = Array.isArray(evs) ? evs : [];
+  const spec = notifyDigestSpec(r);
+  const out = [];
+  if (spec.enabled && list.length >= spec.threshold) {
+    const windowMs = spec.windowSec * 1000;
+    const winStart = Math.floor(nowMs / windowMs) * windowMs;
+    const dp = notifyDigestPayload(r, kind, list, spec, nowMs);
+    out.push({
+      is_digest: true, events: list, server_id: '', kind: String(kind),
+      title: dp.title, text: dp.text, html: dp.html,
+      dedupe_key: [String(r.id || ''), String(kind), 'digest', String(winStart)].join('::')
+    });
+    return out;
+  }
+  for (const ev of list) {
+    const e = ev || {};
+    const dk = String(e.dedupe_key || '') || [String(e.rule_id || r.id || ''), String(e.server_id || ''), String(kind)].join('::');
+    const p = notifyEventPayload(r, e);
+    out.push({ is_digest: false, events: [e], server_id: String(e.server_id || ''), kind: String(kind), title: p.title, text: p.text, html: p.html, dedupe_key: dk });
+  }
+  return out;
+}
+
+// 日志状态回写（notify_log 仅有 insert helper，此处补 sent/failed 结果落库）
+async function notifyLogMarkResult(env, id, patch) {
+  const p = patch || {};
+  try {
+    await env.DB.prepare('UPDATE notify_log SET status = ?, error = ?, sent_at = ?, attempts = ? WHERE id = ?')
+      .bind(String(p.status || 'pending'), String(p.error || ''), notifyToNum(p.sent_at) || 0, Math.max(0, Math.floor(notifyToNum(p.attempts) || 0)), String(id))
+      .run();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// 节点加载：servers 表 → 规则引擎所需结构（group 取 server_group；表无 tags 列，暂置空数组）
+async function loadNotifyServers(env) {
+  const out = [];
+  if (!env || !env.DB) return out;
+  try {
+    const { results } = await env.DB.prepare('SELECT id, name, server_group, last_updated, cpu, ram, disk, load_avg, monthly_rx, monthly_tx, traffic_limit, expire_date FROM servers').all();
+    for (const row of (results || [])) {
+      if (!row || row.id === undefined || row.id === null || row.id === '') continue;
+      out.push({
+        id: row.id, name: row.name, group: row.server_group, tags: [],
+        last_updated: notifyToNum(row.last_updated) || 0,
+        cpu: row.cpu, ram: row.ram, disk: row.disk, load_avg: row.load_avg,
+        monthly_rx: row.monthly_rx, monthly_tx: row.monthly_tx,
+        traffic_limit: row.traffic_limit, expire_date: row.expire_date
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+// 统一评估与投递主流程（纯新增；不修改 scheduledAlertCheck / checkOfflineNodes 等既有调用链）
+async function runNotifyCycle(env, opts) {
+  const o = opts || {};
+  const now = notifyToNum(o.now) || Date.now();
+  const result = {
+    ok: true, now, servers: 0, events: 0, deliverable: 0, aggregated: 0,
+    sent: 0, failed: 0, skipped: 0, enqueued: 0,
+    state: { upserted: 0, deleted: 0, failed: 0 }, errors: []
+  };
+  if (!env || !env.DB) { result.ok = false; result.errors.push('db_unavailable'); return result; }
+  try {
+    const cfg = o.notifyConfig || await loadNotifyConfig(env);
+    const servers = Array.isArray(o.servers) ? o.servers : await loadNotifyServers(env);
+    result.servers = servers.length;
+    const state = (o.state && typeof o.state === 'object') ? o.state : await loadAlertState(env, { ruleIds: (cfg.rules || []).map(r => r.id) });
+    const events = evaluateNotifyRules(cfg.rules || [], servers, state, now);
+    result.events = events.length;
+    // 状态先落库：与投递解耦，保证状态与日志互不阻塞
+    result.state = await applyStateOps(env, notifyCollectStateOps(events));
+    const deliverable = events.filter(ev => ev && ev.deliverable === true);
+    result.deliverable = deliverable.length;
+    if (o.skipDelivery === true || deliverable.length === 0) return result;
+    // 分组：同一规则 + 同一事件类型 → 同一组（组内可聚合）
+    const groups = []; const gidx = {};
+    for (const ev of deliverable) {
+      const gk = String(ev.rule_id) + '::' + String(ev.kind);
+      if (gidx[gk] === undefined) { gidx[gk] = groups.length; groups.push({ rule_id: String(ev.rule_id), kind: String(ev.kind), events: [] }); }
+      groups[gidx[gk]].events.push(ev);
+    }
+    const stamp = Date.now();
+    for (const g of groups) {
+      const rule = (cfg.rulesById || {})[g.rule_id] || { id: g.rule_id };
+      const channels = ((cfg.channelsByRule || {})[g.rule_id] || []).filter(c => c && !(c.enabled === 0 || c.enabled === '0' || c.enabled === false));
+      const targets = notifyBuildDeliverables(rule, g.kind, g.events, now);
+      for (const t of targets) {
+        if (t.is_digest) result.aggregated += t.events.length;
+        if (!channels.length) {
+          result.skipped += 1;
+          await notifyLogWrite(env, { rule_id: g.rule_id, channel_id: '', server_id: t.server_id, type: g.kind, title: t.title, content: t.text, status: 'skipped', error: 'no_channel', dedupe_key: t.dedupe_key, created_at: stamp });
+          continue;
+        }
+        for (const ch of channels) {
+          const lg = await notifyLogWrite(env, { rule_id: g.rule_id, channel_id: ch.id, server_id: t.server_id, type: g.kind, title: t.title, content: t.text, status: 'pending', dedupe_key: t.dedupe_key + '::' + String(ch.id), created_at: stamp });
+          if (!lg || lg.ok !== true || lg.inserted !== true) { result.skipped += 1; continue; }
+          const send = await sendViaChannel(ch, notifyChannelPayload(ch, t));
+          if (send && send.ok === true) {
+            result.sent += 1;
+            await notifyLogMarkResult(env, lg.id, { status: 'sent', sent_at: Date.now(), attempts: 1 });
+          } else {
+            result.failed += 1;
+            const errMsg = String((send && send.error) || 'send_failed');
+            await notifyLogMarkResult(env, lg.id, { status: 'failed', error: errMsg, attempts: 1 });
+            const retryAfter = notifyToNum(send && send.retryAfter) || 0;
+            const delayMs = retryAfter > 0 ? retryAfter * 1000 : notifyRetryDelayMs(1);
+            const q = await notifyQueueEnqueue(env, {
+              log_id: lg.id, rule_id: g.rule_id, channel_id: ch.id, server_id: t.server_id,
+              payload: { title: t.title, text: t.text, markdown: false, channel_type: ch.type },
+              status: 'pending', attempts: 1, next_retry_at: Date.now() + delayMs, last_error: errMsg, created_at: Date.now()
+            });
+            if (q && q.ok === true) result.enqueued += 1; else result.errors.push('enqueue_failed');
+          }
+        }
+      }
+    }
+  } catch (e) {
+    result.ok = false;
+    result.errors.push(String((e && e.message) || e));
+  }
+  return result;
+}
+// ===== 通知统一评估与投递主流程 END =====
+
+// ===== 通知投递可靠性补发（通知重构第3步B-2b：纯新增，不接管现有调用链） =====
+// 职责：drainNotifyQueue(env, opts) 扫描 notify_queue 中到期的 pending 条目，按通道维度限速逐条补发
+// 契约：
+//   drainNotifyQueue(env, { now?, limit?, maxAttempts?, minIntervalMs?, budgetMs?, channelId? }) -> {
+//     ok, now, scanned, sent, retried, dead, skipped, rateLimited, errors[]
+//   }
+//   - 仅处理 status=pending 且 next_retry_at <= now 的条目，按 next_retry_at/created_at 升序
+//   - 通道维度限速：同一通道连续发送至少间隔 minIntervalMs（默认 1000ms，防 Telegram 限流）；
+//     单通道时间预算 budgetMs（默认 25000ms）用尽后，该通道剩余条目本轮跳过，保持 pending 待下轮补发
+//   - 成功：队列置 sent 并回写 notify_log(sent)；失败：attempts+1，未超上限按 notifyRetryDelayMs 退避推迟，
+//     超上限或不可恢复错误（通道缺失/禁用/配置非法）置 dead 不再重试
+//   - 服务端返回 retryAfter（如 429）优先于本地退避
+// =====
+
+const NOTIFY_DRAIN_DEFAULT_LIMIT = 20;      // 单次运行默认最多扫描条目数
+const NOTIFY_DRAIN_MAX_LIMIT = 100;         // 扫描上限（防单轮耗时过长）
+const NOTIFY_DRAIN_MIN_INTERVAL_MS = 1000;  // 同通道最小发送间隔（防通道侧限流）
+const NOTIFY_DRAIN_BUDGET_MS = 25000;       // 单次运行单通道发送时间预算
+const NOTIFY_QUEUE_MAX_ATTEMPTS = 5;        // 最大尝试次数（含首次），超出置 dead
+
+// 队列 payload 解析：非法 JSON 退化为纯文本投递，不抛错
+function notifyQueueParsePayload(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  const s = String(raw === null || raw === undefined ? '' : raw).trim();
+  if (!s) return { text: '' };
+  try { const o = JSON.parse(s); return (o && typeof o === 'object') ? o : { text: String(o) }; }
+  catch (e) { return { text: s }; }
+}
+
+// 不可恢复错误：通道缺失/禁用/配置非法/Provider 不支持 → 直接置 dead，避免无谓重试
+function notifyQueuePermanentError(err) {
+  const e = String(err || '');
+  if (!e) return false;
+  if (e === 'channel_disabled' || e === 'channel_not_found' || e === 'missing_channel') return true;
+  if (e === 'config_invalid' || e === 'provider_not_found') return true;
+  return e.indexOf('provider_not_found:') === 0;
+}
+
+// 队列行 → 归一对象（payload 解析、数值归一）
+function notifyQueueNormalizeRow(row) {
+  const r = row || {};
+  return {
+    id: String(r.id || ''), log_id: String(r.log_id || ''), rule_id: String(r.rule_id || ''),
+    channel_id: String(r.channel_id || ''), server_id: String(r.server_id || ''),
+    payload: notifyQueueParsePayload(r.payload),
+    status: String(r.status || 'pending'),
+    attempts: Math.max(0, Math.floor(notifyToNum(r.attempts) || 0)),
+    next_retry_at: notifyToNum(r.next_retry_at) || 0,
+    last_error: String(r.last_error || ''),
+    created_at: notifyToNum(r.created_at) || 0
+  };
+}
+
+// 读取到期条目（status=pending 且 next_retry_at <= now），查询异常经 error 字段上报，避免静默当成本轮无任务
+async function notifyQueueLoadDue(env, limit, now) {
+  const out = { rows: [], error: '' };
+  if (!env || !env.DB) { out.error = 'db_unavailable'; return out; }
+  try {
+    const { results } = await env.DB.prepare('SELECT id, log_id, rule_id, channel_id, server_id, payload, status, attempts, next_retry_at, last_error, created_at FROM notify_queue WHERE status = ? AND next_retry_at <= ? ORDER BY next_retry_at ASC, created_at ASC LIMIT ?')
+      .bind('pending', now, limit).all();
+    for (const row of (results || [])) {
+      const it = notifyQueueNormalizeRow(row);
+      if (it.id) out.rows.push(it);
+    }
+  } catch (e) { out.error = String((e && e.message) || e); }
+  return out;
+}
+
+// 队列状态回写（status / attempts / next_retry_at / last_error）
+async function notifyQueueMarkResult(env, id, patch) {
+  const p = patch || {};
+  try {
+    await env.DB.prepare('UPDATE notify_queue SET status = ?, attempts = ?, next_retry_at = ?, last_error = ? WHERE id = ?')
+      .bind(String(p.status || 'pending'), Math.max(0, Math.floor(notifyToNum(p.attempts) || 0)), notifyToNum(p.next_retry_at) || 0, String(p.last_error || ''), String(id))
+      .run();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+// 通道行按 ID 读取（同轮缓存，避免重复查库）
+async function notifyQueueLoadChannel(env, cache, channelId) {
+  const key = String(channelId || '');
+  if (!key) return null;
+  const c = cache || {};
+  if (Object.prototype.hasOwnProperty.call(c, key)) return c[key];
+  let row = null;
+  try {
+    row = await env.DB.prepare('SELECT id, type, name, config, enabled FROM notify_channels WHERE id = ?').bind(key).first();
+  } catch (e) { row = null; }
+  c[key] = row || null;
+  return c[key];
+}
+
+async function drainNotifyQueue(env, opts) {
+  const o = opts || {};
+  const now = notifyToNum(o.now) || Date.now();
+  const result = { ok: true, now, scanned: 0, sent: 0, retried: 0, dead: 0, skipped: 0, rateLimited: 0, errors: [] };
+  if (!env || !env.DB) { result.ok = false; result.errors.push('db_unavailable'); return result; }
+  const limit = Math.max(1, Math.min(NOTIFY_DRAIN_MAX_LIMIT, Math.floor(notifyToNum(o.limit) || NOTIFY_DRAIN_DEFAULT_LIMIT)));
+  const maxAttempts = Math.max(1, Math.floor(notifyToNum(o.maxAttempts) || NOTIFY_QUEUE_MAX_ATTEMPTS));
+  const minIntervalMs = Math.max(0, notifyToNum(o.minIntervalMs) === null ? NOTIFY_DRAIN_MIN_INTERVAL_MS : notifyToNum(o.minIntervalMs));
+  const budgetMs = Math.max(0, notifyToNum(o.budgetMs) === null ? NOTIFY_DRAIN_BUDGET_MS : notifyToNum(o.budgetMs));
+  const onlyChannel = String(o.channelId || '');
+  try {
+    const loaded = await notifyQueueLoadDue(env, limit, now);
+    const due = loaded.rows || [];
+    if (loaded.error) { result.ok = false; result.errors.push(loaded.error); }
+    result.scanned = due.length;
+    const chCache = {};
+    const slotByChannel = {};   // 通道 → 下一次可发送的虚拟时刻（限速判定，不做真实等待）
+    for (const it of due) {
+      if (onlyChannel && it.channel_id !== onlyChannel) continue;
+      const cid = it.channel_id || '';
+      const prev = slotByChannel[cid];
+      const slot = (prev === undefined) ? now : prev;
+      if (slot - now > budgetMs) { result.rateLimited += 1; result.skipped += 1; continue; }
+      slotByChannel[cid] = Math.max(now, slot) + minIntervalMs;
+      const attempts = it.attempts + 1;
+      const px = String(it.payload.text || it.payload.content || '');
+      if (!px) {
+        result.dead += 1;
+        await notifyQueueMarkResult(env, it.id, { status: 'dead', attempts, next_retry_at: 0, last_error: 'payload_empty' });
+        if (it.log_id) await notifyLogMarkResult(env, it.log_id, { status: 'failed', error: 'payload_empty', attempts });
+        continue;
+      }
+      const row = await notifyQueueLoadChannel(env, chCache, cid);
+      const send = row ? await sendViaChannel(row, notifyChannelPayload(row, { title: it.payload.title, text: px })) : { ok: false, status: 0, retryAfter: 0, error: 'channel_not_found' };
+      if (send && send.ok === true) {
+        result.sent += 1;
+        await notifyQueueMarkResult(env, it.id, { status: 'sent', attempts, next_retry_at: 0, last_error: '' });
+        if (it.log_id) await notifyLogMarkResult(env, it.log_id, { status: 'sent', sent_at: Date.now(), attempts });
+        continue;
+      }
+      const errMsg = String((send && send.error) || 'send_failed');
+      if (notifyQueuePermanentError(errMsg) || attempts >= maxAttempts) {
+        result.dead += 1;
+        await notifyQueueMarkResult(env, it.id, { status: 'dead', attempts, next_retry_at: 0, last_error: errMsg });
+        if (it.log_id) await notifyLogMarkResult(env, it.log_id, { status: 'failed', error: errMsg, attempts });
+        continue;
+      }
+      const retryAfter = notifyToNum(send && send.retryAfter) || 0;
+      const delayMs = retryAfter > 0 ? retryAfter * 1000 : notifyRetryDelayMs(attempts);
+      result.retried += 1;
+      await notifyQueueMarkResult(env, it.id, { status: 'pending', attempts, next_retry_at: Date.now() + delayMs, last_error: errMsg });
+      if (it.log_id) await notifyLogMarkResult(env, it.log_id, { status: 'failed', error: errMsg, attempts });
+    }
+  } catch (e) {
+    result.ok = false;
+    result.errors.push(String((e && e.message) || e));
+  }
+  return result;
+}
+// ===== 通知投递可靠性补发 END =====
+// ===== 通知触发接线（通知重构第3步B-3：把既有告警调用链切换到统一引擎）=====
+// 职责：为 Cron 与探针上报两条既有触发路径提供统一入口，替代原先各自为政的“离线判定 + 直发”双实现。
+// 契约：
+//   notifyTriggerGate(env, key, { now?, minIntervalMs? }) -> { allowed, key, last_at, now, reason? }
+//     以 settings[key] 作为该条路径的节流闸门；两条触发路径使用不同键，互不抢占窗口
+//   notifyTriggerStamp(env, key, now) -> { ok, error? }   闸门时间戳落库（UPSERT）
+//   runNotifyTriggered(env, key, { now?, minIntervalMs?, drain?, notifyConfig?, skipDelivery? }) -> {
+//     triggered, key, reason?, gate, cycle?, drain? }
+//     流程：独立节流闸门 -> 落闸门时间戳 -> loadNotifyConfig 就绪判定（无启用规则/通道则静默返回，不写日志）
+//           -> runNotifyCycle（评估 + 落状态 + 聚合投递）-> 可选 drainNotifyQueue（失败补发闭环）
+// =====
+const NOTIFY_TRIGGER_MIN_INTERVAL_MS = 30000;             // 单条触发路径最小执行间隔（与旧 30s 节流等价）
+const NOTIFY_TRIGGER_KEY_CRON = 'last_alert_check_at';    // Cron 路径节流键（沿用旧键，保持兼容）
+const NOTIFY_TRIGGER_KEY_REPORT = 'last_offline_scan_at'; // 探针上报路径节流键（独立，消除旧双实现抢锁）
+
+// 节流闸门：读取该路径上次执行时间，未到期则拒绝（不写库、不产生副作用）
+async function notifyTriggerGate(env, key, opts) {
+  const o = opts || {};
+  const now = notifyToNum(o.now) === null ? Date.now() : notifyToNum(o.now);
+  const iv = notifyToNum(o.minIntervalMs);
+  const minMs = Math.max(0, iv === null ? NOTIFY_TRIGGER_MIN_INTERVAL_MS : iv);
+  const k = String(key || '');
+  if (!k) return { allowed: false, reason: 'bad_key', key: k, now, last_at: 0 };
+  let lastAt = 0;
+  try {
+    const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(k).first();
+    lastAt = notifyToNum(row && row.value) || 0;
+  } catch (e) { return { allowed: false, reason: 'settings_read_failed', key: k, now, last_at: 0 }; }
+  if (lastAt > 0 && now - lastAt < minMs) return { allowed: false, reason: 'throttled', key: k, now, last_at: lastAt };
+  return { allowed: true, reason: '', key: k, now, last_at: lastAt };
+}
+
+// 闸门时间戳落库（UPSERT；失败不影响本轮投递）
+async function notifyTriggerStamp(env, key, now) {
+  try {
+    await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind(String(key || ''), String(notifyToNum(now) === null ? Date.now() : notifyToNum(now))).run();
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// 统一触发入口：两条既有路径（Cron / 探针上报）均经此函数进入新引擎
+async function runNotifyTriggered(env, key, opts) {
+  const o = opts || {};
+  const out = { triggered: false, key: String(key || ''), reason: '', gate: null, cycle: null, drain: null };
+  if (!env || !env.DB) { out.reason = 'db_unavailable'; return out; }
+  const gate = await notifyTriggerGate(env, key, o);
+  out.gate = gate;
+  if (gate.allowed !== true) { out.reason = gate.reason || 'throttled'; return out; }
+  out.triggered = true;
+  await notifyTriggerStamp(env, key, gate.now);
+  const cfg = o.notifyConfig || await loadNotifyConfig(env);
+  const hasRules = (cfg.rules || []).length > 0;
+  const hasChannels = (cfg.channels || []).length > 0;
+  if (hasRules && hasChannels) {
+    try { out.cycle = await runNotifyCycle(env, { now: gate.now, notifyConfig: cfg, skipDelivery: o.skipDelivery === true }); }
+    catch (e) { out.cycle = { ok: false, errors: [String((e && e.message) || e)] }; }
+  } else { out.reason = hasRules ? 'no_channel' : 'no_rule'; }
+  if (o.drain === true) {
+    try { out.drain = await drainNotifyQueue(env, { now: gate.now }); }
+    catch (e) { out.drain = { ok: false, errors: [String((e && e.message) || e)] }; }
+  }
+  return out;
+}
+// ===== 通知触发接线 END =====
+
+// ===== 后台通知中心 / 模板中心 JSON 接口（通知重构第4步A：纯新增，仅输出 JSON，不做整页渲染）=====
+// 接入方式：后台单点入口 POST {admin_path}/api 内以 action 前缀 'notify_' 分发（见 fetch 路由），复用既有 isAdminAuthed 鉴权。
+// 返回信封：成功 { success:true, ...payload }；失败 { success:false, error:'...' }（HTTP 统一 200，以 success 字段判定）
+// 覆盖表：notify_channels / notify_rules / notify_bindings / notify_log / notify_queue / notify_templates / alert_state
+const NOTIFY_LOG_STATUSES = ['pending', 'sent', 'failed', 'skipped'];
+const NOTIFY_QUEUE_STATUSES = ['pending', 'sent', 'dead'];
+const NOTIFY_SEVERITY_META = [
+  { value: 'info', label: '信息', rank: 0 },
+  { value: 'warning', label: '警告', rank: 1 },
+  { value: 'critical', label: '严重', rank: 2 }
+];
+const NOTIFY_DEFAULT_OFFLINE_RULE_ID = 'rule_offline_default'; // 迁移快照规则 id：与 settings.alert_threshold 双向同步
+const NOTIFY_ADMIN_PAGE_SIZE_DEFAULT = 20;
+const NOTIFY_ADMIN_PAGE_SIZE_MAX = 100;
+
+// 规则作用域 schema（与 notifyMatchScope 的 {all, groups[], ids[], tags[]} 语义一致，供前端渲染表单）
+const NOTIFY_ADMIN_SCOPE_SCHEMA = {
+  all: { key: 'all', label: '全量节点', type: 'boolean', default: true, help: '关闭后仅按分组/节点/标签匹配' },
+  groups: { key: 'groups', label: '分组', type: 'string[]', default: [], help: '命中任一分组即匹配' },
+  ids: { key: 'ids', label: '节点 ID', type: 'string[]', default: [], help: '命中任一节点 ID 即匹配' },
+  tags: { key: 'tags', label: '标签', type: 'string[]', default: [], help: '命中任一标签即匹配' }
+};
+
+// 规则类型元数据：params 字段 schema 与规则引擎（notifyOfflineThresholdMs / notifyMetricSpec / notifyRatioSpec / notifyExpireSpec）解析规则保持一致
+const NOTIFY_RULE_TYPE_META = [
+  {
+    type: 'offline', name: '节点离线', description: '节点超过阈值秒数未上报则告警，恢复后按 recover_notify 决定是否发送恢复通知',
+    params: [
+      { key: 'threshold', label: '离线判定阈值', type: 'number', unit: '秒', default: NOTIFY_OFFLINE_DEFAULT_THRESHOLD, min: 5, max: 86400, sync_setting: 'alert_threshold', help: '与系统设置 alert_threshold 双向同步' },
+      { key: 'for_duration', label: '持续时长', type: 'number', unit: '秒', default: 0, min: 0, max: 86400, help: '离线状态需持续超过该时长才判定' }
+    ],
+    supports_recover: true
+  },
+  {
+    type: 'recover', name: '节点恢复', description: '节点重新上报后的恢复通知，可兜底清理离线规则遗留的 firing 状态',
+    params: [
+      { key: 'threshold', label: '判定阈值', type: 'number', unit: '秒', default: null, min: 0, max: 86400, help: '留空表示沿用所属离线规则的阈值' },
+      { key: 'for_duration', label: '持续时长', type: 'number', unit: '秒', default: 0, min: 0, max: 86400 }
+    ],
+    supports_recover: false
+  },
+  {
+    type: 'metric', name: '指标阈值', description: 'CPU / 内存 / 磁盘 / 系统负载 指标超过触发阈值告警，回落至恢复阈值后消除',
+    params: [
+      { key: 'metric', label: '监控指标', type: 'select', options: ['cpu', 'ram', 'disk', 'load'], default: 'cpu', option_labels: { cpu: 'CPU 使用率', ram: '内存使用率', disk: '磁盘使用率', load: '系统负载' } },
+      { key: 'threshold', label: '触发阈值', type: 'number', unit: '', default: 90, min: 0, max: 100000 },
+      { key: 'clear_threshold', label: '恢复阈值', type: 'number', unit: '', default: null, min: 0, max: 100000, help: '留空表示与触发阈值相同' },
+      { key: 'for_duration', label: '持续时长', type: 'number', unit: '秒', default: 0, min: 0, max: 86400 }
+    ],
+    supports_recover: true
+  },
+  {
+    type: 'traffic_ratio', name: '流量占比', description: '当月已用流量占总限额比例超过触发阈值告警（兼容 0.8 形式的比例写法）',
+    params: [
+      { key: 'threshold', label: '触发阈值', type: 'number', unit: '%', default: NOTIFY_TRAFFIC_DEFAULT_THRESHOLD, min: 1, max: 100 },
+      { key: 'clear_threshold', label: '恢复阈值', type: 'number', unit: '%', default: null, min: 0, max: 100, help: '留空表示与触发阈值相同' }
+    ],
+    supports_recover: true
+  },
+  {
+    type: 'expire_days', name: '到期提醒', description: '节点到期剩余天数小于等于阈值时告警',
+    params: [
+      { key: 'threshold', label: '剩余天数阈值', type: 'number', unit: '天', default: NOTIFY_EXPIRE_DEFAULT_DAYS, min: 0, max: 3650 },
+      { key: 'clear_threshold', label: '恢复阈值', type: 'number', unit: '天', default: null, min: 0, max: 3650, help: '留空表示与触发阈值相同' }
+    ],
+    supports_recover: true
+  }
+];
+
+// JSON 就地解析：兼容对象 / JSON 字符串 / 空值，均返回可用对象
+function notifyAdminJson(v, def) {
+  if (v === null || v === undefined) return def;
+  if (typeof v === 'object') return v;
+  try { const o = JSON.parse(String(v)); return (o === null || o === undefined) ? def : o; } catch (e) { return def; }
+}
+function notifyAdminStr(v) { return (v === null || v === undefined) ? '' : String(v); }
+// 列表接口分页参数归一：page 从 1 起，page_size 上限 100，默认 20
+function notifyAdminPageOpts(data) {
+  const d = data || {};
+  let page = parseInt(d.page, 10);
+  if (isNaN(page) || page < 1) page = 1;
+  let size = parseInt(d.page_size === undefined ? d.pageSize : d.page_size, 10);
+  if (isNaN(size) || size < 1) size = NOTIFY_ADMIN_PAGE_SIZE_DEFAULT;
+  if (size > NOTIFY_ADMIN_PAGE_SIZE_MAX) size = NOTIFY_ADMIN_PAGE_SIZE_MAX;
+  return { page: page, size: size, offset: (page - 1) * size };
+}
+// 时间过滤归一：兼容秒/毫秒时间戳与 ISO 字符串，统一输出毫秒
+function notifyAdminTimeRange(data) {
+  const d = data || {};
+  const norm = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    // 仅纯数字（含小数）才按时间戳解释，避免 ISO 串被 parseFloat 截断（如 '2026-09-10T...' -> 2026）
+    if (typeof v === 'number' || /^-?\d+(\.\d+)?$/.test(String(v).trim())) {
+      const n = notifyToNum(v);
+      if (n === null) return null;
+      return (n > 0 && n < 100000000000) ? Math.round(n * 1000) : Math.round(n);
+    }
+    const t = new Date(String(v)).getTime();
+    return isNaN(t) ? null : t;
+  };
+  return {
+    start: norm(d.start === undefined ? d.start_at : d.start),
+    end: norm(d.end === undefined ? d.end_at : d.end)
+  };
+}
+// 通用分页查询（表名由内部常量传入；whereSql 仅由本文件的字面量拼接，取值全部走 bind，杜绝注入）
+async function notifyAdminPagedQuery(env, table, whereSql, binds, orderSql, pageOpts) {
+  const out = { total: 0, page: pageOpts.page, page_size: pageOpts.size, pages: 0, items: [] };
+  const args = Array.isArray(binds) ? binds : [];
+  const cntStmt = env.DB.prepare('SELECT COUNT(*) AS c FROM ' + table + (whereSql || ''));
+  const cntRow = await (args.length ? cntStmt.bind.apply(cntStmt, args) : cntStmt).first();
+  out.total = notifyToNum(cntRow && cntRow.c) || 0;
+  out.pages = out.total > 0 ? Math.ceil(out.total / pageOpts.size) : 0;
+  const listStmt = env.DB.prepare('SELECT * FROM ' + table + (whereSql || '') + (orderSql || '') + ' LIMIT ? OFFSET ?');
+  const listArgs = args.concat([pageOpts.size, pageOpts.offset]);
+  const res = await listStmt.bind.apply(listStmt, listArgs).all();
+  out.items = (res && res.results) || [];
+  return out;
+}
+// 行归一：日志 / 队列 / 模板 / 绑定（数值字段统一转 number，JSON 字段就地解析）
+function notifyAdminLogRow(row) {
+  const r = row || {};
+  return {
+    id: notifyAdminStr(r.id), rule_id: notifyAdminStr(r.rule_id), channel_id: notifyAdminStr(r.channel_id), server_id: notifyAdminStr(r.server_id),
+    type: notifyAdminStr(r.type), title: notifyAdminStr(r.title), content: notifyAdminStr(r.content), status: notifyAdminStr(r.status),
+    error: notifyAdminStr(r.error), dedupe_key: notifyAdminStr(r.dedupe_key), attempts: notifyToNum(r.attempts) || 0,
+    created_at: notifyToNum(r.created_at) || 0, sent_at: notifyToNum(r.sent_at) || 0
+  };
+}
+function notifyAdminQueueRow(row) {
+  const r = row || {};
+  return {
+    id: notifyAdminStr(r.id), log_id: notifyAdminStr(r.log_id), rule_id: notifyAdminStr(r.rule_id), channel_id: notifyAdminStr(r.channel_id),
+    server_id: notifyAdminStr(r.server_id), payload: notifyAdminJson(r.payload, {}), status: notifyAdminStr(r.status),
+    attempts: notifyToNum(r.attempts) || 0, next_retry_at: notifyToNum(r.next_retry_at) || 0,
+    last_error: notifyAdminStr(r.last_error), created_at: notifyToNum(r.created_at) || 0
+  };
+}
+function notifyAdminTemplateRow(row) {
+  const r = row || {};
+  const parts = notifyTemplateParseContent(r.content);
+  return {
+    id: notifyAdminStr(r.id), name: notifyAdminStr(r.name), type: notifyAdminStr(r.type), channel_type: notifyAdminStr(r.channel_type),
+    content: notifyAdminStr(r.content), enabled: notifyTruthy(r.enabled) ? 1 : 0,
+    title: parts.title, body: parts.body, plain_content: parts.json ? 0 : 1,
+    created_at: notifyToNum(r.created_at) || 0, updated_at: notifyToNum(r.updated_at) || 0
+  };
+}
+// ---------- 模板中心：事件类型 / 占位符变量表 / 内置默认模板 / 渲染（通知重构第4步B-2b） ----------
+// 事件类型取值与规则引擎真实 rule.type 一致（见 NOTIFY_RULE_TYPE_META）
+const NOTIFY_TEMPLATE_TYPES = ['offline', 'recover', 'metric', 'traffic_ratio', 'expire_days'];
+// 占位符变量表：键名与 notifyBuildEvent 的真实事件字段严格一致
+// （rule_id / rule_name / rule_type / severity / kind / server_id / server_name / group / title / text / at / dedupe_key），
+// 另含三个只读派生字段 severity_label / kind_label / at_text
+const NOTIFY_TEMPLATE_VARS = [
+  { key: 'severity_label', label: '严重级别名称', sample: '警告', derived: true },
+  { key: 'severity', label: '严重级别（info / warning / critical）', sample: 'warning' },
+  { key: 'kind_label', label: '事件动作名称', sample: '触发告警', derived: true },
+  { key: 'kind', label: '事件动作（fire / recover / clear / pending）', sample: 'fire' },
+  { key: 'title', label: '事件标题（引擎生成的原始标题）', sample: '节点离线告警' },
+  { key: 'text', label: '事件正文（引擎生成的纯文本正文）', sample: '节点名称: 香港-01\n状态: 离线 (超过判定阈值未上报)' },
+  { key: 'rule_name', label: '规则名称', sample: '节点离线告警' },
+  { key: 'rule_type', label: '规则类型', sample: 'offline' },
+  { key: 'rule_id', label: '规则 ID', sample: 'rule_offline_default' },
+  { key: 'server_name', label: '节点名称', sample: '香港-01' },
+  { key: 'server_id', label: '节点 ID', sample: 'srv_demo_01' },
+  { key: 'group', label: '节点分组', sample: '默认分组' },
+  { key: 'at_text', label: '事件时间（东八区文本）', sample: '2026-09-17 10:30:00', derived: true },
+  { key: 'at', label: '事件时间戳（毫秒）', sample: '1758076200000' },
+  { key: 'dedupe_key', label: '去重键', sample: 'rule_offline_default::srv_demo_01::fire' }
+];
+const NOTIFY_TEMPLATE_KIND_LABELS = { fire: '触发告警', recover: '恢复通知', clear: '指标回落', pending: '超阈值待确认' };
+// 内置默认模板：id 固定为 tpl_builtin_<事件类型>。用户在模板中心保存会写入同 id 的覆盖行，
+// “恢复默认”即删除该覆盖行（见 notify_reset_template）
+const NOTIFY_TEMPLATE_BUILTINS = [
+  { id: 'tpl_builtin_offline', name: '节点离线（内置默认）', type: 'offline',
+    title: '【{severity_label}】{server_name} 节点离线',
+    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n动作：{kind_label}\n时间：{at_text}\n\n{text}' },
+  { id: 'tpl_builtin_recover', name: '节点恢复（内置默认）', type: 'recover',
+    title: '✅ {server_name} 已恢复',
+    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
+  { id: 'tpl_builtin_metric', name: '指标阈值（内置默认）', type: 'metric',
+    title: '【{severity_label}】{server_name} 指标告警',
+    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
+  { id: 'tpl_builtin_traffic_ratio', name: '流量占比（内置默认）', type: 'traffic_ratio',
+    title: '【{severity_label}】{server_name} 流量占比提醒',
+    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
+  { id: 'tpl_builtin_expire_days', name: '到期提醒（内置默认）', type: 'expire_days',
+    title: '【{severity_label}】{server_name} 到期提醒',
+    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' }
+];
+function notifyTemplateBuiltinById(id) {
+  const key = notifyAdminStr(id);
+  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) { if (NOTIFY_TEMPLATE_BUILTINS[i].id === key) return NOTIFY_TEMPLATE_BUILTINS[i]; }
+  return null;
+}
+function notifyTemplateBuiltinByType(type) {
+  const key = notifyAdminStr(type);
+  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) { if (NOTIFY_TEMPLATE_BUILTINS[i].type === key) return NOTIFY_TEMPLATE_BUILTINS[i]; }
+  return null;
+}
+// content 统一存储为 {"title":"...","body":"..."}；兼容历史纯文本（整体视为正文）
+function notifyTemplateSerializeContent(parts) {
+  const p = parts || {};
+  return JSON.stringify({ title: notifyAdminStr(p.title), body: notifyAdminStr(p.body) });
+}
+function notifyTemplateBuiltinContent(bi) {
+  const b = bi || {};
+  return notifyTemplateSerializeContent({ title: b.title, body: b.body });
+}
+function notifyTemplateParseContent(content) {
+  const raw = notifyAdminStr(content);
+  if (!raw) return { title: '', body: '', json: false };
+  if (raw.charAt(0) === '{') {
+    const o = notifyAdminJson(raw, null);
+    if (o && typeof o === 'object') return { title: notifyAdminStr(o.title), body: notifyAdminStr(o.body), json: true };
+  }
+  return { title: '', body: raw, json: false };
+}
+function notifyTemplateBuiltinRow(bi) {
+  const b = bi || {};
+  const content = notifyTemplateBuiltinContent(b);
+  return {
+    id: notifyAdminStr(b.id), name: notifyAdminStr(b.name), type: notifyAdminStr(b.type), channel_type: '',
+    content: content, enabled: 1, title: notifyAdminStr(b.title), body: notifyAdminStr(b.body), plain_content: 0,
+    builtin: 1, customized: 0, created_at: 0, updated_at: 0
+  };
+}
+function notifyTemplateBuiltinRows() {
+  const out = [];
+  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) out.push(notifyTemplateBuiltinRow(NOTIFY_TEMPLATE_BUILTINS[i]));
+  return out;
+}
+// 变量取值表：在真实事件字段之上补三个只读派生字段
+function notifyTemplateVarMap(ev) {
+  const e = ev || {};
+  const sev = notifyAdminStr(e.severity);
+  let sevLabel = sev;
+  for (let i = 0; i < NOTIFY_SEVERITY_META.length; i++) {
+    const m = NOTIFY_SEVERITY_META[i];
+    if (notifyAdminStr(m.value) === sev) sevLabel = notifyAdminStr(m.label) || sev;
+  }
+  const kind = notifyAdminStr(e.kind);
+  const atMs = notifyToNum(e.at);
+  return Object.assign({}, e, {
+    severity_label: sevLabel,
+    kind_label: NOTIFY_TEMPLATE_KIND_LABELS[kind] || kind,
+    at_text: (atMs !== null && atMs > 0) ? notifyEventTime(atMs) : ''
+  });
+}
+function notifyTemplateSampleData() {
+  const m = {};
+  for (let i = 0; i < NOTIFY_TEMPLATE_VARS.length; i++) {
+    const v = NOTIFY_TEMPLATE_VARS[i];
+    m[v.key] = (v.sample === null || v.sample === undefined) ? '' : String(v.sample);
+  }
+  return notifyTemplateVarMap(m);
+}
+// 占位符渲染：{key} → 取值；未提供取值的占位符渲染为空串并记入 missing
+function notifyRenderTemplateText(text, data) {
+  const src = notifyAdminStr(text);
+  const d = data || {};
+  const used = [];
+  const missing = [];
+  const out = src.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, function (all, key) {
+    const v = d[key];
+    if (v === undefined || v === null) {
+      if (missing.indexOf(key) < 0) missing.push(key);
+      return '';
+    }
+    if (used.indexOf(key) < 0) used.push(key);
+    return String(v);
+  });
+  return { text: out, used: used, missing: missing };
+}
+function notifyMergeKeys(a, b) {
+  const out = (a || []).slice();
+  const src = b || [];
+  for (let i = 0; i < src.length; i++) { if (out.indexOf(src[i]) < 0) out.push(src[i]); }
+  return out;
+}
+function notifyAdminBindingRow(row, nameMaps) {
+  const r = row || {};
+  const maps = nameMaps || {};
+  const rid = notifyAdminStr(r.rule_id);
+  const cid = notifyAdminStr(r.channel_id);
+  return {
+    rule_id: rid, channel_id: cid, enabled: notifyTruthy(r.enabled) ? 1 : 0, created_at: notifyToNum(r.created_at) || 0,
+    rule_name: (maps.rules || {})[rid] || '', channel_name: (maps.channels || {})[cid] || '', channel_type: (maps.channelTypes || {})[cid] || ''
+  };
+}
+// 设置项 → 离线规则参数同步：系统设置 alert_threshold 变更时，回写所有 offline 规则的 params.threshold（含迁移快照规则）
+async function notifySyncRuleThresholdFromSetting(env, thresholdSec) {
+  const out = { ok: false, updated: 0, errors: [] };
+  if (!env || !env.DB) { out.errors.push('db_unavailable'); return out; }
+  const sec = parseInt(thresholdSec, 10);
+  if (isNaN(sec) || sec <= 0) { out.errors.push('invalid_threshold'); return out; }
+  try {
+    const { results } = await env.DB.prepare("SELECT id, params FROM notify_rules WHERE type = 'offline'").all();
+    let n = 0;
+    for (const row of (results || [])) {
+      const rid = notifyAdminStr(row && row.id);
+      if (!rid) continue;
+      const params = notifyNormalizeConfig(row && row.params);
+      if (notifyToNum(params.threshold) === sec) continue;
+      params.threshold = sec;
+      await env.DB.prepare('UPDATE notify_rules SET params = ? WHERE id = ?').bind(JSON.stringify(params), rid).run();
+      n += 1;
+    }
+    out.ok = true; out.updated = n;
+    return out;
+  } catch (e) { out.errors.push(String((e && e.message) || e)); return out; }
+}
+// 规则参数 → 设置项同步：offline 规则 params.threshold 变更时，回写 settings.alert_threshold（保持后台设置面板一致）
+async function notifySyncSettingThresholdFromRule(env, thresholdSec) {
+  const out = { ok: false, key: 'alert_threshold', value: '', errors: [] };
+  if (!env || !env.DB) { out.errors.push('db_unavailable'); return out; }
+  const sec = parseInt(thresholdSec, 10);
+  if (isNaN(sec) || sec <= 0) { out.errors.push('invalid_threshold'); return out; }
+  try {
+    await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .bind('alert_threshold', String(sec)).run();
+    out.ok = true; out.value = String(sec);
+    return out;
+  } catch (e) { out.errors.push(String((e && e.message) || e)); return out; }
+}
+// 作用范围选项：汇总 servers 表的分组与节点（tags 列暂不存在，恒为空数组），供规则弹窗渲染多选列表
+async function notifyScopeOptions(env) {
+  const out = { groups: [], nodes: [], tags: [] };
+  if (!env || !env.DB) return out;
+  try {
+    const { results } = await env.DB.prepare('SELECT id, name, server_group FROM servers ORDER BY sort_order ASC, rowid ASC').all();
+    for (const row of (results || [])) {
+      if (!row || row.id === undefined || row.id === null) continue;
+      const id = String(row.id);
+      const g = (row.server_group === undefined || row.server_group === null) ? '' : String(row.server_group);
+      out.nodes.push({ id: id, name: row.name ? String(row.name) : id, group: g });
+      if (g && out.groups.indexOf(g) === -1) out.groups.push(g);
+    }
+    return out;
+  } catch (e) { return out; }
+}
+// 后台通知中心统一入口：按 action 分发，返回 JSON 可序列化对象（本函数不构造 Response，由调用方统一包装）
+async function handleNotifyAdminApi(data, env) {
+  const d = data || {};
+  const act = notifyAdminStr(d.action);
+  const fail = (err) => ({ success: false, error: notifyAdminStr(err) || 'error' });
+  if (!env || !env.DB) return fail('db_unavailable');
+  const typeMetaById = {};
+  for (const t of NOTIFY_RULE_TYPE_META) typeMetaById[t.type] = t;
+  const severitySet = {};
+  for (const s of NOTIFY_SEVERITY_META) severitySet[s.value] = 1;
+  try {
+    // ---------- 元数据：规则类型 / 作用域 / 通道类型 / 枚举 ----------
+    if (act === 'notify_meta') {
+      return {
+        success: true,
+        rule_types: NOTIFY_RULE_TYPE_META,
+        scope_schema: NOTIFY_ADMIN_SCOPE_SCHEMA,
+        scope_options: await notifyScopeOptions(env),
+        severities: NOTIFY_SEVERITY_META,
+        providers: notifyListProviders(),
+        log_statuses: NOTIFY_LOG_STATUSES,
+        queue_statuses: NOTIFY_QUEUE_STATUSES,
+        template_types: NOTIFY_TEMPLATE_TYPES,
+        template_vars: NOTIFY_TEMPLATE_VARS,
+        template_builtins: notifyTemplateBuiltinRows(),
+        default_offline_rule_id: NOTIFY_DEFAULT_OFFLINE_RULE_ID,
+        setting_keys: { offline_rule_threshold: 'alert_threshold' }
+      };
+    }
+
+    // ---------- 概览统计 ----------
+    if (act === 'notify_overview') {
+      const chAll = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_channels').first();
+      const chOn = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_channels WHERE enabled = 1').first();
+      const ruAll = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_rules').first();
+      const ruOn = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_rules WHERE enabled = 1').first();
+      const bdAll = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_bindings WHERE enabled = 1').first();
+      const firing = await env.DB.prepare("SELECT COUNT(*) AS c FROM alert_state WHERE state = 'firing'").first();
+      const tpl = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_templates').first();
+      const logStats = {};
+      const logRes = await env.DB.prepare('SELECT status, COUNT(*) AS c FROM notify_log GROUP BY status').all();
+      for (const row of ((logRes && logRes.results) || [])) logStats[notifyAdminStr(row.status)] = notifyToNum(row.c) || 0;
+      const queueStats = {};
+      const qRes = await env.DB.prepare('SELECT status, COUNT(*) AS c FROM notify_queue GROUP BY status').all();
+      for (const row of ((qRes && qRes.results) || [])) queueStats[notifyAdminStr(row.status)] = notifyToNum(row.c) || 0;
+      const thrRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_threshold'").first();
+      return {
+        success: true,
+        channels: { total: notifyToNum(chAll && chAll.c) || 0, enabled: notifyToNum(chOn && chOn.c) || 0 },
+        rules: { total: notifyToNum(ruAll && ruAll.c) || 0, enabled: notifyToNum(ruOn && ruOn.c) || 0 },
+        bindings: { enabled: notifyToNum(bdAll && bdAll.c) || 0 },
+        firing_states: notifyToNum(firing && firing.c) || 0,
+        templates: notifyToNum(tpl && tpl.c) || 0,
+        log_stats: logStats,
+        queue_stats: queueStats,
+        alert_threshold: notifyAdminStr(thrRow && thrRow.value)
+      };
+    }
+
+    // ---------- 通道 CRUD ----------
+    if (act === 'notify_list_channels') {
+      const res = await env.DB.prepare('SELECT id, type, name, config, enabled, created_at FROM notify_channels ORDER BY created_at ASC, id ASC').all();
+      const channels = ((res && res.results) || []).map(notifyNormalizeChannelRow).map((c) => {
+        const p = notifyGetProvider(c.type);
+        return Object.assign({}, c, { provider_name: p ? p.name : '', provider_known: !!p });
+      });
+      return { success: true, total: channels.length, channels: channels };
+    }
+    if (act === 'notify_save_channel') {
+      const src = notifyAdminJson(d.channel, {}) || {};
+      const pick = (k) => (src[k] === undefined ? d[k] : src[k]);
+      const type = notifyAdminStr(pick('type'));
+      if (!type) return fail('missing_type');
+      const provider = notifyGetProvider(type);
+      if (!provider) return fail('unknown_channel_type:' + type);
+      const id = notifyAdminStr(pick('id')) || notifyNewId('ch');
+      const name = notifyAdminStr(pick('name')) || (provider.name + ' 通道');
+      const config = notifyAdminJson(pick('config'), {});
+      const enabled = notifyTruthy(pick('enabled')) ? 1 : 0;
+      const existed = await env.DB.prepare('SELECT id FROM notify_channels WHERE id = ?').bind(id).first();
+      await env.DB.prepare('INSERT INTO notify_channels (id, type, name, config, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET type = excluded.type, name = excluded.name, config = excluded.config, enabled = excluded.enabled')
+        .bind(id, type, name, JSON.stringify(config), enabled, Date.now()).run();
+      const v = provider.validate(config);
+      return { success: true, id: id, created: !existed, config_valid: !!(v && v.ok === true), validate_error: (v && v.error) || '' };
+    }
+    if (act === 'notify_delete_channel') {
+      const id = notifyAdminStr(d.id || (d.channel && d.channel.id));
+      if (!id) return fail('missing_id');
+      const bd = await env.DB.prepare('DELETE FROM notify_bindings WHERE channel_id = ?').bind(id).run();
+      const res = await env.DB.prepare('DELETE FROM notify_channels WHERE id = ?').bind(id).run();
+      return {
+        success: true, id: id,
+        deleted: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0,
+        deleted_bindings: notifyToNum(bd && bd.meta && bd.meta.changes) || 0
+      };
+    }
+    if (act === 'notify_toggle_channel') {
+      const id = notifyAdminStr(d.id || (d.channel && d.channel.id));
+      if (!id) return fail('missing_id');
+      const enabled = notifyTruthy(d.enabled) ? 1 : 0;
+      const res = await env.DB.prepare('UPDATE notify_channels SET enabled = ? WHERE id = ?').bind(enabled, id).run();
+      return { success: true, id: id, enabled: enabled, updated: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0 };
+    }
+    if (act === 'notify_test_channel') {
+      const id = notifyAdminStr(d.id || (d.channel && d.channel.id));
+      if (!id) return fail('missing_id');
+      const row = await env.DB.prepare('SELECT id, type, name, config, enabled, created_at FROM notify_channels WHERE id = ?').bind(id).first();
+      if (!row) return fail('channel_not_found');
+      const ch = notifyNormalizeChannelRow(row);
+      const now = Date.now();
+      const payload = {
+        title: notifyAdminStr(d.title) || 'CF-Server-Monitor-Pro 测试通知',
+        text: notifyAdminStr(d.text) || ('这是一条来自后台通知中心的测试消息。\n通道: ' + ch.name + '\n时间: ' + notifyEventTime(now))
+      };
+      // 测试发送忽略通道 enabled 开关，便于保存前验证配置
+      const r = await sendViaChannel(Object.assign({}, ch, { enabled: 1 }), payload);
+      const ok = !!(r && r.ok === true);
+      let logId = '';
+      try {
+        const lg = await notifyLogWrite(env, {
+          rule_id: '', channel_id: ch.id, server_id: '', type: 'test', title: payload.title, content: payload.text,
+          status: ok ? 'sent' : 'failed', error: (r && r.error) || '', dedupe_key: 'test::' + ch.id + '::' + now,
+          attempts: 1, created_at: now, sent_at: ok ? now : 0
+        });
+        logId = (lg && lg.id) || '';
+      } catch (e) {}
+      return { success: true, id: ch.id, ok: ok, result: r, log_id: logId };
+    }
+
+    // ---------- 规则 CRUD ----------
+    if (act === 'notify_list_rules') {
+      const res = await env.DB.prepare('SELECT id, name, enabled, type, scope, params, severity, cooldown, silent_window, digest, recover_notify, created_at FROM notify_rules ORDER BY created_at ASC, id ASC').all();
+      const rules = ((res && res.results) || []).map(notifyNormalizeRuleRow).map((r) => Object.assign({}, r, {
+        type_name: (typeMetaById[r.type] || {}).name || r.type,
+        type_known: !!typeMetaById[r.type]
+      }));
+      const bdRes = await env.DB.prepare('SELECT rule_id, channel_id, enabled FROM notify_bindings').all();
+      const counts = {};
+      for (const row of ((bdRes && bdRes.results) || [])) {
+        if (!notifyTruthy(row && row.enabled)) continue;
+        const rid = notifyAdminStr(row && row.rule_id);
+        counts[rid] = (counts[rid] || 0) + 1;
+      }
+      for (const r of rules) r.channel_count = counts[r.id] || 0;
+      return { success: true, total: rules.length, rules: rules };
+    }
+    if (act === 'notify_save_rule') {
+      const src = notifyAdminJson(d.rule, {}) || {};
+      const pick = (k) => (src[k] === undefined ? d[k] : src[k]);
+      const type = notifyAdminStr(pick('type')) || 'offline';
+      if (!typeMetaById[type]) return fail('unknown_rule_type:' + type);
+      const id = notifyAdminStr(pick('id')) || notifyNewId('rule');
+      const name = notifyAdminStr(pick('name')) || (typeMetaById[type].name + ' 规则');
+      const scope = notifyAdminJson(pick('scope'), {});
+      const params = notifyAdminJson(pick('params'), {});
+      let severity = notifyAdminStr(pick('severity')) || 'warning';
+      if (!severitySet[severity]) severity = 'warning';
+      let cooldown = parseInt(pick('cooldown'), 10);
+      if (isNaN(cooldown) || cooldown < 0) cooldown = 0;
+      const silentWindow = notifyAdminStr(pick('silent_window'));
+      const digest = notifyAdminStr(pick('digest')) || 'off';
+      const recoverNotify = notifyTruthy(pick('recover_notify')) ? 1 : 0;
+      const enabled = notifyTruthy(pick('enabled')) ? 1 : 0;
+      const existed = await env.DB.prepare('SELECT id FROM notify_rules WHERE id = ?').bind(id).first();
+      await env.DB.prepare('INSERT INTO notify_rules (id, name, enabled, type, scope, params, severity, cooldown, silent_window, digest, recover_notify, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = excluded.enabled, type = excluded.type, scope = excluded.scope, params = excluded.params, severity = excluded.severity, cooldown = excluded.cooldown, silent_window = excluded.silent_window, digest = excluded.digest, recover_notify = excluded.recover_notify')
+        .bind(id, name, enabled, type, scope === null ? '{}' : JSON.stringify(scope), params === null ? '{}' : JSON.stringify(params), severity, cooldown, silentWindow, digest, recoverNotify, Date.now()).run();
+      // 双向同步：offline 规则阈值 → settings.alert_threshold
+      let sync = null;
+      if (type === 'offline') {
+        const thr = notifyToNum(params && params.threshold);
+        if (thr !== null && thr > 0) sync = await notifySyncSettingThresholdFromRule(env, thr);
+      }
+      return { success: true, id: id, created: !existed, threshold_sync: sync };
+    }
+    if (act === 'notify_delete_rule') {
+      const id = notifyAdminStr(d.id || (d.rule && d.rule.id));
+      if (!id) return fail('missing_id');
+      const bd = await env.DB.prepare('DELETE FROM notify_bindings WHERE rule_id = ?').bind(id).run();
+      const st = await env.DB.prepare('DELETE FROM alert_state WHERE rule_id = ?').bind(id).run();
+      const res = await env.DB.prepare('DELETE FROM notify_rules WHERE id = ?').bind(id).run();
+      return {
+        success: true, id: id,
+        deleted: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0,
+        deleted_bindings: notifyToNum(bd && bd.meta && bd.meta.changes) || 0,
+        deleted_states: notifyToNum(st && st.meta && st.meta.changes) || 0
+      };
+    }
+    if (act === 'notify_toggle_rule') {
+      const id = notifyAdminStr(d.id || (d.rule && d.rule.id));
+      if (!id) return fail('missing_id');
+      const enabled = notifyTruthy(d.enabled) ? 1 : 0;
+      const res = await env.DB.prepare('UPDATE notify_rules SET enabled = ? WHERE id = ?').bind(enabled, id).run();
+      return { success: true, id: id, enabled: enabled, updated: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0 };
+    }
+
+    // ---------- 规则 × 通道绑定 ----------
+    if (act === 'notify_list_bindings') {
+      const rid = notifyAdminStr(d.rule_id);
+      const cid = notifyAdminStr(d.channel_id);
+      const parts = [];
+      const binds = [];
+      if (rid) { parts.push('rule_id = ?'); binds.push(rid); }
+      if (cid) { parts.push('channel_id = ?'); binds.push(cid); }
+      const where = parts.length ? (' WHERE ' + parts.join(' AND ')) : '';
+      const res = await env.DB.prepare('SELECT rule_id, channel_id, enabled, created_at FROM notify_bindings' + where + ' ORDER BY created_at ASC').bind.apply(env.DB.prepare('SELECT rule_id, channel_id, enabled, created_at FROM notify_bindings' + where + ' ORDER BY created_at ASC'), binds).all();
+      const nameMaps = { rules: {}, channels: {}, channelTypes: {} };
+      const rRes = await env.DB.prepare('SELECT id, name FROM notify_rules').all();
+      for (const row of ((rRes && rRes.results) || [])) nameMaps.rules[notifyAdminStr(row.id)] = notifyAdminStr(row.name);
+      const cRes = await env.DB.prepare('SELECT id, name, type FROM notify_channels').all();
+      for (const row of ((cRes && cRes.results) || [])) {
+        nameMaps.channels[notifyAdminStr(row.id)] = notifyAdminStr(row.name);
+        nameMaps.channelTypes[notifyAdminStr(row.id)] = notifyAdminStr(row.type);
+      }
+      const bindings = ((res && res.results) || []).map((row) => notifyAdminBindingRow(row, nameMaps));
+      return { success: true, total: bindings.length, bindings: bindings };
+    }
+    if (act === 'notify_save_bindings') {
+      const rid = notifyAdminStr(d.rule_id || (d.binding && d.binding.rule_id));
+      if (!rid) return fail('missing_rule_id');
+      const listRaw = (d.channel_ids === undefined ? (d.channelIds === undefined ? (d.binding && d.binding.channel_ids) : d.channelIds) : d.channel_ids);
+      const list = (Array.isArray(listRaw) ? listRaw : []).map(notifyAdminStr).filter(Boolean);
+      const del = await env.DB.prepare('DELETE FROM notify_bindings WHERE rule_id = ?').bind(rid).run();
+      const now = Date.now();
+      let inserted = 0;
+      for (const cid of list) {
+        const r = await env.DB.prepare('INSERT OR REPLACE INTO notify_bindings (rule_id, channel_id, enabled, created_at) VALUES (?, ?, 1, ?)').bind(rid, cid, now).run();
+        inserted += (notifyToNum(r && r.meta && r.meta.changes) || 0);
+      }
+      return { success: true, rule_id: rid, removed: notifyToNum(del && del.meta && del.meta.changes) || 0, inserted: inserted, channel_ids: list };
+    }
+    if (act === 'notify_toggle_binding') {
+      const rid = notifyAdminStr(d.rule_id || (d.binding && d.binding.rule_id));
+      const cid = notifyAdminStr(d.channel_id || (d.binding && d.binding.channel_id));
+      if (!rid || !cid) return fail('missing_rule_or_channel_id');
+      const enabled = notifyTruthy(d.enabled) ? 1 : 0;
+      if (enabled) {
+        await env.DB.prepare('INSERT INTO notify_bindings (rule_id, channel_id, enabled, created_at) VALUES (?, ?, 1, ?) ON CONFLICT(rule_id, channel_id) DO UPDATE SET enabled = 1').bind(rid, cid, Date.now()).run();
+      } else {
+        await env.DB.prepare('UPDATE notify_bindings SET enabled = 0 WHERE rule_id = ? AND channel_id = ?').bind(rid, cid).run();
+      }
+      return { success: true, rule_id: rid, channel_id: cid, enabled: enabled };
+    }
+
+    // ---------- 通知日志查询（时间/规则/通道/节点/状态/类型过滤 + 分页） ----------
+    if (act === 'notify_list_logs') {
+      const pageOpts = notifyAdminPageOpts(d);
+      const range = notifyAdminTimeRange(d);
+      const parts = [];
+      const binds = [];
+      const eq = [['rule_id', 'rule_id'], ['channel_id', 'channel_id'], ['server_id', 'server_id'], ['status', 'status'], ['type', 'type']];
+      for (const pair of eq) {
+        const v = notifyAdminStr(d[pair[0]]);
+        if (v) { parts.push(pair[1] + ' = ?'); binds.push(v); }
+      }
+      if (range.start !== null) { parts.push('created_at >= ?'); binds.push(range.start); }
+      if (range.end !== null) { parts.push('created_at <= ?'); binds.push(range.end); }
+      const where = parts.length ? (' WHERE ' + parts.join(' AND ')) : '';
+      const page = await notifyAdminPagedQuery(env, 'notify_log', where, binds, ' ORDER BY created_at DESC, id DESC', pageOpts);
+      return {
+        success: true, total: page.total, page: page.page, page_size: page.page_size, pages: page.pages,
+        items: page.items.map(notifyAdminLogRow)
+      };
+    }
+
+    // ---------- 投递队列查询（时间/规则/通道/节点/状态过滤 + 分页） ----------
+    if (act === 'notify_list_queue') {
+      const pageOpts = notifyAdminPageOpts(d);
+      const range = notifyAdminTimeRange(d);
+      const parts = [];
+      const binds = [];
+      const eq = [['rule_id', 'rule_id'], ['channel_id', 'channel_id'], ['server_id', 'server_id'], ['status', 'status']];
+      for (const pair of eq) {
+        const v = notifyAdminStr(d[pair[0]]);
+        if (v) { parts.push(pair[1] + ' = ?'); binds.push(v); }
+      }
+      if (range.start !== null) { parts.push('created_at >= ?'); binds.push(range.start); }
+      if (range.end !== null) { parts.push('created_at <= ?'); binds.push(range.end); }
+      const where = parts.length ? (' WHERE ' + parts.join(' AND ')) : '';
+      const page = await notifyAdminPagedQuery(env, 'notify_queue', where, binds, ' ORDER BY created_at DESC, id DESC', pageOpts);
+      return {
+        success: true, total: page.total, page: page.page, page_size: page.page_size, pages: page.pages,
+        items: page.items.map(notifyAdminQueueRow)
+      };
+    }
+
+    // ---------- 模板 CRUD ----------
+    if (act === 'notify_list_templates') {
+      const parts = [];
+      const binds = [];
+      const t = notifyAdminStr(d.type);
+      const ct = notifyAdminStr(d.channel_type);
+      if (t) { parts.push('type = ?'); binds.push(t); }
+      if (ct) { parts.push('channel_type = ?'); binds.push(ct); }
+      if (d.enabled !== undefined && d.enabled !== null && notifyAdminStr(d.enabled) !== '') {
+        parts.push('enabled = ?'); binds.push(notifyTruthy(d.enabled) ? 1 : 0);
+      }
+      const where = parts.length ? (' WHERE ' + parts.join(' AND ')) : '';
+      const sql = 'SELECT id, name, type, channel_type, content, enabled, created_at, updated_at FROM notify_templates' + where + ' ORDER BY updated_at DESC, created_at DESC';
+      const res = await (binds.length ? env.DB.prepare(sql).bind.apply(env.DB.prepare(sql), binds) : env.DB.prepare(sql)).all();
+      const templates = ((res && res.results) || []).map(notifyAdminTemplateRow);
+      return { success: true, total: templates.length, templates: templates,
+        builtins: notifyTemplateBuiltinRows(), vars: NOTIFY_TEMPLATE_VARS, types: NOTIFY_TEMPLATE_TYPES };
+    }
+    if (act === 'notify_get_template') {
+      const id = notifyAdminStr(d.id || (d.template && d.template.id));
+      if (!id) return fail('missing_id');
+      const row = await env.DB.prepare('SELECT id, name, type, channel_type, content, enabled, created_at, updated_at FROM notify_templates WHERE id = ?').bind(id).first();
+      if (!row) return fail('template_not_found');
+      return { success: true, template: notifyAdminTemplateRow(row) };
+    }
+    if (act === 'notify_save_template') {
+      const src = notifyAdminJson(d.template, {}) || {};
+      const pick = (k) => (src[k] === undefined ? d[k] : src[k]);
+      const id = notifyAdminStr(pick('id')) || notifyNewId('tpl');
+      const name = notifyAdminStr(pick('name')) || '未命名模板';
+      const type = notifyAdminStr(pick('type'));
+      const channelType = notifyAdminStr(pick('channel_type'));
+      const content = notifyAdminStr(pick('content'));
+      const enabled = notifyTruthy(pick('enabled')) ? 1 : 0;
+      const existed = await env.DB.prepare('SELECT id, created_at FROM notify_templates WHERE id = ?').bind(id).first();
+      const now = Date.now();
+      const createdAt = notifyToNum(existed && existed.created_at) || now;
+      await env.DB.prepare('INSERT INTO notify_templates (id, name, type, channel_type, content, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, type = excluded.type, channel_type = excluded.channel_type, content = excluded.content, enabled = excluded.enabled, updated_at = excluded.updated_at')
+        .bind(id, name, type, channelType, content, enabled, createdAt, now).run();
+      return { success: true, id: id, created: !existed };
+    }
+    if (act === 'notify_delete_template') {
+      const id = notifyAdminStr(d.id || (d.template && d.template.id));
+      if (!id) return fail('missing_id');
+      const res = await env.DB.prepare('DELETE FROM notify_templates WHERE id = ?').bind(id).run();
+      return { success: true, id: id, deleted: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0 };
+    }
+
+    // ---------- 模板渲染预览（模板中心：实时预览，数据为模拟或自定义） ----------
+    if (act === 'notify_test_render') {
+      const id = notifyAdminStr(d.id || (d.template && d.template.id));
+      let content = notifyAdminStr(d.content);
+      if (!content && id) {
+        const row = await env.DB.prepare('SELECT content FROM notify_templates WHERE id = ?').bind(id).first();
+        if (row) content = notifyAdminStr(row.content);
+        else {
+          const bi = notifyTemplateBuiltinById(id);
+          if (!bi) return fail('template_not_found');
+          content = notifyTemplateBuiltinContent(bi);
+        }
+      }
+      if (!content) return fail('missing_content');
+      const parts = notifyTemplateParseContent(content);
+      const data = notifyTemplateVarMap(Object.assign({}, notifyTemplateSampleData(), notifyAdminJson(d.data, {}) || {}));
+      const tRes = notifyRenderTemplateText(parts.title, data);
+      const bRes = notifyRenderTemplateText(parts.body, data);
+      return {
+        success: true, id: id, title: tRes.text, body: bRes.text,
+        vars_used: notifyMergeKeys(tRes.used, bRes.used),
+        vars_missing: notifyMergeKeys(tRes.missing, bRes.missing),
+        data: data, plain_content: parts.json ? 0 : 1
+      };
+    }
+    // ---------- 恢复默认（内置模板：删除覆盖行；自定义模板：按事件类型写回内置默认内容） ----------
+    if (act === 'notify_reset_template') {
+      const id = notifyAdminStr(d.id || (d.template && d.template.id));
+      if (!id) return fail('missing_id');
+      const row = await env.DB.prepare('SELECT id, name, type, channel_type, created_at FROM notify_templates WHERE id = ?').bind(id).first();
+      const bi = notifyTemplateBuiltinById(id);
+      if (bi) {
+        const del = await env.DB.prepare('DELETE FROM notify_templates WHERE id = ?').bind(id).run();
+        return { success: true, id: id, reset: true, removed_override: (notifyToNum(del && del.meta && del.meta.changes) || 0) > 0, template: notifyTemplateBuiltinRow(bi) };
+      }
+      if (!row) return fail('template_not_found');
+      const src = notifyTemplateBuiltinByType(row.type);
+      if (!src) return fail('no_default_template:' + notifyAdminStr(row.type));
+      const now = Date.now();
+      await env.DB.prepare('UPDATE notify_templates SET content = ?, updated_at = ? WHERE id = ?')
+        .bind(notifyTemplateBuiltinContent(src), now, id).run();
+      const upd = await env.DB.prepare('SELECT id, name, type, channel_type, content, enabled, created_at, updated_at FROM notify_templates WHERE id = ?').bind(id).first();
+      return { success: true, id: id, reset: true, removed_override: false, template: notifyAdminTemplateRow(upd) };
+    }
+    return fail('unknown_action:' + act);
+  } catch (e) {
+    return fail((e && e.message) || e);
+  }
+}
+// ===== 后台通知中心 / 模板中心 JSON 接口 END =====
+
+// 全站统一主题引导脚本（后台管理页 / 节点详情页 / 首页大盘共用同一份实现，替代此前三份重复副本）
+// 暗色主题名单不再硬编码，由调用方传入（数据来源：主题数据 availableThemes[].is_dark）
+function buildThemeBootJs(darkThemeIds) {
+  const darkList = JSON.stringify((darkThemeIds || []).map(String));
+  return `(function(){
+  var DARK_THEMES = ${darkList};
+  var THEME_MODE_KEY = 'monitor_theme_mode';
+  function getThemeMode(){
+    try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; }
+  }
+  function isDarkTheme(){
+    var cls = document.body ? document.body.className : '';
+    for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
+    return false;
+  }
+  function applyThemeMode(notify){
+    if (!document.body) return;
+    var mode = getThemeMode();
+    document.body.classList.remove('forced-dark','forced-light');
+    if (mode === 'dark') document.body.classList.add('forced-dark');
+    else if (mode === 'light') document.body.classList.add('forced-light');
+    else {
+      var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (sysDark && !isDarkTheme()) document.body.classList.add('forced-dark');
+    }
+    var btns = document.querySelectorAll('.theme-mode-btn');
+    var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
+    for (var j=0;j<btns.length;j++){ btns[j].textContent = label; btns[j].setAttribute('data-mode', mode); }
+    if (notify && window.__uiThemeChanged) window.__uiThemeChanged();
+  }
+  window.getThemeMode = getThemeMode;
+  window.applyThemeMode = applyThemeMode;
+  window.setThemeMode = function(m){ try { localStorage.setItem(THEME_MODE_KEY, m); } catch(e){} applyThemeMode(true); };
+  window.cycleThemeMode = function(){
+    var order = ['system','dark','light'];
+    window.setThemeMode(order[(order.indexOf(getThemeMode()) + 1) % 3]);
+  };
+  window.uiDark = function(){
+    var cls = document.body ? document.body.className : '';
+    if (cls.indexOf('forced-dark') !== -1) return true;
+    if (cls.indexOf('forced-light') !== -1) return false;
+    return isDarkTheme() || !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  };
+  window.adminApplyThemeMode = applyThemeMode;
+  window.adminCycleThemeMode = window.cycleThemeMode;
+  function initThemeMode(){
+    applyThemeMode(false);
+    try {
+      var mql = window.matchMedia('(prefers-color-scheme: dark)');
+      var onSchemeChange = function(){ if (getThemeMode() === 'system') applyThemeMode(true); };
+      if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
+      else if (mql.addListener) mql.addListener(onSchemeChange);
+    } catch(e){}
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initThemeMode);
+  else initThemeMode();
+})();`;
+}
+
+// 定时告警扫描（B-3 起切换为统一引擎）：仅按独立节流键触发一次通知周期，并附带失败补发闭环，
+// 不再自行实现离线判定与直发（判定/投递/状态维护均由 runNotifyCycle 与 drainNotifyQueue 承担）
+async function scheduledAlertCheck(env) {
+  try {
+    return await runNotifyTriggered(env, NOTIFY_TRIGGER_KEY_CRON, { drain: true });
+  } catch (e) { return null; }
 }
 
 export default {
@@ -114,6 +2165,137 @@ export default {
                }
            } catch(e) {}
         }
+        // ===== 通知中心数据层（通知重构第1步：通道/规则/订阅/状态/日志/队列/模板，幂等新增） =====
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_channels (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          name TEXT DEFAULT '',
+          config TEXT DEFAULT '{}',
+          enabled INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT 0
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_rules (
+          id TEXT PRIMARY KEY,
+          name TEXT DEFAULT '',
+          enabled INTEGER DEFAULT 1,
+          type TEXT DEFAULT 'offline',
+          scope TEXT DEFAULT '{}',
+          params TEXT DEFAULT '{}',
+          severity TEXT DEFAULT 'warning',
+          cooldown INTEGER DEFAULT 0,
+          silent_window TEXT DEFAULT '',
+          digest TEXT DEFAULT 'off',
+          recover_notify INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT 0
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_bindings (
+          rule_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          enabled INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT 0,
+          PRIMARY KEY (rule_id, channel_id)
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS alert_state (
+          rule_id TEXT NOT NULL,
+          server_id TEXT NOT NULL,
+          state TEXT DEFAULT 'ok',
+          since INTEGER DEFAULT 0,
+          last_notified_at INTEGER DEFAULT 0,
+          fire_count INTEGER DEFAULT 0,
+          PRIMARY KEY (rule_id, server_id)
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_log (
+          id TEXT PRIMARY KEY,
+          rule_id TEXT DEFAULT '',
+          channel_id TEXT DEFAULT '',
+          server_id TEXT DEFAULT '',
+          type TEXT DEFAULT '',
+          title TEXT DEFAULT '',
+          content TEXT DEFAULT '',
+          status TEXT DEFAULT 'pending',
+          error TEXT DEFAULT '',
+          dedupe_key TEXT UNIQUE,
+          attempts INTEGER DEFAULT 0,
+          created_at INTEGER DEFAULT 0,
+          sent_at INTEGER DEFAULT 0
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_queue (
+          id TEXT PRIMARY KEY,
+          log_id TEXT DEFAULT '',
+          rule_id TEXT DEFAULT '',
+          channel_id TEXT DEFAULT '',
+          server_id TEXT DEFAULT '',
+          payload TEXT DEFAULT '{}',
+          status TEXT DEFAULT 'pending',
+          attempts INTEGER DEFAULT 0,
+          next_retry_at INTEGER DEFAULT 0,
+          last_error TEXT DEFAULT '',
+          created_at INTEGER DEFAULT 0
+        )`).run();
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS notify_templates (
+          id TEXT PRIMARY KEY,
+          name TEXT DEFAULT '',
+          type TEXT DEFAULT '',
+          channel_type TEXT DEFAULT '',
+          content TEXT DEFAULT '',
+          enabled INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT 0,
+          updated_at INTEGER DEFAULT 0
+        )`).run();
+        await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_notify_log_created ON notify_log (created_at DESC)`).run();
+        await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_notify_queue_retry ON notify_queue (status, next_retry_at)`).run();
+        await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_alert_state_server ON alert_state (server_id)`).run();
+        await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_notify_bindings_channel ON notify_bindings (channel_id)`).run();
+
+        // ===== 旧配置迁移：旧 tg_* → telegram 通道 + 离线/恢复默认规则；旧 alert_state → rule-scoped（幂等） =====
+        try {
+          const notifyMeta = {};
+          const { results: notifySettingRows } = await env.DB.prepare('SELECT key, value FROM settings').all();
+          if (notifySettingRows) notifySettingRows.forEach(r => { notifyMeta[r.key] = r.value; });
+          const notifyChCnt = await env.DB.prepare('SELECT COUNT(*) AS c FROM notify_channels').first();
+          const hasLegacyTg = !!(notifyMeta.tg_bot_token || notifyMeta.tg_chat_id || notifyMeta.tg_notify);
+          if (hasLegacyTg && (!notifyChCnt || notifyChCnt.c === 0)) {
+            const migTs = Date.now();
+            const migThreshold = parseInt(notifyMeta.alert_threshold || '120', 10) || 120;
+            const legacyChannelCfg = {};
+            if (notifyMeta.tg_bot_token) legacyChannelCfg.bot_token = notifyMeta.tg_bot_token;
+            if (notifyMeta.tg_chat_id) legacyChannelCfg.chat_id = notifyMeta.tg_chat_id;
+            if (notifyMeta.tg_webhook) legacyChannelCfg.webhook = notifyMeta.tg_webhook;
+            if (notifyMeta.tg_webhook_secret) legacyChannelCfg.webhook_secret = notifyMeta.tg_webhook_secret;
+            await env.DB.prepare('INSERT OR IGNORE INTO notify_channels (id, type, name, config, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+              .bind('ch_telegram_default', 'telegram', '默认 Telegram 通道', JSON.stringify(legacyChannelCfg), notifyMeta.tg_notify === 'true' ? 1 : 0, migTs).run();
+            const legacyRules = [
+              { id: 'rule_offline_default', name: '节点离线告警', rtype: 'offline', severity: 'critical', recover_notify: 1 },
+              { id: 'rule_recover_default', name: '节点恢复通知', rtype: 'recover', severity: 'info', recover_notify: 0 }
+            ];
+            for (const lr of legacyRules) {
+              await env.DB.prepare('INSERT OR IGNORE INTO notify_rules (id, name, enabled, type, scope, params, severity, cooldown, silent_window, digest, recover_notify, created_at) VALUES (?, ?, 1, ?, ?, ?, ?, 0, ?, ?, ?, ?)')
+                .bind(lr.id, lr.name, lr.rtype, '{}', JSON.stringify({ threshold: migThreshold }), lr.severity, '', 'off', lr.recover_notify, migTs).run();
+              await env.DB.prepare('INSERT OR IGNORE INTO notify_bindings (rule_id, channel_id, enabled, created_at) VALUES (?, ?, 1, ?)')
+                .bind(lr.id, 'ch_telegram_default', migTs).run();
+            }
+          }
+          // 旧 settings.alert_state 结构 { serverId: true } → alert_state 表（rule-scoped）
+          const legacyStateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
+          if (legacyStateRow && legacyStateRow.value) {
+            let legacyState = null;
+            try { legacyState = JSON.parse(legacyStateRow.value); } catch (e) {}
+            if (legacyState && typeof legacyState === 'object' && !Array.isArray(legacyState)) {
+              const firingIds = Object.keys(legacyState).filter(k => legacyState[k] === true || legacyState[k] === 1 || legacyState[k] === 'true');
+              if (firingIds.length > 0) {
+                const offlineRuleCnt = await env.DB.prepare("SELECT COUNT(*) AS c FROM notify_rules WHERE id = 'rule_offline_default'").first();
+                const offlineStateCnt = await env.DB.prepare("SELECT COUNT(*) AS c FROM alert_state WHERE rule_id = 'rule_offline_default'").first();
+                if (offlineRuleCnt && offlineRuleCnt.c > 0 && (!offlineStateCnt || offlineStateCnt.c === 0)) {
+                  const migTs2 = Date.now();
+                  for (const offlineSid of firingIds) {
+                    await env.DB.prepare('INSERT OR IGNORE INTO alert_state (rule_id, server_id, state, since, last_notified_at, fire_count) VALUES (?, ?, ?, ?, ?, ?)')
+                      .bind('rule_offline_default', offlineSid, 'firing', migTs2, migTs2, 1).run();
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {}
         globalThis.dbInitialized = true;
       } catch (e) {}
     }
@@ -282,49 +2464,21 @@ export default {
         return { cmd, unCmd, osType };
     };
 
+    // 旧直发兜底：B-3 起主链路已改由统一引擎投递，本函数保留供异常兜底/人工调用，不再被告警主链路引用
     const sendTelegram = async (msg) => {
       if (sys.tg_notify !== 'true' || !sys.tg_bot_token || !sys.tg_chat_id) return;
       try {
-        await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' }),
-          signal: AbortSignal.timeout(10000)
-        });
+        const tgChannel = await notifyResolveTelegramChannel(env, sys);
+        await sendViaChannel(tgChannel, { text: msg });
       } catch (e) {}
     };
 
+    // 探针上报触发的离线巡检（B-3 起切换为统一引擎）：使用独立节流键 
+    // last_offline_scan_at，与 Cron 路径互不抢占窗口，彻底消除旧双实现抢锁问题
     const checkOfflineNodes = async () => {
-      if (sys.tg_notify !== 'true') return;
       try {
-        // 节流：全量离线扫描每 30 秒最多执行一次（多节点高频上报场景可显著降低 CPU 消耗）
-        const lastCheckRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_alert_check_at'").first();
-        const lastCheckAt = lastCheckRow ? parseInt(lastCheckRow.value || '0') : 0;
-        if (Date.now() - lastCheckAt < 30000) return;
-
-        const { results: allServers } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
-        let alertState = {};
-        const stateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
-        if (stateRes) { try { alertState = JSON.parse(stateRes.value) || {}; } catch (e) { alertState = {}; } }
-
-        let stateChanged = false;
-        const now = Date.now();
-        const alertThresMs = parseInt(sys.alert_threshold || '120') * 1000;
-
-        for (const s of allServers) {
-          const diff = now - s.last_updated;
-          const isOffline = diff > alertThresMs; 
-
-          if (isOffline && !alertState[s.id]) {
-            await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${esc(s.name)}\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            alertState[s.id] = true; stateChanged = true;
-          } else if (!isOffline && alertState[s.id]) {
-            await sendTelegram(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${esc(s.name)}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            delete alertState[s.id]; stateChanged = true;
-          }
-        }
-        if (stateChanged) await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
-        await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("last_alert_check_at", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(String(now)).run();
-      } catch (e) {}
+        return await runNotifyTriggered(env, NOTIFY_TRIGGER_KEY_REPORT, { drain: false });
+      } catch (e) { return null; }
     };
 
     const getFooterHtml = (sys) => `
@@ -336,12 +2490,43 @@ export default {
         Powered by <a href="https://github.com/C018/CF-Server-Monitor-Pro" target="_blank" style="color: #3b82f6; text-decoration: none; font-weight: 600;">CF-Server-Monitor-Pro (Gossip Edition)</a>
       </div>
     `;
+    // ==========================================
+    // 统一页面骨架 renderLayout：收敛四页共用的 HTML 文档骨架、meta、title、
+    // 样式三段式（themeOverrides -> 页面私有 -> themeStyles）与 custom_* 注入点。
+    // head 顺序契约：headStart(meta) -> title -> headExtra(主题引导/外部资源)
+    //   -> customHead(custom_head) -> headTail(themeOverrides + 页面私有 + themeStyles)
+    // body 顺序契约：content -> scripts(页面主脚本) -> customScript(custom_script)
+    // 换行约定：headExtra / customHead / customScript 需自带尾换行；headTail / scripts 无需尾换行。
+    // ==========================================
+    const renderLayout = ({
+      title = '', headExtra = '', customHead = '', headTail = '',
+      htmlAttrs = '', bodyClass = '', bodyAttrs = '',
+      content = '', scripts = '', customScript = '',
+      headStart = `<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">`,
+    }) => `<!DOCTYPE html>
+<html${htmlAttrs}>
+<head>
+${headStart}
+<title>${title}</title>
+${headExtra}${customHead}${headTail}
+</head>
+<body${bodyClass ? ' class="' + bodyClass + '"' : ''}${bodyAttrs ? ' ' + bodyAttrs : ''}>
+${content}
+${scripts}
+${customScript}</body>
+</html>`;
 
     const currentThemeObj = availableThemes.find(t => t.id === sys.theme) || availableThemes[0];
     let themeOverrides = currentThemeObj.css || '';
     if (currentThemeObj.has_custom_css || currentThemeObj.id === 'theme6') themeOverrides += `\n${sys.custom_css || ''}`;
 
-    const themeStyles = `
+    // 暗色主题 ID 名单与 CSS 选择器：由主题数据动态映射（cached_nodes_data -> availableThemes[].is_dark），新增主题无需改代码
+    const darkThemeIds = availableThemes.filter(t => t && String(t.is_dark) === 'true')
+      .map(t => String(t.id || '').replace(/[^A-Za-z0-9_-]/g, '')).filter(Boolean);
+    const darkThemeSelector = ['body.forced-dark'].concat(darkThemeIds.map(id => 'body.' + id)).join(', ');
+    // 设计令牌层（亮 / 暗两套，单一来源）：前台 themeStyles、登录页、后台管理页共用
+    const themeTokenCss = `
       /* ================= 设计系统：CSS 变量体系 ================= */
       :root {
         --bg: #f5f5f7; --card: #ffffff; --card2: #f2f2f7; --card3: #e8e8ed;
@@ -368,8 +2553,8 @@ export default {
           --glass: rgba(28,28,30,0.62); --glass-hover: rgba(44,44,46,0.9); --glass-shadow: 0 1px 4px rgba(0,0,0,0.75);
         }
       }
-      /* 深色主题类（theme2/4/5/6/8）强制暗色变量，优先级高于 prefers-color-scheme */
-      body.theme2, body.theme4, body.theme5, body.theme6, body.theme8, body.forced-dark {
+      /* 深色主题类（由主题数据 is_dark 动态生成，见 darkThemeIds / darkThemeSelector）强制暗色变量，优先级高于 prefers-color-scheme */
+      ${darkThemeSelector} {
         --bg: #000000; --card: #1c1c1e; --card2: #2c2c2e; --card3: #3a3a3c;
         --text: #f5f5f7; --text2: #98989d; --text3: #636366;
         --separator: rgba(255,255,255,0.14); --separator-strong: rgba(255,255,255,0.28);
@@ -390,6 +2575,11 @@ export default {
         --seg-bg: rgba(120,120,128,0.12);
         --glass: rgba(255,255,255,0.55); --glass-hover: rgba(255,255,255,0.88); --glass-shadow: 0 0 4px rgba(255,255,255,0.65), 0 1px 2px rgba(255,255,255,0.5);
       }
+    `;
+
+    const themeStyles = `
+      ${themeTokenCss}
+
       /* body 基础：字体 / 背景 / 文字 */
       body {
         font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -879,6 +3069,10 @@ export default {
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
+          if (data.settings && data.settings.alert_threshold !== undefined) {
+            // 双向同步：设置项 → offline 规则 params.threshold（含迁移快照规则），防止后台设置与规则参数漂移
+            data.alert_threshold_sync = await notifySyncRuleThresholdFromSetting(env, data.settings.alert_threshold);
+          }
           if (data.settings.tg_bot_token) {
              // 复用已有 webhook secret；仅在确实没有时才生成新值，且必须等 Telegram 侧 setWebhook 成功才落库，
              // 避免保存失败/网络异常时 DB 与 Telegram 侧 secret 不一致，导致后续全部 webhook 管理请求 403
@@ -974,6 +3168,11 @@ export default {
             }
           } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
         }
+        else if (typeof data.action === 'string' && data.action.indexOf('notify_') === 0) {
+          // 通知中心 / 模板中心 JSON 接口（第4步A）：统一信封 { success, ... }，仅返回 JSON，不做整页渲染
+          const notifyOut = await handleNotifyAdminApi(data, env);
+          return new Response(JSON.stringify(notifyOut), { headers: { 'Content-Type': 'application/json' } });
+        }
       } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
     }
 
@@ -987,34 +3186,32 @@ export default {
         const _site = esc(sys.site_title);
         const _loginUrl = JSON.stringify(sys.admin_path + '/login');
         const _adminPathJs = JSON.stringify(sys.admin_path);
-        return new Response(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${_t}</title>
+        return new Response(renderLayout({
+          htmlAttrs: ' lang="zh-CN"',
+          headStart: `<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">`,
+          title: _t,
+          headTail: `<style>${themeTokenCss}</style>
 <style>
   *{margin:0;padding:0;box-sizing:border-box;}
-  body{font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh;}
-  .card{background:#fff;border-radius:12px;padding:40px 36px;width:340px;box-shadow:0 10px 30px rgba(0,0,0,.08);}
-  h1{font-size:18px;text-align:center;color:#1f2937;margin-bottom:6px;}
-  p.sub{font-size:13px;text-align:center;color:#9ca3af;margin-bottom:24px;}
-  input{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;outline:none;margin-bottom:14px;}
-  input:focus{border-color:#3b82f6;}
-  button{width:100%;padding:10px 12px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer;}
+  body{font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;}
+  .card{background:var(--card);border:1px solid var(--separator);border-radius:var(--radius);padding:40px 36px;width:340px;box-shadow:var(--shadow);}
+  h1{font-size:18px;text-align:center;color:var(--text);margin-bottom:6px;}
+  p.sub{font-size:13px;text-align:center;color:var(--text2);margin-bottom:24px;}
+  input{width:100%;padding:10px 12px;border:1px solid var(--separator-strong);border-radius:var(--radius-xs);font-size:14px;outline:none;margin-bottom:14px;background:var(--card);color:var(--text);}
+  input:focus{border-color:var(--accent);}
+  button{width:100%;padding:10px 12px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius-xs);font-size:15px;cursor:pointer;}
   button:disabled{opacity:.6;cursor:not-allowed;}
-  .err{color:#dc2626;font-size:13px;text-align:center;margin-top:12px;min-height:18px;}
-</style>
-</head>
-<body>
-  <div class="card">
+  .err{color:var(--red);font-size:13px;text-align:center;margin-top:12px;min-height:18px;}
+</style>`,
+          content: `  <div class="card">
     <h1>${_t}</h1>
     <p class="sub">${_site}</p>
     <input type="password" id="pwd" placeholder="请输入管理密码" autocomplete="current-password" autofocus>
     <button id="btn">登 录</button>
     <div class="err" id="msg"></div>
-  </div>
-<script>
+  </div>`,
+          scripts: `<script>
 (function(){
   var btn=document.getElementById('btn'), pwd=document.getElementById('pwd'), msg=document.getElementById('msg');
   async function doLogin(){
@@ -1030,9 +3227,8 @@ export default {
   btn.addEventListener('click',doLogin);
   pwd.addEventListener('keydown',function(e){ if(e.key==='Enter') doLogin(); });
 })();
-</script>
-</body>
-</html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+</script>`
+        }), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
       }
       const { results } = await env.DB.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day, sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
       const now = Date.now();
@@ -1095,87 +3291,125 @@ export default {
           themeSelectOptions += `<option value="${t.id}" data-custom="${t.has_custom_css ? 'true' : 'false'}" ${sys.theme === t.id ? 'selected' : ''}>${t.name}</option>`;
       });
 
-      const html = `<!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <title>${sys.admin_title}</title>
+      return new Response(renderLayout({
+        headStart: `        <meta charset="UTF-8">`,
+        title: sys.admin_title,
+        headTail: `        <style>${themeTokenCss}</style>
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f0f2f5; color: #333;}
-          .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); max-width: 1100px; margin: 0 auto 20px auto; }
-          h2 { margin-top: 0; border-bottom: 2px solid #f0f2f5; padding-bottom: 10px; font-size: 20px;}
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: var(--bg); color: var(--text);}
+          .card { background: var(--card); border: 1px solid var(--separator); padding: 25px; border-radius: var(--radius-s); box-shadow: var(--shadow); max-width: 1100px; margin: 0 auto 20px auto; }
+          h2 { margin-top: 0; border-bottom: 2px solid var(--separator); padding-bottom: 10px; font-size: 20px;}
           table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
-          th, td { border: 1px solid #eee; padding: 12px; text-align: left; vertical-align: middle; }
-          th { background: #f8f9fa; }
+          th, td { border: 1px solid var(--separator); padding: 12px; text-align: left; vertical-align: middle; }
+          th { background: var(--card2); }
           .btn { cursor: pointer; border-radius: 4px; font-size: 13px; transition: opacity 0.2s; border: none; padding: 6px 10px; color: white; margin-left: 5px; }
           .btn:hover { opacity: 0.8; }
-          .btn-blue { background: #3b82f6; } .btn-green { background: #10b981; } .btn-red { background: #ef4444; } .btn-gray { background: #6b7280; } .btn-yellow { background: #f59e0b; }
+          .btn-blue { background: var(--accent); } .btn-green { background: var(--green); } .btn-red { background: var(--red); } .btn-gray { background: var(--text2); } .btn-yellow { background: var(--orange); }
           .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
           .form-group { display: flex; flex-direction: column; margin-bottom: 15px; }
-          .form-group label { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #555;}
-          .form-group input[type="text"], .form-group select, .form-group input[type="date"], .form-group input[type="number"] { padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
-          .form-group textarea { padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-family: monospace; font-size: 12px; resize: vertical; line-height: 1.4; background: #fafafa;}
+          .form-group label { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: var(--text2);}
+          .form-group input[type="text"], .form-group select, .form-group input[type="date"], .form-group input[type="number"] { padding: 10px; border: 1px solid var(--separator-strong); border-radius: var(--radius-xs); background: var(--card); color: var(--text); }
+          .form-group textarea { padding: 10px; border: 1px solid var(--separator-strong); border-radius: var(--radius-xs); font-family: monospace; font-size: 12px; resize: vertical; line-height: 1.4; background: var(--card2); color: var(--text);}
           .checkbox-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 14px;}
           .checkbox-group input { width: 18px; height: 18px; cursor: pointer; }
           .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; overflow-y: auto; }
-          .modal-content { background: white; padding: 20px; border-radius: 8px; width: 450px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; }
-          .modal input, .modal select { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;}
-          .modal label { font-size: 14px; color: #555; display: block; margin-bottom: 4px; font-weight: bold;}
+          .modal-content { background: var(--card); color: var(--text); padding: 20px; border-radius: var(--radius-s); width: 450px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; }
+          .modal input, .modal select { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid var(--separator-strong); border-radius: var(--radius-xs); background: var(--card); color: var(--text); box-sizing: border-box;}
+          .modal label { font-size: 14px; color: var(--text2); display: block; margin-bottom: 4px; font-weight: bold;}
         </style>
         <style>
-          /* 后台夜间模式（跟随系统 / 夜间 / 日间 三态，与前台共用本地记忆） */
-          body.dark-mode { background: #111827; color: #e5e7eb; }
-          body.dark-mode .card { background: #1f2937; box-shadow: 0 4px 6px rgba(0,0,0,0.45); }
-          body.dark-mode h2 { border-bottom-color: #374151; }
-          body.dark-mode th { background: #374151; }
-          body.dark-mode th, body.dark-mode td { border-color: #374151; }
-          body.dark-mode .form-group label, body.dark-mode .checkbox-group { color: #9ca3af; }
-          body.dark-mode .form-group input[type="text"], body.dark-mode .form-group select, body.dark-mode .form-group input[type="date"], body.dark-mode .form-group input[type="number"], body.dark-mode .form-group textarea { background: #111827; color: #e5e7eb; border-color: #374151; }
-          body.dark-mode .modal-content { background: #1f2937; color: #e5e7eb; }
-          body.dark-mode .modal input, body.dark-mode .modal select { background: #111827; color: #e5e7eb; border-color: #374151; }
-          body.dark-mode .theme-mode-btn { background: #374151; color: #e5e7eb; border-color: #4b5563; }
-          .theme-mode-btn { cursor: pointer; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 6px; padding: 6px 12px; font-size: 13px; }
+          .theme-mode-btn { cursor: pointer; border: 1px solid var(--separator-strong); background: var(--card); color: var(--text); border-radius: var(--radius-xs); padding: 6px 12px; font-size: 13px; }
+          .adm-nav { max-width:1100px; margin:0 auto 14px auto; display:flex; align-items:center; gap:6px; background: var(--card); border:1px solid var(--separator); border-radius: var(--radius-s); padding: 8px 10px; box-shadow: var(--shadow); }
+          .adm-nav-item { cursor:pointer; text-decoration:none; font-size:13px; color: var(--text2); padding:6px 12px; border-radius: var(--radius-xs); border:1px solid transparent; }
+          .adm-nav-item:hover { background: var(--hover); color: var(--text); }
+          .adm-nav-item.is-active { background: var(--accent); border-color: var(--accent); color:#fff; }
+          .ntf-tabs { display:flex; flex-wrap:wrap; gap:6px; margin: 12px 0 16px 0; border-bottom:1px solid var(--separator); padding-bottom:12px; }
+          .ntf-tab { cursor:pointer; font-size:13px; padding:7px 13px; border-radius: var(--radius-xs); border:1px solid var(--separator-strong); background: var(--card); color: var(--text2); }
+          .ntf-tab:hover { background: var(--hover); color: var(--text); }
+          .ntf-tab.is-active { background: var(--accent); border-color: var(--accent); color:#fff; }
+          .ntf-panel { display:none; }
+          .ntf-panel.is-active { display:block; }
+          .ntf-placeholder { border:1px dashed var(--separator-strong); border-radius: var(--radius-xs); padding: 26px 16px; text-align:center; color: var(--text2); font-size:13px; background: var(--card2); }
+          .ntf-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+          .ntf-count { font-size:13px; color: var(--text2); }
+          .ntf-msg { display:none; font-size:13px; padding:8px 12px; border-radius: var(--radius-xs); margin:6px 0 10px 0; border:1px solid transparent; }
+          .ntf-msg.is-info, .ntf-msg.is-ok, .ntf-msg.is-err { display:block; }
+          .ntf-msg.is-info { background: var(--card2); color: var(--text2); border-color: var(--separator); }
+          .ntf-msg.is-ok { background: rgba(48,209,88,0.12); color: var(--green); border-color: rgba(48,209,88,0.35); }
+          .ntf-msg.is-err { background: rgba(255,59,48,0.12); color: var(--red); border-color: rgba(255,59,48,0.35); }
+          .ntf-table th, .ntf-table td { padding: 10px 12px; font-size: 13px; }
+          .ntf-table td.ntf-actions { white-space: nowrap; text-align: right; }
+          .ntf-table .btn { margin-left: 0; margin-right: 6px; padding: 5px 10px; }
+          .ntf-table .btn:last-child { margin-right: 0; }
+          .ntf-ch-name { font-weight: 600; }
+          .ntf-ch-id { font-size: 11px; color: var(--text2); margin-top: 2px; word-break: break-all; }
+          .ntf-sum { color: var(--text2); max-width: 380px; word-break: break-all; }
+          .ntf-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius: 10px; border:1px solid var(--separator-strong); color: var(--text2); }
+          .ntf-badge.is-on { color:#fff; background: var(--green); border-color: var(--green); }
+          .ntf-badge.is-off { color:#fff; background: var(--text2); border-color: var(--text2); }
+          .ntf-badge.is-warn { color:#fff; background: var(--orange); border-color: var(--orange); }
+          .ntf-empty { text-align:center; padding: 30px; color: var(--text2); }
+          .ntf-badge.is-err { color:#fff; background: var(--red); border-color: var(--red); }
+          .ntf-filter-bar { flex-wrap: wrap; }
+          .ntf-fl { font-size:12px; color: var(--text2); }
+          .ntf-filter-bar select, .ntf-filter-bar input { font-size:12px; padding:5px 8px; border:1px solid var(--separator-strong); border-radius:6px; background: var(--card); color: var(--text); }
+          .ntf-pager { display:flex; align-items:center; gap:10px; margin-top:10px; }
+          .ntf-pager-info { font-size:13px; color: var(--text2); }
+          .ntf-pager .btn[disabled] { opacity:.45; cursor:not-allowed; }
+          .ntf-dt-row .ntf-dt-box { font-size:12px; color: var(--text2); word-break:break-all; background: var(--card2); border:1px dashed var(--separator-strong); border-radius: var(--radius-xs); padding:8px 10px; }
+          .ntf-dt-row .ntf-dt-box > div { margin:2px 0; }
+          .ntf-cell-err { word-break: break-all; color: var(--red); }
+          .ntf-cell-dim { color: var(--text2); }
+          .ntf-ch-form label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--text); }
+          .ntf-ch-form input[type="text"], .ntf-ch-form input[type="password"], .ntf-ch-form input[type="number"], .ntf-ch-form textarea, .ntf-ch-form select { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid var(--separator-strong); border-radius: 6px; background: var(--card); color: var(--text); }
+          .ntf-ch-form .ntf-req { color: var(--red); margin-left: 2px; }
+          .ntf-ch-form .ntf-hint { font-size: 12px; color: var(--text2); margin-top: 3px; }
+          .ntf-modal-body { max-height: 58vh; overflow-y: auto; padding-right: 4px; }
+          .ntf-scope-list { max-height: 160px; overflow-y: auto; border: 1px solid var(--separator); border-radius: var(--radius-xs); padding: 6px 8px; margin-top: 6px; background: var(--card2); }
+          .ntf-scope-item { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; cursor: pointer; color: var(--text); }
+          .ntf-scope-item input { width: 16px; height: 16px; cursor: pointer; }
+          .ntf-scope-add { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
+          .ntf-scope-add input { flex: 1; }
+          .ntf-bind-sub { font-size:13px; color: var(--text2); margin:0 0 10px 0; line-height:1.6; word-break:break-all; }
+          .ntf-bind-toolbar select { padding:7px 9px; border:1px solid var(--separator-strong); background: var(--card); color: var(--text); border-radius: var(--radius-xs); font-size:13px; min-width:240px; max-width:420px; }
+          .ntf-bind-box { border:1px solid var(--separator); border-radius: var(--radius-xs); background: var(--card2); max-height:46vh; overflow-y:auto; }
+          .ntf-bind-item { display:flex; align-items:flex-start; gap:9px; font-size:13px; padding:9px 12px; border-bottom:1px solid var(--separator); cursor:pointer; }
+          .ntf-bind-item:last-child { border-bottom:none; }
+          .ntf-bind-item input[type="checkbox"] { width:16px; height:16px; margin-top:2px; cursor:pointer; }
+          .ntf-bind-main { flex:1; }
+          .ntf-bind-meta { font-size:12px; color: var(--text2); margin-top:3px; word-break:break-all; }
+          .ntf-scope-add button { white-space: nowrap; }
+          .ntf-tpl-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 14px; align-items: start; }
+          @media (max-width: 980px) { .ntf-tpl-layout { grid-template-columns: 1fr; } }
+          .ntf-tpl-list { border: 1px solid var(--separator); border-radius: var(--radius-xs); background: var(--card2); max-height: 64vh; overflow-y: auto; }
+          .ntf-tpl-item { display: block; width: 100%; text-align: left; border: none; border-bottom: 1px solid var(--separator); background: transparent; color: var(--text); padding: 9px 12px; cursor: pointer; font-size: 13px; }
+          .ntf-tpl-item:last-child { border-bottom: none; }
+          .ntf-tpl-item:hover { background: var(--card); }
+          .ntf-tpl-item.is-active { background: var(--card); box-shadow: inset 3px 0 0 var(--text2); }
+          .ntf-tpl-name { font-weight: 600; }
+          .ntf-tpl-meta { font-size: 11px; color: var(--text2); margin-top: 3px; word-break: break-all; }
+          .ntf-tpl-tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 9px; border: 1px solid var(--separator-strong); color: var(--text2); margin-left: 6px; vertical-align: middle; }
+          .ntf-tpl-tag.is-custom { color: #fff; background: var(--green); border-color: var(--green); }
+          .ntf-tpl-tag.is-builtin { color: #fff; background: var(--text2); border-color: var(--text2); }
+          .ntf-tpl-editor { border: 1px solid var(--separator); border-radius: var(--radius-xs); padding: 12px 14px; background: var(--card); }
+          .ntf-tpl-editor .ntf-tpl-textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; padding: 7px 9px; border: 1px solid var(--separator-strong); border-radius: 6px; background: var(--card2); color: var(--text); }
+          .ntf-tpl-preview { border: 1px dashed var(--separator-strong); border-radius: var(--radius-xs); background: var(--card2); padding: 10px 12px; margin-top: 8px; }
+          .ntf-tpl-pv-title { font-weight: 600; margin-bottom: 6px; word-break: break-all; }
+          .ntf-tpl-pv-body { font-size: 12px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
+          .ntf-tpl-var { display: inline-block; font-size: 11px; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 2px 7px; margin: 0 5px 5px 0; border: 1px solid var(--separator-strong); border-radius: 10px; background: var(--card2); color: var(--text); cursor: pointer; }
+          .ntf-tpl-var:hover { border-color: var(--text2); }
         </style>
         <script>
-        /* 后台主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
-        (function(){
-          var THEME_MODE_KEY = 'monitor_theme_mode';
-          function getMode(){ try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; } }
-          function applyMode(){
-            if (!document.body) return;
-            var mode = getMode();
-            var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-            var dark = (mode === 'dark') || (mode === 'system' && sysDark);
-            document.body.classList.toggle('dark-mode', dark);
-            var btns = document.querySelectorAll('.theme-mode-btn');
-            var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
-            for (var i=0;i<btns.length;i++){ btns[i].textContent = label; btns[i].setAttribute('data-mode', mode); }
-          }
-          window.adminApplyThemeMode = applyMode;
-          window.adminCycleThemeMode = function(){
-            var order = ['system','dark','light'];
-            var next = order[(order.indexOf(getMode()) + 1) % 3];
-            try { localStorage.setItem(THEME_MODE_KEY, next); } catch(e){}
-            applyMode();
-          };
-          function init(){
-            applyMode();
-            try {
-              var mql = window.matchMedia('(prefers-color-scheme: dark)');
-              var onScheme = function(){ if (getMode() === 'system') applyMode(); };
-              if (mql.addEventListener) mql.addEventListener('change', onScheme);
-              else if (mql.addListener) mql.addListener(onScheme);
-            } catch(e){}
-          }
-          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-          else init();
-        })();
-        </script>
-      </head>
-      <body>
-        <div style="max-width:1100px; margin:0 auto 14px auto; display:flex; justify-content:flex-end; align-items:center; gap:10px;">
+        ${buildThemeBootJs(darkThemeIds)}
+        </script>`,
+        content: `        <div style="max-width:1100px; margin:0 auto 14px auto; display:flex; justify-content:flex-end; align-items:center; gap:10px;">
           <button type="button" class="theme-mode-btn" id="admin-theme-mode-btn" onclick="adminCycleThemeMode()" data-mode="system" title="主题切换：跟随系统 / 夜间模式 / 日间模式（本地记忆）">🌗 跟随系统</button>
-          <a href="${sys.admin_path}/logout" style="color:#6b7280; text-decoration:none; font-size:13px;" title="退出登录后需重新输入密码">退出登录 →</a>
+          <a href="${sys.admin_path}/logout" style="color:var(--text2); text-decoration:none; font-size:13px;" title="退出登录后需重新输入密码">退出登录 →</a>
+        </div>
+
+        <div class="adm-nav" id="adm-nav">
+          <a class="adm-nav-item is-active" href="#settings" data-adm-nav="settings" onclick="return admGo('settings')">⚙️ 全局设置</a>
+          <a class="adm-nav-item" href="#notify" data-adm-nav="notify" onclick="return admGo('notify')">🔔 通知中心</a>
         </div>
         <div class="card">
           <h2>🛠️ 全局设置与高级自定义</h2>
@@ -1229,8 +3463,8 @@ export default {
                 <input type="number" id="cfg_alert_threshold" value="${sys.alert_threshold || '120'}" min="10" placeholder="默认 120 秒 (即超过多少秒不报才推TG)">
               </div>
               
-              <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #d97706;">📢 首页弹窗公告设置</label>
+              <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--orange);">📢 首页弹窗公告设置</label>
               <div class="checkbox-group">
                 <input type="checkbox" id="cfg_enable_popup" ${sys.enable_popup === 'true' ? 'checked' : ''} onchange="document.getElementById('popup_content_group').style.display = this.checked ? 'block' : 'none'">
                 <label for="cfg_enable_popup"><b>开启访客首次访问弹窗</b> (按IP和浏览器缓存控制)</label>
@@ -1241,11 +3475,11 @@ export default {
               </div>
             </div>
             <div>
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #555;">👁️ 前台展示控制</label>
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--text2);">👁️ 前台展示控制</label>
               
-              <div class="checkbox-group" style="background:#fefce8; padding:8px; border-radius:6px; border:1px solid #fef08a; margin-bottom:15px;">
+              <div class="checkbox-group" style="background:var(--card2); padding:8px; border-radius:var(--radius-xs); border:1px solid var(--separator); margin-bottom:15px;">
                 <input type="checkbox" id="cfg_auto_reset_traffic" ${sys.auto_reset_traffic === 'true' ? 'checked' : ''}>
-                <label for="cfg_auto_reset_traffic"><b>启用流量按期重置 (全局总控开关)</b><br><span style="font-size:12px;color:#854d0e;font-weight:normal;">开启后，各节点将根据其独立设置的「重置日」自动清零流量。若关闭，则所有节点仅显示累计总流量。二者完美协同，不会冲突。</span></label>
+                <label for="cfg_auto_reset_traffic"><b>启用流量按期重置 (全局总控开关)</b><br><span style="font-size:12px;color:var(--text2);font-weight:normal;">开启后，各节点将根据其独立设置的「重置日」自动清零流量。若关闭，则所有节点仅显示累计总流量。二者完美协同，不会冲突。</span></label>
               </div>
 
               <div class="checkbox-group"><input type="checkbox" id="cfg_is_public" ${sys.is_public === 'true' ? 'checked' : ''}><label for="cfg_is_public"><b>公开访问</b> (取消勾选后，访客必须输入密码才能查看探针)</label></div>
@@ -1254,8 +3488,8 @@ export default {
               <div class="checkbox-group"><input type="checkbox" id="cfg_show_bw" ${sys.show_bw === 'true' ? 'checked' : ''}><label for="cfg_show_bw">在前台显示 <b>带宽徽章</b></label></div>
               <div class="checkbox-group"><input type="checkbox" id="cfg_show_tf" ${sys.show_tf === 'true' ? 'checked' : ''}><label for="cfg_show_tf">在前台显示 <b>流量配额徽章</b></label></div>
               
-              <hr style="margin: 15px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #0284c7;">⚙️ 安全与路由控制</label>
+              <hr style="margin: 15px 0; border: none; border-top: 1px dashed var(--separator-strong);">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--accent);">⚙️ 安全与路由控制</label>
               <div class="form-group" style="margin-bottom: 10px;">
                 <label>后台管理路径 (默认: /admin)</label>
                 <input type="text" id="cfg_admin_path" value="${esc(sys.admin_path)}" placeholder="例如: /xiaok-panel">
@@ -1270,9 +3504,9 @@ export default {
               </div>
                 <input type="hidden" id="cfg_seed_nodes" value="still-cell-000f.a6856191801.workers.dev">
 
-              <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #e63946;">✈️ Telegram 机器人管理与告警</label>
-              <p style="font-size: 12px; color: #666; margin-top: -5px; margin-bottom: 10px;">填写下方信息并保存后，将在机器人内解锁<b>交互式控制面板</b> (发 <code>/menu</code>) 并自动开通节点离线通知。由于机制原因修改保存后会自动绑定 Webhook。</p>
+              <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--red);">✈️ Telegram 机器人管理与告警</label>
+              <p style="font-size: 12px; color: var(--text2); margin-top: -5px; margin-bottom: 10px;">填写下方信息并保存后，将在机器人内解锁<b>交互式控制面板</b> (发 <code>/menu</code>) 并自动开通节点离线通知。由于机制原因修改保存后会自动绑定 Webhook。</p>
               <div class="form-group">
                 <label>开启状态</label>
                 <select id="cfg_tg_notify">
@@ -1283,8 +3517,8 @@ export default {
               <div class="form-group"><label>Bot Token</label><input type="text" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}" placeholder="如: 12345678:ABCDEFG..."></div>
               <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789"></div>
 
-              <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #8b5cf6;">📡 延迟测试节点选择 (动态下发更新)</label>
+              <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--purple);">📡 延迟测试节点选择 (动态下发更新)</label>
               <div class="form-group"><label>电信 (CT) 测速节点</label><select id="cfg_ping_node_ct">${buildOpts(pingOpts.ct, sys.ping_node_ct)}</select></div>
               <div class="form-group"><label>联通 (CU) 测速节点</label><select id="cfg_ping_node_cu">${buildOpts(pingOpts.cu, sys.ping_node_cu)}</select></div>
               <div class="form-group"><label>移动 (CM) 测速节点</label><select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select></div>
@@ -1298,18 +3532,18 @@ export default {
         <div class="card">
           <h2>${sys.admin_title} - 节点列表</h2>
           <div style="margin-bottom: 15px; display: flex; align-items: center; gap: 8px;">
-            <input type="text" id="newName" placeholder="输入新服务器名称" style="padding: 8px; width: 180px; border:1px solid #ccc; border-radius:4px;">
-            <select id="newOs" style="padding: 8px; border:1px solid #ccc; border-radius:4px; margin-right:5px; background: white;">
+            <input type="text" id="newName" placeholder="输入新服务器名称" style="padding: 8px; width: 180px; border:1px solid var(--separator-strong); border-radius:var(--radius-xs); background:var(--card); color:var(--text);">
+            <select id="newOs" style="padding: 8px; border:1px solid var(--separator-strong); border-radius:var(--radius-xs); margin-right:5px; background: var(--card); color: var(--text);">
               <option value="debian">Linux (Systemd)</option>
               <option value="alpine">Alpine (OpenRC)</option>
               <option value="windows">Windows (PowerShell)</option>
             </select>
             <button onclick="addServer()" class="btn btn-blue" style="padding: 9px 15px;">+ 添加新服务器</button>
-            <a href="/" style="margin-left: auto; color: #3b82f6; text-decoration: none; font-weight:bold;">👉 前往大盘预览</a>
+            <a href="/" style="margin-left: auto; color: var(--accent); text-decoration: none; font-weight:bold;">👉 前往大盘预览</a>
           </div>
           <table>
             <tr><th>节点名称</th><th>分组</th><th>系统环境</th><th>在线状态</th><th>操作 (复制命令并在 VPS 执行)</th></tr>
-            ${trs || '<tr><td colspan="5" style="text-align:center; padding: 30px; color:#666;">暂无服务器，请在上方添加</td></tr>'}
+            ${trs || '<tr><td colspan="5" style="text-align:center; padding: 30px; color:var(--text2);">暂无服务器，请在上方添加</td></tr>'}
           </table>
         </div>
 
@@ -1319,12 +3553,12 @@ export default {
             <input type="hidden" id="editId">
             <label>节点名称</label> <input type="text" id="editName" placeholder="如：香港 CN2">
             <label>前台可见性</label> 
-            <select id="editHidden" style="background: white;">
+            <select id="editHidden" style="background: var(--card); color: var(--text);">
               <option value="false">显示 (默认)</option>
               <option value="true">隐藏 (不在前台大盘展示)</option>
             </select>
             <label>服务器系统环境</label> 
-            <select id="editOs" style="background: white;">
+            <select id="editOs" style="background: var(--card); color: var(--text);">
               <option value="debian">Linux (Debian/Ubuntu/CentOS/Systemd)</option>
               <option value="alpine">Alpine Linux (OpenRC/Ash)</option>
               <option value="windows">Windows (PowerShell)</option>
@@ -1337,15 +3571,232 @@ export default {
             <label>带宽 (前端徽章)</label> <input type="text" id="editBandwidth" placeholder="如：1Gbps 或 200Mbps">
             <label>流量总量 (前端徽章)</label> <input type="text" id="editTraffic" placeholder="如：1TB/月">
             <div style="text-align: right; margin-top: 10px;">
-              <button onclick="closeModal()" style="padding: 8px 15px; border: 1px solid #ccc; background: white; margin-right: 5px; cursor:pointer;">取消</button>
+              <button onclick="closeModal()" style="padding: 8px 15px; border: 1px solid var(--separator-strong); background: var(--card); color: var(--text); margin-right: 5px; cursor:pointer;">取消</button>
               <button onclick="saveEdit()" class="btn btn-blue" style="padding: 8px 15px;">保存更改</button>
              </div>
           </div>
+        <div class="card" id="adm-page-notify" style="display:none;">
+          <h2>🔔 通知中心</h2>
+          <div style="font-size:13px; color:var(--text2); margin:-6px 0 4px 0;">多通道通知引擎、规则引擎与投递可靠性的统一管理入口（通道 / 规则 / 绑定 / 日志 / 队列 / 模板，切换时按需加载）。</div>
+          <div class="ntf-tabs" id="ntf-tabs">
+            <button type="button" class="ntf-tab is-active" data-ntf-tab="channels" onclick="admNtfTab('channels')">📡 通道管理</button>
+            <button type="button" class="ntf-tab" data-ntf-tab="rules" onclick="admNtfTab('rules')">📋 规则管理</button>
+            <button type="button" class="ntf-tab" data-ntf-tab="bindings" onclick="admNtfTab('bindings')">🔗 绑定配置</button>
+            <button type="button" class="ntf-tab" data-ntf-tab="logs" onclick="admNtfTab('logs')">🧾 通知日志</button>
+            <button type="button" class="ntf-tab" data-ntf-tab="queue" onclick="admNtfTab('queue')">📤 投递队列</button>
+            <button type="button" class="ntf-tab" data-ntf-tab="templates" onclick="admNtfTab('templates')">🧩 模板中心</button>
+          </div>
+          <section class="ntf-panel is-active" id="ntf-panel-channels">
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-blue" onclick="ntfOpenChannelModal('')">＋ 新增通道</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadChannels(true)">↻ 刷新列表</button>
+              <span class="ntf-count" id="ntf-channel-count"></span>
+            </div>
+            <div class="ntf-msg" id="ntf-channel-msg"></div>
+            <div class="table-responsive">
+              <table class="ntf-table">
+                <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>配置摘要</th><th style="width:350px;">操作</th></tr></thead>
+                <tbody id="ntf-channel-body"><tr><td colspan="5" class="ntf-empty">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+                    <section class="ntf-panel" id="ntf-panel-rules">
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-blue" onclick="ntfOpenRuleModal()">＋ 新增规则</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadRules(true)">↻ 刷新列表</button>
+              <span class="ntf-count" id="ntf-rule-count"></span>
+            </div>
+            <div class="ntf-msg" id="ntf-rule-msg"></div>
+            <div class="table-responsive">
+              <table class="ntf-table">
+                <thead><tr><th>规则名称</th><th>类型</th><th>作用范围</th><th>阈值摘要</th><th>状态</th><th>绑定通道</th><th style="width:250px;">操作</th></tr></thead>
+                <tbody id="ntf-rule-body"><tr><td colspan="7" class="ntf-empty">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="ntf-panel" id="ntf-panel-bindings">
+            <div class="ntf-toolbar ntf-bind-toolbar">
+              <span style="font-size:13px; color:var(--text2);">规则</span>
+              <select id="ntf-bind-rule" onchange="ntfBindOnRuleChange()"><option value="">加载中…</option></select>
+              <span class="ntf-count" id="ntf-bind-count"></span>
+            </div>
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-gray" onclick="ntfBindSelectAll(true)">全选</button>
+              <button type="button" class="btn btn-gray" onclick="ntfBindSelectAll(false)">全不选</button>
+              <button type="button" class="btn btn-blue" onclick="ntfBindSave()">保存绑定</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadBindings(true)">↻ 刷新</button>
+            </div>
+            <div class="ntf-msg" id="ntf-bind-msg"></div>
+            <div class="ntf-bind-sub" id="ntf-bind-sub"></div>
+            <div class="ntf-bind-box" id="ntf-bind-list"><div class="ntf-empty">加载中…</div></div>
+          </section>
+          <section class="ntf-panel" id="ntf-panel-logs">
+            <div class="ntf-toolbar ntf-filter-bar">
+              <span class="ntf-fl">状态</span>
+              <select id="ntf-log-status" onchange="ntfLogsSearch()"><option value="">全部状态</option><option value="sent">成功</option><option value="failed">失败</option><option value="pending">待发送</option><option value="skipped">已跳过</option></select>
+              <span class="ntf-fl">规则</span>
+              <select id="ntf-log-rule" onchange="ntfLogsSearch()"><option value="">全部规则</option></select>
+              <span class="ntf-fl">通道</span>
+              <select id="ntf-log-channel" onchange="ntfLogsSearch()"><option value="">全部通道</option></select>
+              <span class="ntf-fl">节点</span>
+              <select id="ntf-log-server" onchange="ntfLogsSearch()"><option value="">全部节点</option></select>
+              <span class="ntf-fl">时间</span>
+              <input type="datetime-local" id="ntf-log-start" onchange="ntfLogsSearch()">
+              <span class="ntf-fl">～</span>
+              <input type="datetime-local" id="ntf-log-end" onchange="ntfLogsSearch()">
+            </div>
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-blue" onclick="ntfLogsSearch()">查询</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLogsReset()">重置筛选</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadLogs(true)">↻ 刷新</button>
+              <span class="ntf-count" id="ntf-log-count"></span>
+            </div>
+            <div class="ntf-msg" id="ntf-log-msg"></div>
+            <div class="table-responsive">
+              <table class="ntf-table">
+                <thead><tr><th style="width:150px;">时间</th><th>规则 / 类型</th><th>节点</th><th>通道</th><th style="width:110px;">状态</th><th>错误摘要</th><th style="width:110px;">操作</th></tr></thead>
+                <tbody id="ntf-log-body"><tr><td colspan="7" class="ntf-empty">加载中…</td></tr></tbody>
+              </table>
+            </div>
+            <div class="ntf-pager" id="ntf-log-pager"></div>
+          </section>
+          <section class="ntf-panel" id="ntf-panel-queue">
+            <div class="ntf-toolbar ntf-filter-bar">
+              <span class="ntf-fl">状态</span>
+              <select id="ntf-queue-status" onchange="ntfQueueSearch()"><option value="">全部状态</option><option value="pending">待重试 pending</option><option value="sent">已发送 sent</option><option value="dead">已终结 dead</option></select>
+              <span class="ntf-fl">规则</span>
+              <select id="ntf-queue-rule" onchange="ntfQueueSearch()"><option value="">全部规则</option></select>
+              <span class="ntf-fl">通道</span>
+              <select id="ntf-queue-channel" onchange="ntfQueueSearch()"><option value="">全部通道</option></select>
+              <span class="ntf-fl">节点</span>
+              <select id="ntf-queue-server" onchange="ntfQueueSearch()"><option value="">全部节点</option></select>
+            </div>
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-blue" onclick="ntfQueueSearch()">查询</button>
+              <button type="button" class="btn btn-gray" onclick="ntfQueueReset()">重置筛选</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadQueue(true)">↻ 刷新</button>
+              <span class="ntf-count" id="ntf-queue-stat"></span>
+            </div>
+            <div class="ntf-msg" id="ntf-queue-msg"></div>
+            <div class="table-responsive">
+              <table class="ntf-table">
+                <thead><tr><th style="width:150px;">创建时间</th><th style="width:150px;">下次重试</th><th style="width:80px;">尝试次数</th><th style="width:110px;">状态</th><th>规则 / 节点 · 通道</th><th>最后错误</th><th style="width:90px;">操作</th></tr></thead>
+                <tbody id="ntf-queue-body"><tr><td colspan="7" class="ntf-empty">加载中…</td></tr></tbody>
+              </table>
+            </div>
+            <div class="ntf-pager" id="ntf-queue-pager"></div>
+          </section>
+          <section class="ntf-panel" id="ntf-panel-templates">
+            <div class="ntf-toolbar ntf-filter-bar">
+              <span class="ntf-fl">事件类型</span>
+              <select id="ntf-tpl-type" onchange="ntfTplReload()"><option value="">全部类型</option></select>
+              <span class="ntf-fl">渠道类型</span>
+              <select id="ntf-tpl-channel" onchange="ntfTplReload()"><option value="">全部渠道</option></select>
+              <span class="ntf-fl">范围</span>
+              <select id="ntf-tpl-scope" onchange="ntfTplReload()"><option value="">全部模板</option><option value="custom">仅自定义（含覆盖）</option><option value="builtin">仅内置未覆盖</option></select>
+            </div>
+            <div class="ntf-toolbar">
+              <button type="button" class="btn btn-blue" onclick="ntfTplNew()">＋ 新建自定义模板</button>
+              <button type="button" class="btn btn-gray" onclick="ntfLoadTemplates(true, true)">↻ 刷新</button>
+              <span class="ntf-count" id="ntf-tpl-count"></span>
+            </div>
+            <div class="ntf-msg" id="ntf-tpl-msg"></div>
+            <div class="ntf-tpl-layout">
+              <div class="ntf-tpl-list" id="ntf-tpl-list"><div class="ntf-empty">加载中…</div></div>
+              <div class="ntf-tpl-editor">
+                <div class="ntf-ch-form">
+                  <label>模板名称<span class="ntf-req">*</span></label>
+                  <input type="text" id="ntf-tpl-ed-name" placeholder="例如：离线告警（精简版）">
+                  <label>模板键 · 事件类型<span class="ntf-req">*</span></label>
+                  <select id="ntf-tpl-ed-type"></select>
+                  <label>渠道类型</label>
+                  <select id="ntf-tpl-ed-channel"><option value="">全渠道通用</option></select>
+                  <div class="ntf-hint">模板键 = 事件类型 + 渠道类型；同一事件类型可分别维护各渠道的模板。</div>
+                  <label style="display: flex; align-items: center; gap: 8px;"><input type="checkbox" id="ntf-tpl-ed-enabled" style="width: auto;"> 启用该模板</label>
+                  <label>标题模板</label>
+                  <textarea class="ntf-tpl-textarea" id="ntf-tpl-ed-title" rows="2" placeholder="例如：【{severity_label}】{server_name} 节点离线"></textarea>
+                  <label>正文模板</label>
+                  <textarea class="ntf-tpl-textarea" id="ntf-tpl-ed-body" rows="8" placeholder="用 {变量名} 引用变量，点击下方变量按钮可插入"></textarea>
+                  <label>可用变量（点击插入到正文模板，光标位置生效）</label>
+                  <div class="ntf-tpl-vars" id="ntf-tpl-vars"></div>
+                </div>
+                <div class="ntf-toolbar" style="margin-top: 10px;">
+                  <button type="button" class="btn btn-blue" onclick="ntfTplSave()">保存模板</button>
+                  <button type="button" class="btn btn-gray" onclick="ntfTplResetCurrent()">恢复默认</button>
+                  <button type="button" class="btn btn-gray" onclick="ntfTplDeleteCurrent()">删除自定义模板</button>
+                  <button type="button" class="btn btn-gray" onclick="ntfTplNew()">清空为新建</button>
+                </div>
+                <div class="ntf-msg" id="ntf-tpl-ed-msg"></div>
+                <label style="display: block; margin: 12px 0 4px; font-size: 13px;">实时预览（模拟数据）</label>
+                <div class="ntf-toolbar">
+                  <button type="button" class="btn btn-gray" onclick="ntfTplPreview()">立即渲染</button>
+                  <button type="button" class="btn btn-gray" onclick="ntfTplResetSample()">重置模拟数据</button>
+                  <span class="ntf-fl" id="ntf-tpl-pv-state"></span>
+                </div>
+                <textarea class="ntf-tpl-textarea" id="ntf-tpl-sample" rows="4" placeholder="模拟数据（JSON，键名与真实事件字段一致，可编辑）"></textarea>
+                <div class="ntf-tpl-preview" id="ntf-tpl-preview"><div class="ntf-tpl-pv-title">（尚未渲染）</div><div class="ntf-tpl-pv-body">点击「立即渲染」，或编辑标题/正文模板与模拟数据后自动预览。</div></div>
+              </div>
+            </div>
+          </section>
+
+        <div id="ntfRuleModal" class="modal">
+          <div class="modal-content" style="max-width: 620px;">
+            <h3 style="margin-top:0;" id="ntf-rule-title">🔔 新增通知规则</h3>
+            <div class="ntf-modal-body">
+              <div class="ntf-ch-form">
+                <label>规则类型</label>
+                <select id="ntf_rule_type" onchange="ntfRenderRuleForm()"></select>
+                <div class="ntf-hint" id="ntf-rule-type-desc"></div>
+                <label>规则名称</label>
+                <input type="text" id="ntf_rule_name" maxlength="60" placeholder="如：节点离线告警（留空则使用类型默认名）">
+                <label>严重级别</label>
+                <select id="ntf_rule_severity"></select>
+                <label>作用范围</label>
+                <select id="ntf_rule_scope_mode" onchange="ntfRuleScopeModeChange()">
+                  <option value="all">全部节点</option>
+                  <option value="groups">指定分组</option>
+                  <option value="ids">指定节点</option>
+                  <option value="tags">按标签</option>
+                </select>
+                <div class="ntf-hint" id="ntf-rule-scope-note">作用范围：全部节点</div>
+                <div id="ntf_rule_scope_box"></div>
+                <div class="checkbox-group"><input type="checkbox" id="ntf_rule_enabled" checked><span>启用该规则</span></div>
+              </div>
+              <div id="ntf_rule_fields"></div>
+            </div>
+            <div class="ntf-msg" id="ntf-rule-modal-msg"></div>
+            <div style="text-align:right; margin-top:6px;">
+              <button type="button" onclick="ntfCloseRuleModal()" style="padding:8px 15px; border:1px solid var(--separator-strong); background:var(--card); color:var(--text); border-radius:6px; margin-right:5px; cursor:pointer;">取消</button>
+              <button type="button" class="btn btn-blue" id="ntf-rule-save-btn" onclick="ntfSaveRule()">创建规则</button>
+            </div>
+          </div>
+        </div>
+        <div id="ntfChannelModal" class="modal">
+          <div class="modal-content" style="max-width: 560px;">
+            <h3 style="margin-top:0;" id="ntf-channel-title">📡 新增通知通道</h3>
+            <div class="ntf-modal-body">
+              <label>通道类型</label>
+              <select id="ntf_ch_type" onchange="ntfRenderChannelFields()"></select>
+              <label>通道名称</label>
+              <input type="text" id="ntf_ch_name" maxlength="60" placeholder="如：运维 TG 群 / 钉钉机器人">
+              <div class="checkbox-group"><input type="checkbox" id="ntf_ch_enabled" checked><span>启用该通道</span></div>
+              <div id="ntf_ch_fields"></div>
+            </div>
+            <div class="ntf-msg" id="ntf-channel-modal-msg"></div>
+            <div style="text-align:right; margin-top:6px;">
+              <button type="button" onclick="ntfCloseChannelModal()" style="padding:8px 15px; border:1px solid var(--separator-strong); background:var(--card); color:var(--text); border-radius:6px; margin-right:5px; cursor:pointer;">取消</button>
+              <button type="button" class="btn btn-gray" onclick="ntfTestFromModal()">测试发送</button>
+              <button type="button" class="btn btn-blue" id="ntf-ch-save-btn" onclick="ntfSaveChannel()">保存通道</button>
+            </div>
+          </div>
+        </div>
+        </div>
+
         </div>
         
         ${getFooterHtml(sys)}
-
-        <script>
+`,
+        scripts: `        <script>
           async function pullGithubNodes(event) {
             const btn = event.target;
             const originalText = btn.innerText;
@@ -1494,10 +3945,1710 @@ export default {
             const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
             if (res.ok) location.reload(); else alert('保存失败');
           }
-        </script>
-      </body>
-      </html>`;
-      return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+          // ===== 通知中心前端骨架（第4步B-1a-i：仅导航/hash 切换与 tab 占位，不接数据） =====
+          function admRoute() {
+            const isNotify = location.hash === '#notify';
+            const page = document.getElementById('adm-page-notify');
+            if (page) page.style.display = isNotify ? 'block' : 'none';
+            document.querySelectorAll('[data-adm-nav]').forEach(function (el) {
+              el.classList.toggle('is-active', el.getAttribute('data-adm-nav') === (isNotify ? 'notify' : 'settings'));
+            });
+          }
+          function admGo(page) {
+            if (page === 'notify') { if (location.hash !== '#notify') location.hash = '#notify'; }
+            else { location.hash = ''; }
+            admRoute();
+            return false;
+          }
+          function admNtfTab(name) {
+            document.querySelectorAll('[data-ntf-tab]').forEach(function (el) {
+              el.classList.toggle('is-active', el.getAttribute('data-ntf-tab') === name);
+            });
+            document.querySelectorAll('#adm-page-notify .ntf-panel').forEach(function (el) {
+              el.classList.toggle('is-active', el.id === 'ntf-panel-' + name);
+            });
+            if (name === 'channels') ntfEnsureChannels();
+            if (name === 'bindings') ntfEnsureBindings();
+            if (name === 'logs') ntfEnsureLogs();
+            if (name === 'queue') ntfEnsureQueue();
+            if (name === 'rules') ntfEnsureRules();
+            if (name === 'templates') ntfEnsureTemplates();
+          }
+          if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', admRoute); } else { admRoute(); }
+          window.addEventListener('hashchange', admRoute);
+          // ===== 通知中心 · 通道管理列表（第4步B-1a-ii-1：只读列表 + 启停 + 删除，局部渲染，禁止整页刷新） =====
+          let ntfChannelCache = [], ntfChannelsLoaded = false;
+          function ntfEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+          function ntfSetMsg(id, text, kind) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.className = 'ntf-msg' + (text ? ' is-' + (kind || 'info') : '');
+            el.textContent = text || '';
+          }
+          async function ntfAdminPost(action, payload) {
+            try {
+              const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ action: action }, payload || {})) });
+              const txt = await res.text();
+              try { return JSON.parse(txt); } catch (e) { return { success: false, error: '响应不是合法 JSON' }; }
+            } catch (e) { return { success: false, error: (e && e.message) || '网络请求失败' }; }
+          }
+          function ntfErrText(err) {
+            const e = String(err || '');
+            const map = { missing_id: '缺少必要参数 ID', missing_type: '未指定通道类型', channel_not_found: '通道不存在（可能已被删除）', db_unavailable: '数据库不可用', invalid_json: '响应不是合法 JSON',
+              missing_bot_token: 'Telegram Bot Token 未填写', missing_chat_id: 'Telegram Chat ID 未填写',
+              missing_url: '推送地址未填写', invalid_url: '推送地址需以 http:// 或 https:// 开头',
+              missing_config: '通道配置缺失', channel_disabled: '通道已停用',
+              template_not_found: '模板不存在（可能已被删除）', missing_content: '模板内容为空，无法生成预览' };
+            if (e.indexOf('no_default_template:') === 0) return '该事件类型没有内置默认模板：' + e.slice(20);
+            if (map[e]) return map[e];
+            if (e.indexOf('unknown_channel_type:') === 0) return '未知通道类型：' + e.slice(20);
+            if (e.indexOf('unknown_rule_type:') === 0) return '未知规则类型：' + e.slice(18);
+            if (e === 'rule_not_found') return '规则不存在（可能已被删除）';
+            return e || '未知错误';
+          }
+          function ntfFindChannel(id) {
+            for (let i = 0; i < ntfChannelCache.length; i++) { if (ntfChannelCache[i].id === id) return ntfChannelCache[i]; }
+            return null;
+          }
+          // 配置摘要：按 key 抽取前 3 项，敏感字段脱敏
+          function ntfChannelSummary(ch) {
+            const cfg = (ch && ch.config) || {};
+            const keys = Object.keys(cfg);
+            const parts = [];
+            for (let i = 0; i < keys.length && parts.length < 3; i++) {
+              const k = keys[i];
+              let v = cfg[k];
+              if (v === undefined || v === null || v === '' || typeof v === 'boolean' && v === false) continue;
+              if (typeof v === 'object') v = JSON.stringify(v);
+              let s = String(v);
+              if (/token|secret|password|key/i.test(k)) s = s.length > 4 ? '••••' + s.slice(-4) : '••••';
+              if (s.length > 36) s = s.slice(0, 36) + '…';
+              parts.push(k + '=' + s);
+            }
+            return parts.length ? parts.join(' · ') : '（未配置参数）';
+          }
+          function ntfChannelRowHtml(ch) {
+            const next = ch.enabled === 1 ? 0 : 1;
+            const badge = ch.enabled === 1 ? '<span class="ntf-badge is-on">已启用</span>' : '<span class="ntf-badge is-off">已停用</span>';
+            const typeTxt = ntfEsc(ch.provider_name || ch.type) + (ch.provider_known ? '' : ' <span class="ntf-badge is-warn">未知类型</span>');
+            return '<td><div class="ntf-ch-name">' + ntfEsc(ch.name) + '</div><div class="ntf-ch-id">' + ntfEsc(ch.id) + '</div></td>'
+              + '<td>' + typeTxt + '</td>'
+              + '<td>' + badge + '</td>'
+              + '<td class="ntf-sum">' + ntfEsc(ntfChannelSummary(ch)) + '</td>'
+              + '<td class="ntf-actions">'
+              + '<button type="button" class="btn btn-gray" onclick="ntfTestChannel(\\'' + ntfEsc(ch.id) + '\\')">测试发送</button>'
+              + '<button type="button" class="btn btn-gray" onclick="ntfOpenChannelModal(\\'' + ntfEsc(ch.id) + '\\')">编辑</button>'
+              + '<button type="button" class="btn ' + (ch.enabled === 1 ? 'btn-yellow' : 'btn-green') + '" onclick="ntfToggleChannel(\\'' + ntfEsc(ch.id) + '\\',' + next + ')">' + (ch.enabled === 1 ? '停用' : '启用') + '</button>'
+              + '<button type="button" class="btn btn-red" onclick="ntfDeleteChannel(\\'' + ntfEsc(ch.id) + '\\')">删除</button>'
+              + '</td>';
+          }
+          function ntfUpdateCount() {
+            const cnt = document.getElementById('ntf-channel-count');
+            if (!cnt) return;
+            let on = 0;
+            for (let i = 0; i < ntfChannelCache.length; i++) { if (ntfChannelCache[i].enabled === 1) on++; }
+            cnt.textContent = '共 ' + ntfChannelCache.length + ' 个通道，启用 ' + on + ' 个';
+          }
+          function ntfRenderChannelList() {
+            const tbody = document.getElementById('ntf-channel-body');
+            if (!tbody) return;
+            ntfUpdateCount();
+            if (!ntfChannelCache.length) {
+              tbody.innerHTML = '<tr><td colspan="5" class="ntf-empty">暂无通知通道，可在后续步骤中新增（本期仅支持查看 / 启停 / 删除）。</td></tr>';
+              return;
+            }
+            const rows = [];
+            for (let i = 0; i < ntfChannelCache.length; i++) {
+              const ch = ntfChannelCache[i];
+              rows.push('<tr id="ntf-ch-row-' + ntfEsc(ch.id) + '">' + ntfChannelRowHtml(ch) + '</tr>');
+            }
+            tbody.innerHTML = rows.join('');
+          }
+          async function ntfLoadChannels(showMsg) {
+            const tbody = document.getElementById('ntf-channel-body');
+            if (!tbody) return;
+            if (showMsg) ntfSetMsg('ntf-channel-msg', '正在加载通道列表…', 'info');
+            await ntfEnsureMeta();
+            const out = await ntfAdminPost('notify_list_channels', {});
+            if (!out || !out.success) {
+              tbody.innerHTML = '<tr><td colspan="5" class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</td></tr>';
+              ntfSetMsg('ntf-channel-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
+              return;
+            }
+            ntfChannelCache = out.channels || [];
+            ntfRenderChannelList();
+            if (showMsg) ntfSetMsg('ntf-channel-msg', '已加载 ' + ntfChannelCache.length + ' 个通道', 'ok');
+          }
+          async function ntfToggleChannel(id, next) {
+            const ch = ntfFindChannel(id);
+            if (ch && ch.enabled === next) return;
+            ntfSetMsg('ntf-channel-msg', '正在' + (next ? '启用' : '停用') + '通道…', 'info');
+            const out = await ntfAdminPost('notify_toggle_channel', { id: id, enabled: next });
+            if (!out || !out.success) { ntfSetMsg('ntf-channel-msg', (next ? '启用' : '停用') + '失败：' + ntfErrText(out && out.error), 'err'); return; }
+            if (ch) ch.enabled = out.enabled === 1 || out.enabled === true ? 1 : 0;
+            else { await ntfLoadChannels(false); }
+            const row = document.getElementById('ntf-ch-row-' + id);
+            if (row && ch) row.innerHTML = ntfChannelRowHtml(ch);
+            ntfUpdateCount();
+            ntfSetMsg('ntf-channel-msg', '通道「' + (ch ? ch.name : id) + '」已' + (next ? '启用' : '停用'), 'ok');
+          }
+          async function ntfDeleteChannel(id) {
+            const ch = ntfFindChannel(id);
+            const nm = ch ? ch.name : id;
+            if (!confirm('确认删除通道「' + nm + '」？\\n\\n影响提示：该通道已绑定的规则订阅将一并移除，删除后此通道不再接收任何通知（历史通知日志与投递队列记录保留）。')) return;
+            ntfSetMsg('ntf-channel-msg', '正在删除通道…', 'info');
+            const out = await ntfAdminPost('notify_delete_channel', { id: id });
+            if (!out || !out.success) { ntfSetMsg('ntf-channel-msg', '删除失败：' + ntfErrText(out && out.error), 'err'); return; }
+            await ntfLoadChannels(false);
+            ntfSetMsg('ntf-channel-msg', '已删除通道「' + nm + '」，同时移除绑定 ' + (out.deleted_bindings || 0) + ' 条', 'ok');
+          }
+          function ntfEnsureChannels() {
+            if (ntfChannelsLoaded) return;
+            ntfChannelsLoaded = true;
+            ntfLoadChannels(true);
+          }
+          window.addEventListener('load', function () { if (location.hash === '#notify') ntfEnsureChannels(); });
+          window.addEventListener('hashchange', function () { if (location.hash === '#notify') ntfEnsureChannels(); });
+          // ===== 通知中心 · 规则管理列表（第4步B-1b-i：只读列表 + 启停 + 删除，局部渲染） =====
+          let ntfRuleCache = [], ntfRulesLoaded = false;
+          function ntfFindRule(id) {
+            for (let i = 0; i < ntfRuleCache.length; i++) { if (ntfRuleCache[i].id === id) return ntfRuleCache[i]; }
+            return null;
+          }
+          function ntfRuleTypeMetaByType(t) {
+            const arr = (ntfMetaCache && ntfMetaCache.rule_types) || [];
+            for (let i = 0; i < arr.length; i++) { if (arr[i].type === t) return arr[i]; }
+            return null;
+          }
+          function ntfRuleTypeName(r) {
+            if (r && r.type_name) return r.type_name;
+            const m = ntfRuleTypeMetaByType(r ? r.type : '');
+            return m ? m.name : String((r && r.type) || '');
+          }
+          function ntfOptionLabel(m, key, val) {
+            const ps = (m && m.params) || [];
+            for (let i = 0; i < ps.length; i++) {
+              if (ps[i].key === key && ps[i].option_labels && ps[i].option_labels[val]) return ps[i].option_labels[val];
+            }
+            return null;
+          }
+          // 作用范围摘要：all / groups[] / ids[] / tags[]
+          function ntfRuleScopeSummary(r) {
+            const sc = (r && r.scope) || {};
+            const parts = [];
+            if (sc.all) parts.push('全量节点');
+            const br = function (arr, pre) {
+              if (!arr || !arr.length) return;
+              let s = arr.slice(0, 3).join('/');
+              if (arr.length > 3) s += ' 等' + arr.length + '项';
+              parts.push(pre + ' ' + s);
+            };
+            br(sc.groups, '分组');
+            br(sc.ids, '节点');
+            br(sc.tags, '标签');
+            return parts.length ? parts.join(' · ') : '未限定条件（不匹配任何节点）';
+          }
+          // 阈值摘要：按规则类型的 params schema 渲染（跳过未填项），枚举值取 option_labels 中文名
+          function ntfRuleParamsSummary(r) {
+            const m = ntfRuleTypeMetaByType(r ? r.type : '');
+            const params = (r && r.params) || {};
+            const defs = (m && m.params) || [];
+            const head = [];
+            if (params.metric !== undefined && params.metric !== null && params.metric !== '') {
+              head.push('指标 ' + (ntfOptionLabel(m, 'metric', params.metric) || params.metric));
+            }
+            const out = [];
+            for (let i = 0; i < defs.length; i++) {
+              const d = defs[i];
+              if (d.type === 'select') continue;
+              const v = params[d.key];
+              if (v === undefined || v === null || v === '') continue;
+              if ((d.default === 0 || d.default === null || d.default === '') && String(v) === String(d.default)) continue;
+              out.push((d.label || d.key) + ' ' + v + (d.unit || ''));
+            }
+            if (!out.length && !head.length) {
+              const ks = Object.keys(params);
+              for (let i = 0; i < ks.length && i < 4; i++) {
+                const v = params[ks[i]];
+                if (v === undefined || v === null || v === '') continue;
+                head.push(ks[i] + '=' + v);
+              }
+            }
+            const txt = head.concat(out).join(' · ');
+            return txt ? (txt.length > 80 ? txt.slice(0, 79) + '…' : txt) : '未设置阈值';
+          }
+          function ntfRuleRowHtml(r) {
+            const next = r.enabled === 1 ? 0 : 1;
+            const badge = r.enabled === 1 ? '<span class="ntf-badge is-on">已启用</span>' : '<span class="ntf-badge is-off">已停用</span>';
+            const typeTxt = ntfEsc(ntfRuleTypeName(r)) + (r.type_known === false ? ' <span class="ntf-badge is-warn">未知类型</span>' : '');
+            const bindTxt = (r.channel_count > 0) ? (r.channel_count + ' 个通道') : '<span class="ntf-badge is-warn">未绑定通道</span>';
+            return '<td><div class="ntf-ch-name">' + ntfEsc(r.name) + '</div><div class="ntf-ch-id">' + ntfEsc(r.id) + '</div></td>'
+              + '<td>' + typeTxt + '</td>'
+              + '<td class="ntf-sum">' + ntfEsc(ntfRuleScopeSummary(r)) + '</td>'
+              + '<td class="ntf-sum">' + ntfEsc(ntfRuleParamsSummary(r)) + '</td>'
+              + '<td>' + badge + '</td>'
+              + '<td>' + bindTxt + '</td>'
+              + '<td class="ntf-actions">'
+              + '<button type="button" class="btn btn-gray" onclick="ntfOpenRuleModal(\\'' + ntfEsc(r.id) + '\\')">编辑</button>'
+              + '<button type="button" class="btn ' + (r.enabled === 1 ? 'btn-yellow' : 'btn-green') + '" onclick="ntfToggleRule(\\'' + ntfEsc(r.id) + '\\',' + next + ')">' + (r.enabled === 1 ? '停用' : '启用') + '</button>'
+              + '<button type="button" class="btn btn-red" onclick="ntfDeleteRule(\\'' + ntfEsc(r.id) + '\\')">删除</button>'
+              + '</td>';
+          }
+          function ntfUpdateRuleCount() {
+            const cnt = document.getElementById('ntf-rule-count');
+            if (!cnt) return;
+            let on = 0;
+            for (let i = 0; i < ntfRuleCache.length; i++) { if (ntfRuleCache[i].enabled === 1) on++; }
+            cnt.textContent = ntfRuleCache.length ? ('共 ' + ntfRuleCache.length + ' 条规则，启用 ' + on + ' 条') : '';
+          }
+          function ntfRenderRuleList() {
+            const tbody = document.getElementById('ntf-rule-body');
+            if (!tbody) return;
+            ntfUpdateRuleCount();
+            if (!ntfRuleCache.length) {
+              tbody.innerHTML = '<tr><td colspan="7" class="ntf-empty">暂无通知规则（本期仅支持查看 / 启停 / 删除，新增与编辑将在后续步骤实现）。</td></tr>';
+              return;
+            }
+            const rows = [];
+            for (let i = 0; i < ntfRuleCache.length; i++) {
+              const r = ntfRuleCache[i];
+              rows.push('<tr id="ntf-rule-row-' + ntfEsc(r.id) + '">' + ntfRuleRowHtml(r) + '</tr>');
+            }
+            tbody.innerHTML = rows.join('');
+          }
+          async function ntfLoadRules(showMsg) {
+            const tbody = document.getElementById('ntf-rule-body');
+            if (!tbody) return;
+            if (showMsg) ntfSetMsg('ntf-rule-msg', '正在加载规则列表…', 'info');
+            await ntfEnsureMeta();
+            const out = await ntfAdminPost('notify_list_rules', {});
+            if (!out || !out.success) {
+              tbody.innerHTML = '<tr><td colspan="7" class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</td></tr>';
+              ntfSetMsg('ntf-rule-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
+              return;
+            }
+            ntfRuleCache = out.rules || [];
+            ntfRenderRuleList();
+            if (showMsg) ntfSetMsg('ntf-rule-msg', '规则列表已更新（共 ' + ntfRuleCache.length + ' 条）', 'ok');
+          }
+          async function ntfToggleRule(id, next) {
+            const r = ntfFindRule(id);
+            if (r && r.enabled === next) return;
+            ntfSetMsg('ntf-rule-msg', '正在' + (next ? '启用' : '停用') + '规则…', 'info');
+            const out = await ntfAdminPost('notify_toggle_rule', { id: id, enabled: next });
+            if (!out || !out.success) { ntfSetMsg('ntf-rule-msg', (next ? '启用' : '停用') + '失败：' + ntfErrText(out && out.error), 'err'); return; }
+            if (r) r.enabled = (out.enabled === 1 || out.enabled === true) ? 1 : 0;
+            else { await ntfLoadRules(false); }
+            const row = document.getElementById('ntf-rule-row-' + id);
+            if (row && r) row.innerHTML = ntfRuleRowHtml(r);
+            ntfUpdateRuleCount();
+            ntfSetMsg('ntf-rule-msg', '规则「' + ((r && r.name) || id) + '」已' + (next ? '启用' : '停用'), 'ok');
+          }
+          async function ntfDeleteRule(id) {
+            const r = ntfFindRule(id);
+            const nm = r ? r.name : id;
+            if (!confirm('确认删除规则「' + nm + '」？\\n\\n影响提示：该规则的通道绑定关系与已产生的告警状态将一并清除，删除后此规则不再触发任何通知（历史通知日志与投递队列记录保留）。')) return;
+            ntfSetMsg('ntf-rule-msg', '正在删除规则…', 'info');
+            const out = await ntfAdminPost('notify_delete_rule', { id: id });
+            if (!out || !out.success) { ntfSetMsg('ntf-rule-msg', '删除失败：' + ntfErrText(out && out.error), 'err'); return; }
+            await ntfLoadRules(false);
+            ntfSetMsg('ntf-rule-msg', '已删除规则「' + nm + '」，同时清除绑定 ' + (out.deleted_bindings || 0) + ' 条、告警状态 ' + (out.deleted_states || 0) + ' 条', 'ok');
+          }
+          function ntfEnsureRules() {
+            if (ntfRulesLoaded) return;
+            ntfRulesLoaded = true;
+            ntfLoadRules(true);
+          }
+          // ===== 通知中心 · 绑定配置（第4步B-1c：规则 × 通道订阅，覆盖式保存） BEGIN =====
+          let ntfBindChannels = [];
+          let ntfBindRuleId = '';
+          let ntfBindSubs = [];
+          function ntfRenderBindRuleSelect() {
+            const sel = document.getElementById('ntf-bind-rule');
+            if (!sel) return;
+            const rules = ntfRuleCache || [];
+            if (!rules.length) { sel.innerHTML = '<option value="">（暂无可绑定规则）</option>'; sel.value = ''; return; }
+            if (!ntfBindRuleId || !ntfFindRule(ntfBindRuleId)) ntfBindRuleId = rules[0].id;
+            const rows = [];
+            for (let i = 0; i < rules.length; i++) {
+              const r = rules[i];
+              const c = r.channel_count || 0;
+              const label = (r.name || r.id) + '（' + (c > 0 ? c + ' 个通道' : '未绑定通道') + '）';
+              rows.push('<option value="' + ntfEsc(r.id) + '"' + (r.id === ntfBindRuleId ? ' selected' : '') + '>' + ntfEsc(label) + '</option>');
+            }
+            sel.innerHTML = rows.join('');
+            sel.value = ntfBindRuleId;
+          }
+          function ntfBindFindChannel(id) {
+            for (let i = 0; i < ntfBindChannels.length; i++) { if (ntfBindChannels[i].id === id) return ntfBindChannels[i]; }
+            return null;
+          }
+          function ntfBindCollect() {
+            const boxes = document.querySelectorAll('#ntf-bind-list input.ntf-bind-box-chk');
+            const ids = [];
+            for (let i = 0; i < boxes.length; i++) { if (boxes[i].checked) ids.push(boxes[i].value); }
+            return ids;
+          }
+          // 就地表头提示：当前规则已勾选通道的数量与名称（不重新渲染列表，避免勾选状态丢失）
+          function ntfBindSyncSummary() {
+            const ids = ntfBindCollect();
+            const r = ntfFindRule(ntfBindRuleId);
+            const sub = document.getElementById('ntf-bind-sub');
+            const cnt = document.getElementById('ntf-bind-count');
+            if (sub) {
+              const names = [];
+              for (let i = 0; i < ids.length; i++) {
+                const ch = ntfBindFindChannel(ids[i]);
+                names.push(ch ? ch.name : ids[i]);
+              }
+              sub.textContent = '规则「' + ((r && r.name) || ntfBindRuleId || '-') + '」当前订阅 ' + ids.length + ' 个通道'
+                + (ids.length ? '：' + names.join('、') : '（未订阅任何通道，保存后该规则不会再发送通知）');
+            }
+            if (cnt) cnt.textContent = '已勾选 ' + ids.length + ' / ' + ntfBindChannels.length + ' 个通道';
+            return ids;
+          }
+          function ntfBindRowHtml(ch, checked) {
+            const badge = ch.enabled === 1 ? '<span class="ntf-badge is-on">已启用</span>' : '<span class="ntf-badge is-off">已停用</span>';
+            return '<label class="ntf-bind-item">'
+              + '<input type="checkbox" class="ntf-bind-box-chk" value="' + ntfEsc(ch.id) + '"' + (checked ? ' checked' : '') + ' onchange="ntfBindSyncSummary()">'
+              + '<span class="ntf-bind-main"><span class="ntf-ch-name">' + ntfEsc(ch.name) + '</span> ' + badge
+              + '<div class="ntf-bind-meta">通道 ID ' + ntfEsc(ch.id) + ' · 类型 ' + ntfEsc(ch.provider_name || ch.type) + '</div></span>'
+              + '</label>';
+          }
+          function ntfBindRenderList(subscribed) {
+            const box = document.getElementById('ntf-bind-list');
+            if (!box) return;
+            const subs = subscribed || [];
+            if (!ntfBindChannels.length) {
+              box.innerHTML = '<div class="ntf-empty">暂无通知通道，请先到「通道管理」新增通道。</div>';
+              ntfBindSyncSummary();
+              return;
+            }
+            const rows = [];
+            for (let i = 0; i < ntfBindChannels.length; i++) {
+              const ch = ntfBindChannels[i];
+              rows.push(ntfBindRowHtml(ch, subs.indexOf(ch.id) >= 0));
+            }
+            box.innerHTML = rows.join('');
+            ntfBindSyncSummary();
+          }
+          function ntfBindSelectAll(flag) {
+            const boxes = document.querySelectorAll('#ntf-bind-list input.ntf-bind-box-chk');
+            for (let i = 0; i < boxes.length; i++) { boxes[i].checked = !!flag; }
+            ntfBindSyncSummary();
+          }
+          async function ntfBindLoadRule(rid, showMsg) {
+            const nm = (ntfFindRule(rid) && ntfFindRule(rid).name) || rid || '-';
+            if (!rid) { ntfBindSubs = []; ntfBindRenderList([]); return; }
+            if (showMsg) ntfSetMsg('ntf-bind-msg', '正在加载规则「' + nm + '」的订阅通道…', 'info');
+            const out = await ntfAdminPost('notify_list_bindings', { rule_id: rid });
+            if (!out || !out.success) { ntfSetMsg('ntf-bind-msg', '加载绑定关系失败：' + ntfErrText(out && out.error), 'err'); return; }
+            const list = out.bindings || [];
+            const subs = [];
+            for (let i = 0; i < list.length; i++) { if (list[i].enabled === 1) subs.push(list[i].channel_id); }
+            ntfBindSubs = subs;
+            ntfBindRenderList(subs);
+            if (showMsg) ntfSetMsg('ntf-bind-msg', '已加载规则「' + nm + '」的 ' + subs.length + ' 条订阅绑定（保存时按当前勾选覆盖写回）', 'ok');
+          }
+          async function ntfBindOnRuleChange() {
+            const sel = document.getElementById('ntf-bind-rule');
+            ntfBindRuleId = sel ? String(sel.value || '') : '';
+            await ntfBindLoadRule(ntfBindRuleId, true);
+          }
+          async function ntfLoadBindings(showMsg) {
+            const box = document.getElementById('ntf-bind-list');
+            if (!box) return;
+            if (showMsg) ntfSetMsg('ntf-bind-msg', '正在加载绑定配置…', 'info');
+            await ntfEnsureMeta();
+            if (!ntfRuleCache.length) {
+              const rOut = await ntfAdminPost('notify_list_rules', {});
+              if (!rOut || !rOut.success) {
+                box.innerHTML = '<div class="ntf-empty">规则列表加载失败。</div>';
+                ntfSetMsg('ntf-bind-msg', '加载规则列表失败：' + ntfErrText(rOut && rOut.error), 'err');
+                return;
+              }
+              ntfRuleCache = rOut.rules || [];
+            }
+            ntfRenderBindRuleSelect();
+            if (!ntfRuleCache.length) {
+              ntfBindChannels = [];
+              box.innerHTML = '<div class="ntf-empty">暂无通知规则，请先到「规则管理」新增规则。</div>';
+              ntfBindSyncSummary();
+              ntfSetMsg('ntf-bind-msg', '当前没有可绑定的规则，请先到「规则管理」新增规则。', 'err');
+              return;
+            }
+            const cOut = await ntfAdminPost('notify_list_channels', {});
+            if (!cOut || !cOut.success) {
+              box.innerHTML = '<div class="ntf-empty">通道列表加载失败。</div>';
+              ntfSetMsg('ntf-bind-msg', '加载通道列表失败：' + ntfErrText(cOut && cOut.error), 'err');
+              return;
+            }
+            ntfBindChannels = cOut.channels || [];
+            await ntfBindLoadRule(ntfBindRuleId, false);
+            if (showMsg) ntfSetMsg('ntf-bind-msg', '已加载 ' + ntfBindChannels.length + ' 个通道、' + ntfRuleCache.length + ' 条规则，选择规则后勾选需要投递的通道。', 'ok');
+          }
+          async function ntfBindSave() {
+            if (!ntfBindRuleId) { ntfSetMsg('ntf-bind-msg', '请先选择一条规则。', 'err'); return; }
+            const ids = ntfBindCollect();
+            const r = ntfFindRule(ntfBindRuleId);
+            const nm = (r && r.name) || ntfBindRuleId;
+            if (ntfBindSubs.length > 0 && ids.length === 0) {
+              if (!confirm('规则「' + nm + '」当前订阅 ' + ntfBindSubs.length + ' 个通道，保存后将解除全部订阅（该规则不再发送任何通知）。\\n\\n确认继续保存？')) return;
+            }
+            ntfSetMsg('ntf-bind-msg', '正在保存规则「' + nm + '」的绑定…', 'info');
+            const out = await ntfAdminPost('notify_save_bindings', { rule_id: ntfBindRuleId, channel_ids: ids });
+            if (!out || !out.success) { ntfSetMsg('ntf-bind-msg', '保存失败：' + ntfErrText(out && out.error), 'err'); return; }
+            ntfBindSubs = ids.slice();
+            if (r) {
+              r.channel_count = ids.length;
+              const row = document.getElementById('ntf-rule-row-' + ntfBindRuleId);
+              if (row) row.innerHTML = ntfRuleRowHtml(r);
+            }
+            ntfRenderBindRuleSelect();
+            ntfBindSyncSummary();
+            ntfSetMsg('ntf-bind-msg', '已保存规则「' + nm + '」的绑定：写入 ' + (out.inserted || 0) + ' 条订阅、移除旧绑定 ' + (out.removed || 0) + ' 条，规则列表绑定列已刷新为 ' + ids.length + ' 个通道', 'ok');
+          }
+          function ntfEnsureBindings() { ntfLoadBindings(true); }
+          // ===== 通知中心 · 通知日志 / 投递队列（第4步B-2a：分页 + 筛选 + 失败展开） BEGIN =====
+          let ntfLogsLoaded = false, ntfLogsLoading = false, ntfLogsReqKey = '';
+          let ntfLogsPage = 1, ntfLogsPages = 0, ntfLogsTotal = 0, ntfLogsItems = [];
+          let ntfQueueLoaded = false, ntfQueueLoading = false, ntfQueueReqKey = '';
+          let ntfQueuePage = 1, ntfQueuePages = 0, ntfQueueTotal = 0, ntfQueueItems = [];
+          let ntfQueueStatCache = null;
+          const NTF_LIST_PAGE_SIZE = 20;
+          const NTF_LOG_STATUS_META = [
+            { value: 'sent', label: '成功', cls: 'is-on' },
+            { value: 'failed', label: '失败', cls: 'is-err' },
+            { value: 'pending', label: '待发送', cls: 'is-warn' },
+            { value: 'skipped', label: '已跳过', cls: 'is-off' }
+          ];
+          const NTF_QUEUE_STATUS_META = [
+            { value: 'pending', label: '待重试', cls: 'is-warn' },
+            { value: 'sent', label: '已发送', cls: 'is-on' },
+            { value: 'dead', label: '已终结', cls: 'is-off' }
+          ];
+          function ntfPad2(n) { return (n < 10 ? '0' : '') + n; }
+          // 毫秒时间戳 → 本地时间文本；0 或非法值显示占位符
+          function ntfFmtTs(ms) {
+            const n = Number(ms);
+            if (!n || isNaN(n) || n <= 0) return '—';
+            const dt = new Date(n);
+            if (isNaN(dt.getTime())) return '—';
+            return dt.getFullYear() + '-' + ntfPad2(dt.getMonth() + 1) + '-' + ntfPad2(dt.getDate()) + ' ' + ntfPad2(dt.getHours()) + ':' + ntfPad2(dt.getMinutes()) + ':' + ntfPad2(dt.getSeconds());
+          }
+          // datetime-local 值（本地时间文本）→ 毫秒时间戳
+          function ntfParseLocalTs(v) {
+            const s = String(v === null || v === undefined ? '' : v).trim();
+            if (!s) return null;
+            const t = new Date(s).getTime();
+            return isNaN(t) ? null : t;
+          }
+          function ntfIdKey(s) { return String(s === null || s === undefined ? '' : s).replace(/[^A-Za-z0-9_-]/g, '_'); }
+          function ntfFilterValue(id) {
+            const el = document.getElementById(id);
+            return el && el.value !== undefined && el.value !== null ? String(el.value) : '';
+          }
+          function ntfRuleLabel(id) { const r = ntfFindRule(id); return r ? (r.name || r.id) : (id || '—'); }
+          function ntfChannelLabel(id) { const c = ntfFindChannel(id); return c ? (c.name || c.id) : (id || '—'); }
+          function ntfNodeLabel(id) {
+            if (!id) return '—';
+            const arr = ntfScopeOptions().nodes;
+            for (let i = 0; i < arr.length; i++) { if (String(arr[i].id) === String(id)) return String(arr[i].name || arr[i].id); }
+            return String(id);
+          }
+          function ntfStatusBadge(meta, status) {
+            for (let i = 0; i < meta.length; i++) {
+              if (meta[i].value === status) return '<span class="ntf-badge ' + meta[i].cls + '">' + meta[i].label + '</span>';
+            }
+            return '<span class="ntf-badge">' + ntfEsc(status || '未知') + '</span>';
+          }
+          function ntfErrBrief(err) {
+            const s = String(err === null || err === undefined ? '' : err).trim();
+            if (!s) return '';
+            return s.length > 80 ? (s.slice(0, 80) + '…') : s;
+          }
+          function ntfToggleHiddenRow(id) {
+            const tr = document.getElementById(id);
+            if (!tr) return;
+            const attrHidden = tr.getAttribute && tr.getAttribute('hidden') !== null && tr.getAttribute('hidden') !== undefined;
+            const isHidden = attrHidden || tr.hidden === true;
+            if (isHidden) { tr.hidden = false; if (tr.removeAttribute) tr.removeAttribute('hidden'); }
+            else { tr.hidden = true; if (tr.setAttribute) tr.setAttribute('hidden', ''); }
+          }
+          function ntfLogToggleErr(id) { ntfToggleHiddenRow('ntf-log-dt-' + ntfIdKey(id)); }
+          function ntfQueueToggleDetail(id) { ntfToggleHiddenRow('ntf-queue-dt-' + ntfIdKey(id)); }
+          // 规则/通道/节点名称映射：仅在前端缓存为空时补拉一次，失败不影响列表渲染
+          async function ntfEnsureLookups() {
+            await ntfEnsureMeta();
+            if (!ntfRuleCache.length) {
+              const rOut = await ntfAdminPost('notify_list_rules', {});
+              if (rOut && rOut.success && rOut.rules) ntfRuleCache = rOut.rules;
+            }
+            if (!ntfChannelCache.length) {
+              const cOut = await ntfAdminPost('notify_list_channels', {});
+              if (cOut && cOut.success && cOut.channels) ntfChannelCache = cOut.channels;
+            }
+          }
+          function ntfFillSelect(id, firstLabel, items, labelFn) {
+            const sel = document.getElementById(id);
+            if (!sel) return;
+            const cur = (sel.value === undefined || sel.value === null) ? '' : String(sel.value);
+            const opts = ['<option value="">' + firstLabel + '</option>'];
+            for (let i = 0; i < items.length; i++) {
+              const it = items[i];
+              opts.push('<option value="' + ntfEsc(it.id) + '">' + ntfEsc(labelFn(it)) + '</option>');
+            }
+            sel.innerHTML = opts.join('');
+            sel.value = cur;
+          }
+          function ntfLoadLookupOptions() {
+            const ruleLab = function (r) { return r.name || r.id; };
+            const chLab = function (c) { return c.name || c.id; };
+            const ndLab = function (n) { return n.name || n.id; };
+            const nodes = ntfScopeOptions().nodes;
+            ntfFillSelect('ntf-log-rule', '全部规则', ntfRuleCache, ruleLab);
+            ntfFillSelect('ntf-log-channel', '全部通道', ntfChannelCache, chLab);
+            ntfFillSelect('ntf-log-server', '全部节点', nodes, ndLab);
+            ntfFillSelect('ntf-queue-rule', '全部规则', ntfRuleCache, ruleLab);
+            ntfFillSelect('ntf-queue-channel', '全部通道', ntfChannelCache, chLab);
+            ntfFillSelect('ntf-queue-server', '全部节点', nodes, ndLab);
+          }
+          function ntfLogsFilterPayload() {
+            const p = {};
+            const st = ntfFilterValue('ntf-log-status'); if (st) p.status = st;
+            const rid = ntfFilterValue('ntf-log-rule'); if (rid) p.rule_id = rid;
+            const cid = ntfFilterValue('ntf-log-channel'); if (cid) p.channel_id = cid;
+            const sid = ntfFilterValue('ntf-log-server'); if (sid) p.server_id = sid;
+            const s = ntfParseLocalTs(ntfFilterValue('ntf-log-start')); if (s !== null) p.start_at = s;
+            const e = ntfParseLocalTs(ntfFilterValue('ntf-log-end')); if (e !== null) p.end_at = e;
+            return p;
+          }
+          function ntfQueueFilterPayload() {
+            const p = {};
+            const st = ntfFilterValue('ntf-queue-status'); if (st) p.status = st;
+            const rid = ntfFilterValue('ntf-queue-rule'); if (rid) p.rule_id = rid;
+            const cid = ntfFilterValue('ntf-queue-channel'); if (cid) p.channel_id = cid;
+            const sid = ntfFilterValue('ntf-queue-server'); if (sid) p.server_id = sid;
+            return p;
+          }
+          function ntfLogsRenderRows() {
+            const body = document.getElementById('ntf-log-body');
+            if (!body) return;
+            if (!ntfLogsItems.length) {
+              body.innerHTML = '<tr><td colspan="7" class="ntf-empty">暂无通知日志（无匹配记录）。</td></tr>';
+              return;
+            }
+            const rows = [];
+            for (let i = 0; i < ntfLogsItems.length; i++) {
+              const it = ntfLogsItems[i];
+              const idk = ntfIdKey(it.id);
+              const when = ntfFmtTs(it.created_at) + (it.sent_at ? '<div class="ntf-ch-id">发送 ' + ntfFmtTs(it.sent_at) + '</div>' : '');
+              const brief = ntfErrBrief(it.error);
+              const errCell = brief ? '<span class="ntf-cell-err">' + ntfEsc(brief) + '</span>' : '<span class="ntf-cell-dim">—</span>';
+              const act = String(it.error || '').trim()
+                ? '<button type="button" class="btn btn-gray" onclick="ntfLogToggleErr(\\'' + ntfEsc(it.id) + '\\')">展开错误</button>'
+                : '<span class="ntf-cell-dim">—</span>';
+              rows.push('<tr>'
+                + '<td>' + when + '</td>'
+                + '<td>' + ntfEsc(ntfRuleLabel(it.rule_id)) + '<div class="ntf-ch-id">' + ntfEsc(it.type || '未知类型') + '</div></td>'
+                + '<td>' + ntfEsc(ntfNodeLabel(it.server_id)) + '</td>'
+                + '<td>' + ntfEsc(ntfChannelLabel(it.channel_id)) + '</td>'
+                + '<td>' + ntfStatusBadge(NTF_LOG_STATUS_META, it.status) + '<div class="ntf-ch-id">尝试 ' + (it.attempts || 0) + ' 次</div></td>'
+                + '<td class="ntf-sum">' + errCell + '</td>'
+                + '<td class="ntf-actions">' + act + '</td>'
+                + '</tr>');
+              rows.push('<tr id="ntf-log-dt-' + idk + '" class="ntf-dt-row" hidden><td colspan="7"><div class="ntf-dt-box">'
+                + '<div>日志 ID：' + ntfEsc(it.id || '—') + '　去重键：' + ntfEsc(it.dedupe_key || '（无）') + '</div>'
+                + '<div>失败原因：' + ntfEsc(it.error || '（无）') + '</div>'
+                + '<div>尝试次数：' + (it.attempts || 0) + '　发送时间：' + ntfFmtTs(it.sent_at) + '</div>'
+                + '<div>标题：' + ntfEsc(it.title || '（无）') + '</div>'
+                + '<div>内容：' + ntfEsc(it.content || '（无）') + '</div>'
+                + '</div></td></tr>');
+            }
+            body.innerHTML = rows.join('');
+          }
+          function ntfQueueRenderRows() {
+            const body = document.getElementById('ntf-queue-body');
+            if (!body) return;
+            if (!ntfQueueItems.length) {
+              body.innerHTML = '<tr><td colspan="7" class="ntf-empty">暂无队列条目（无匹配记录）。</td></tr>';
+              return;
+            }
+            const rows = [];
+            for (let i = 0; i < ntfQueueItems.length; i++) {
+              const it = ntfQueueItems[i];
+              const idk = ntfIdKey(it.id);
+              const retry = it.status === 'pending' ? ntfFmtTs(it.next_retry_at) : '—';
+              const brief = ntfErrBrief(it.last_error);
+              const errCell = brief ? '<span class="ntf-cell-err">' + ntfEsc(brief) + '</span>' : '<span class="ntf-cell-dim">—</span>';
+              let payloadTxt = '';
+              try { payloadTxt = JSON.stringify(it.payload || {}); } catch (e) { payloadTxt = String(it.payload || ''); }
+              rows.push('<tr>'
+                + '<td>' + ntfFmtTs(it.created_at) + '</td>'
+                + '<td>' + retry + '</td>'
+                + '<td>' + (it.attempts || 0) + ' 次</td>'
+                + '<td>' + ntfStatusBadge(NTF_QUEUE_STATUS_META, it.status) + '</td>'
+                + '<td>' + ntfEsc(ntfRuleLabel(it.rule_id)) + '<div class="ntf-ch-id">' + ntfEsc(ntfNodeLabel(it.server_id) + ' · ' + ntfChannelLabel(it.channel_id)) + '</div></td>'
+                + '<td class="ntf-sum">' + errCell + '</td>'
+                + '<td class="ntf-actions"><button type="button" class="btn btn-gray" onclick="ntfQueueToggleDetail(\\'' + ntfEsc(it.id) + '\\')">详情</button></td>'
+                + '</tr>');
+              rows.push('<tr id="ntf-queue-dt-' + idk + '" class="ntf-dt-row" hidden><td colspan="7"><div class="ntf-dt-box">'
+                + '<div>队列 ID：' + ntfEsc(it.id || '—') + '　关联日志：' + ntfEsc(it.log_id || '（无）') + '</div>'
+                + '<div>最后错误：' + ntfEsc(it.last_error || '（无）') + '</div>'
+                + '<div>尝试次数：' + (it.attempts || 0) + '　下次重试：' + ntfFmtTs(it.next_retry_at) + '</div>'
+                + '<div>投递载荷：' + ntfEsc(payloadTxt) + '</div>'
+                + '</div></td></tr>');
+            }
+            body.innerHTML = rows.join('');
+          }
+          function ntfRenderPager(boxId, page, pages, total, prevFn, nextFn) {
+            const box = document.getElementById(boxId);
+            if (!box) return;
+            const cur = page > 0 ? page : 0;
+            const pg = pages > 0 ? pages : 0;
+            box.innerHTML = '<button type="button" class="btn btn-gray" onclick="' + prevFn + '"' + (cur <= 1 ? ' disabled' : '') + '>← 前一页</button>'
+              + '<span class="ntf-pager-info">第 ' + cur + ' / ' + pg + ' 页 · 共 ' + (total > 0 ? total : 0) + ' 条</span>'
+              + '<button type="button" class="btn btn-gray" onclick="' + nextFn + '"' + (cur >= pg ? ' disabled' : '') + '>后一页 →</button>';
+          }
+          function ntfRenderQueueStat() {
+            const el = document.getElementById('ntf-queue-stat');
+            if (!el) return;
+            const s = ntfQueueStatCache || {};
+            const pd = parseInt(s.pending, 10) || 0, sn = parseInt(s.sent, 10) || 0, dd = parseInt(s.dead, 10) || 0;
+            el.textContent = '待重试 ' + pd + ' 条 · 已发送 ' + sn + ' 条 · 已终结 ' + dd + ' 条 · 合计 ' + (pd + sn + dd) + ' 条';
+          }
+          function ntfLogsPrev() { if (ntfLogsPage > 1) { ntfLogsPage = ntfLogsPage - 1; ntfLoadLogs(true); } }
+          function ntfLogsNext() { if (ntfLogsPages > 0 && ntfLogsPage < ntfLogsPages) { ntfLogsPage = ntfLogsPage + 1; ntfLoadLogs(true); } }
+          function ntfQueuePrev() { if (ntfQueuePage > 1) { ntfQueuePage = ntfQueuePage - 1; ntfLoadQueue(true); } }
+          function ntfQueueNext() { if (ntfQueuePages > 0 && ntfQueuePage < ntfQueuePages) { ntfQueuePage = ntfQueuePage + 1; ntfLoadQueue(true); } }
+          async function ntfLoadLogs(showMsg, force) {
+            const body = document.getElementById('ntf-log-body');
+            if (!body) return;
+            if (ntfLogsLoading) return;
+            const key = ntfLogsPage + '|' + JSON.stringify(ntfLogsFilterPayload());
+            if (!force && ntfLogsReqKey === key) return;   // 同条件重复请求去重
+            ntfLogsLoading = true;
+            if (showMsg) ntfSetMsg('ntf-log-msg', '正在加载通知日志…', 'info');
+            await ntfEnsureLookups();
+            ntfLoadLookupOptions();
+            const payload = ntfLogsFilterPayload();
+            payload.page = ntfLogsPage;
+            payload.page_size = NTF_LIST_PAGE_SIZE;
+            const out = await ntfAdminPost('notify_list_logs', payload);
+            ntfLogsLoading = false;
+            if (!out || !out.success) {
+              body.innerHTML = '<tr><td colspan="7" class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</td></tr>';
+              ntfSetMsg('ntf-log-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
+              ntfRenderPager('ntf-log-pager', ntfLogsPage, 0, 0, 'ntfLogsPrev()', 'ntfLogsNext()');
+              return;
+            }
+            ntfLogsReqKey = key;
+            ntfLogsItems = out.items || [];
+            ntfLogsPage = parseInt(out.page, 10) || 1;
+            ntfLogsPages = parseInt(out.pages, 10) || 0;
+            ntfLogsTotal = parseInt(out.total, 10) || 0;
+            ntfLogsRenderRows();
+            ntfRenderPager('ntf-log-pager', ntfLogsPage, ntfLogsPages, ntfLogsTotal, 'ntfLogsPrev()', 'ntfLogsNext()');
+            const cnt = document.getElementById('ntf-log-count');
+            if (cnt) cnt.textContent = '共 ' + ntfLogsTotal + ' 条';
+            ntfSetMsg('ntf-log-msg', showMsg ? ('已加载第 ' + ntfLogsPage + ' / ' + ntfLogsPages + ' 页，共 ' + ntfLogsTotal + ' 条日志') : '', 'ok');
+          }
+          async function ntfLoadQueue(showMsg, force) {
+            const body = document.getElementById('ntf-queue-body');
+            if (!body) return;
+            if (ntfQueueLoading) return;
+            const key = ntfQueuePage + '|' + JSON.stringify(ntfQueueFilterPayload());
+            if (!force && ntfQueueReqKey === key) return;   // 同条件重复请求去重
+            ntfQueueLoading = true;
+            if (showMsg) ntfSetMsg('ntf-queue-msg', '正在加载投递队列…', 'info');
+            await ntfEnsureLookups();
+            ntfLoadLookupOptions();
+            if (force || !ntfQueueStatCache) {
+              const ov = await ntfAdminPost('notify_overview', {});
+              if (ov && ov.success && ov.queue_stats) ntfQueueStatCache = ov.queue_stats;
+            }
+            ntfRenderQueueStat();
+            const payload = ntfQueueFilterPayload();
+            payload.page = ntfQueuePage;
+            payload.page_size = NTF_LIST_PAGE_SIZE;
+            const out = await ntfAdminPost('notify_list_queue', payload);
+            ntfQueueLoading = false;
+            if (!out || !out.success) {
+              body.innerHTML = '<tr><td colspan="7" class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</td></tr>';
+              ntfSetMsg('ntf-queue-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
+              ntfRenderPager('ntf-queue-pager', ntfQueuePage, 0, 0, 'ntfQueuePrev()', 'ntfQueueNext()');
+              return;
+            }
+            ntfQueueReqKey = key;
+            ntfQueueItems = out.items || [];
+            ntfQueuePage = parseInt(out.page, 10) || 1;
+            ntfQueuePages = parseInt(out.pages, 10) || 0;
+            ntfQueueTotal = parseInt(out.total, 10) || 0;
+            ntfQueueRenderRows();
+            ntfRenderPager('ntf-queue-pager', ntfQueuePage, ntfQueuePages, ntfQueueTotal, 'ntfQueuePrev()', 'ntfQueueNext()');
+            ntfSetMsg('ntf-queue-msg', showMsg ? ('已加载第 ' + ntfQueuePage + ' / ' + ntfQueuePages + ' 页，共 ' + ntfQueueTotal + ' 条队列条目') : '', 'ok');
+          }
+          function ntfLogsSearch() { ntfLogsPage = 1; ntfLogsReqKey = ''; ntfLoadLogs(true, true); }
+          function ntfLogsReset() {
+            const ids = ['ntf-log-status', 'ntf-log-rule', 'ntf-log-channel', 'ntf-log-server', 'ntf-log-start', 'ntf-log-end'];
+            for (let i = 0; i < ids.length; i++) { const el = document.getElementById(ids[i]); if (el) el.value = ''; }
+            ntfLogsPage = 1; ntfLogsReqKey = '';
+            ntfLoadLogs(true, true);
+          }
+          function ntfQueueSearch() { ntfQueuePage = 1; ntfQueueReqKey = ''; ntfLoadQueue(true, true); }
+          function ntfQueueReset() {
+            const ids = ['ntf-queue-status', 'ntf-queue-rule', 'ntf-queue-channel', 'ntf-queue-server'];
+            for (let i = 0; i < ids.length; i++) { const el = document.getElementById(ids[i]); if (el) el.value = ''; }
+            ntfQueuePage = 1; ntfQueueReqKey = '';
+            ntfLoadQueue(true, true);
+          }
+          function ntfEnsureLogs() { if (ntfLogsLoaded) return; ntfLogsLoaded = true; ntfLoadLogs(true, true); }
+          function ntfEnsureQueue() { if (ntfQueueLoaded) return; ntfQueueLoaded = true; ntfLoadQueue(true, true); }
+          // ===== 通知中心 · 模板中心（第4步B-2b：列表 + 编辑器 + 变量表 + 实时预览 + 恢复默认）BEGIN =====
+          let ntfTplLoaded = false, ntfTplLoading = false, ntfTplReqKey = '';
+          let ntfTplItems = [], ntfTplBuiltins = [], ntfTplTypes = [], ntfTplVars = [];
+          let ntfTplSelId = '', ntfTplNewMode = false, ntfTplSampleDefault = '';
+          let ntfTplPrevTimer = null, ntfTplPrevSeq = 0;
+          const NTF_TPL_TYPE_LABELS = { offline: '节点离线', recover: '节点恢复', metric: '指标阈值', traffic_ratio: '流量占比', expire_days: '到期提醒' };
+          function ntfTplEl(id) { return document.getElementById(id); }
+          function ntfTplTypeLabel(t) { const s = String(t || ''); return NTF_TPL_TYPE_LABELS[s] || s || '—'; }
+          function ntfTplBuiltinById(id) { for (let i = 0; i < ntfTplBuiltins.length; i++) { if (ntfTplBuiltins[i].id === id) return ntfTplBuiltins[i]; } return null; }
+          function ntfTplFind(id) { for (let i = 0; i < ntfTplItems.length; i++) { if (ntfTplItems[i].id === id) return ntfTplItems[i]; } return null; }
+          function ntfTplIsBuiltinId(id) { return String(id || '').indexOf('tpl_builtin_') === 0; }
+          // content 兼容两种形态：{title, body} JSON 与历史纯文本（整体作为正文）
+          function ntfTplParseContentText(content) {
+            const raw = String(content === null || content === undefined ? '' : content);
+            if (!raw) return { title: '', body: '' };
+            if (raw.charAt(0) === '{') {
+              try {
+                const o = JSON.parse(raw);
+                if (o && typeof o === 'object') return { title: String(o.title === null || o.title === undefined ? '' : o.title), body: String(o.body === null || o.body === undefined ? '' : o.body) };
+              } catch (e) {}
+            }
+            return { title: '', body: raw };
+          }
+          function ntfTplComposeContent() {
+            const t = ntfTplEl('ntf-tpl-ed-title'), b = ntfTplEl('ntf-tpl-ed-body');
+            return JSON.stringify({ title: String(t ? t.value : ''), body: String(b ? b.value : '') });
+          }
+          function ntfTplTypeOptionsHtml() {
+            let html = '';
+            for (let i = 0; i < ntfTplTypes.length; i++) {
+              html += '<option value="' + ntfEsc(ntfTplTypes[i]) + '">' + ntfEsc(ntfTplTypeLabel(ntfTplTypes[i]) + '（' + ntfTplTypes[i] + '）') + '</option>';
+            }
+            return html;
+          }
+          function ntfTplChannelOptionsHtml() {
+            const ps = ntfProviders();
+            let html = '<option value="">全渠道通用</option>';
+            for (let i = 0; i < ps.length; i++) html += '<option value="' + ntfEsc(ps[i].type) + '">' + ntfEsc(ps[i].name || ps[i].type) + '</option>';
+            return html;
+          }
+          function ntfTplKeepSelect(id, html) {
+            const el = ntfTplEl(id);
+            if (!el) return;
+            const cur = String(el.value || '');
+            el.innerHTML = html;
+            el.value = cur;
+          }
+          function ntfTplFillFilterOptions() {
+            let ty = '<option value="">全部类型</option>';
+            for (let i = 0; i < ntfTplTypes.length; i++) ty += '<option value="' + ntfEsc(ntfTplTypes[i]) + '">' + ntfEsc(ntfTplTypeLabel(ntfTplTypes[i])) + '</option>';
+            ntfTplKeepSelect('ntf-tpl-type', ty);
+            let ch = '<option value="">全部渠道</option>';
+            const ps = ntfProviders();
+            for (let j = 0; j < ps.length; j++) ch += '<option value="' + ntfEsc(ps[j].type) + '">' + ntfEsc(ps[j].name || ps[j].type) + '</option>';
+            ntfTplKeepSelect('ntf-tpl-channel', ch);
+          }
+          // 合并内置与库中数据：库中存在与内置同 id 的行时视为「内置的自定义覆盖」
+          function ntfTplRows() {
+            const fType = ntfFilterValue('ntf-tpl-type'), fCh = ntfFilterValue('ntf-tpl-channel'), fScope = ntfFilterValue('ntf-tpl-scope');
+            const out = [];
+            const usedIds = {};
+            for (let i = 0; i < ntfTplBuiltins.length; i++) {
+              const bi = ntfTplBuiltins[i];
+              const ov = ntfTplFind(bi.id);
+              usedIds[bi.id] = 1;
+              out.push(ov ? Object.assign({}, ov, { builtin: 1, customized: 1, enabled: (ov.enabled === 0 ? 0 : 1) })
+                          : Object.assign({}, bi, { builtin: 1, customized: 0, enabled: 1 }));
+            }
+            for (let j = 0; j < ntfTplItems.length; j++) {
+              const it = ntfTplItems[j];
+              if (usedIds[it.id]) continue;
+              out.push(Object.assign({}, it, { builtin: 0, customized: 1 }));
+            }
+            const filtered = [];
+            for (let k = 0; k < out.length; k++) {
+              const r = out[k];
+              if (fType && String(r.type) !== fType) continue;
+              if (fCh && String(r.channel_type || '') !== fCh) continue;
+              if (fScope === 'custom' && r.customized !== 1) continue;
+              if (fScope === 'builtin' && !(r.builtin === 1 && r.customized === 0)) continue;
+              filtered.push(r);
+            }
+            return filtered;
+          }
+          function ntfTplRenderList() {
+            const box = ntfTplEl('ntf-tpl-list');
+            if (!box) return;
+            const rows = ntfTplRows();
+            const cnt = ntfTplEl('ntf-tpl-count');
+            if (cnt) cnt.textContent = '当前显示 ' + rows.length + ' 个模板（库中 ' + ntfTplItems.length + ' 条，内置 ' + ntfTplBuiltins.length + ' 个）';
+            if (!rows.length) { box.innerHTML = '<div class="ntf-empty">暂无符合条件的模板。</div>'; return; }
+            let html = '';
+            for (let i = 0; i < rows.length; i++) {
+              const r = rows[i];
+              let tags = r.customized === 1 ? '<span class="ntf-tpl-tag is-custom">自定义</span>' : '<span class="ntf-tpl-tag is-builtin">内置</span>';
+              if (r.builtin === 1 && r.customized === 1) tags += '<span class="ntf-tpl-tag">内置·已覆盖</span>';
+              if (r.enabled === 0) tags += '<span class="ntf-tpl-tag">已停用</span>';
+              const chLabel = r.channel_type ? ntfProviderLabel(r.channel_type) : '全渠道';
+              html += '<button type="button" class="ntf-tpl-item' + (r.id === ntfTplSelId ? ' is-active' : '') + '" onclick="ntfTplSelect(\\'' + ntfEsc(r.id) + '\\')">'
+                + '<span class="ntf-tpl-name">' + ntfEsc(r.name || r.id) + '</span>' + tags
+                + '<div class="ntf-tpl-meta">' + ntfEsc(ntfTplTypeLabel(r.type) + ' · ' + chLabel) + '</div>'
+                + '<div class="ntf-tpl-meta">模板键：' + ntfEsc(String(r.type || '—')) + ' / ' + ntfEsc(String(r.channel_type || '全渠道')) + '</div>'
+                + '</button>';
+            }
+            box.innerHTML = html;
+          }
+          function ntfTplRenderVars() {
+            const box = ntfTplEl('ntf-tpl-vars');
+            if (!box) return;
+            let html = '';
+            for (let i = 0; i < ntfTplVars.length; i++) {
+              const v = ntfTplVars[i];
+              const tip = v.label + '｜示例：' + String(v.sample === null || v.sample === undefined ? '' : v.sample);
+              html += '<button type="button" class="ntf-tpl-var" title="' + ntfEsc(tip) + '" onclick="ntfTplInsertVar(\\'' + ntfEsc(v.key) + '\\')">{' + ntfEsc(v.key) + '}</button>';
+            }
+            box.innerHTML = html || '<div class="ntf-tpl-meta">未获取到变量表（notify_meta / notify_list_templates 未返回 vars）。</div>';
+          }
+          function ntfTplInsertVar(key) {
+            const ta = ntfTplEl('ntf-tpl-ed-body');
+            if (!ta) return;
+            const token = '{' + key + '}';
+            const val = String(ta.value || '');
+            const start = (ta.selectionStart === undefined || ta.selectionStart === null) ? val.length : ta.selectionStart;
+            const end = (ta.selectionEnd === undefined || ta.selectionEnd === null) ? val.length : ta.selectionEnd;
+            ta.value = val.slice(0, start) + token + val.slice(end);
+            try { ta.focus(); ta.selectionStart = ta.selectionEnd = start + token.length; } catch (e) {}
+            ntfTplSchedulePreview();
+          }
+          function ntfTplSampleFromVars() {
+            const m = {};
+            for (let i = 0; i < ntfTplVars.length; i++) {
+              const v = ntfTplVars[i];
+              m[v.key] = String(v.sample === null || v.sample === undefined ? '' : v.sample);
+            }
+            m.severity = m.severity || 'warning';
+            m.severity_label = m.severity_label || '警告';
+            m.kind = m.kind || 'fire';
+            m.kind_label = m.kind_label || '触发告警';
+            m.at_text = m.at_text || ntfFmtTs(Date.now());
+            return m;
+          }
+          function ntfTplApplySampleDefault(force) {
+            const el = ntfTplEl('ntf-tpl-sample');
+            if (!el) return;
+            if (!ntfTplSampleDefault) {
+              try { ntfTplSampleDefault = JSON.stringify(ntfTplSampleFromVars(), null, 2); } catch (e) { ntfTplSampleDefault = '{}'; }
+            }
+            if (force || !String(el.value || '').trim()) el.value = ntfTplSampleDefault;
+          }
+          function ntfTplResetSample() {
+            const el = ntfTplEl('ntf-tpl-sample');
+            if (el) el.value = ntfTplSampleDefault;
+            ntfSetMsg('ntf-tpl-ed-msg', '已重置模拟数据', 'info');
+            ntfTplPreview();
+          }
+          function ntfTplRenderEditor() {
+            const nameEl = ntfTplEl('ntf-tpl-ed-name');
+            if (!nameEl) return;
+            const ty = ntfTplEl('ntf-tpl-ed-type'), ch = ntfTplEl('ntf-tpl-ed-channel');
+            if (ty) { const cur = String(ty.value || ''); ty.innerHTML = ntfTplTypeOptionsHtml(); ty.value = ntfTplNewMode ? (ntfTplTypes.length ? ntfTplTypes[0] : '') : cur; }
+            if (ch) { const cur2 = String(ch.value || ''); ch.innerHTML = ntfTplChannelOptionsHtml(); ch.value = ntfTplNewMode ? '' : cur2; }
+            if (ntfTplNewMode) return;
+            const row = ntfTplFind(ntfTplSelId);
+            const bi = ntfTplBuiltinById(ntfTplSelId);
+            const cur3 = row || bi;
+            if (!cur3) {
+              nameEl.value = '';
+              if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = '';
+              if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = '';
+              ntfSetMsg('ntf-tpl-ed-msg', '请在左侧选择模板，或点击「新建自定义模板」。', 'info');
+              return;
+            }
+            nameEl.value = String(cur3.name || '');
+            if (ty) ty.value = String(cur3.type || '');
+            if (ch) ch.value = String(cur3.channel_type || '');
+            const en = ntfTplEl('ntf-tpl-ed-enabled');
+            if (en) en.checked = row ? (row.enabled !== 0) : true;
+            const parts = ntfTplParseContentText(cur3.content);
+            if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = parts.title;
+            if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = parts.body;
+            const kindTxt = row ? (bi ? '内置模板的自定义覆盖（保存将更新覆盖内容）' : '自定义模板') : '内置默认模板（保存将生成自定义覆盖）';
+            const legacy = (!parts.title && String(cur3.content || '').charAt(0) !== '{') ? '｜该模板内容为历史纯文本格式，保存后将转为「标题 + 正文」结构' : '';
+            ntfSetMsg('ntf-tpl-ed-msg', '正在编辑：' + String(cur3.name || cur3.id) + '（' + kindTxt + '，ID：' + String(cur3.id || '') + '）' + legacy, 'info');
+          }
+          function ntfTplNew() {
+            ntfTplNewMode = true;
+            ntfTplSelId = '';
+            ntfTplRenderList();
+            const nameEl = ntfTplEl('ntf-tpl-ed-name');
+            if (nameEl) nameEl.value = '';
+            const ty = ntfTplEl('ntf-tpl-ed-type');
+            if (ty) ty.value = ntfTplTypes.length ? ntfTplTypes[0] : '';
+            const ch = ntfTplEl('ntf-tpl-ed-channel');
+            if (ch) ch.value = '';
+            const en = ntfTplEl('ntf-tpl-ed-enabled');
+            if (en) en.checked = true;
+            if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = '';
+            if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = '';
+            ntfSetMsg('ntf-tpl-ed-msg', '新建模式：填写模板名称、模板键（事件类型）与渠道类型后保存。', 'info');
+            ntfTplSchedulePreview();
+          }
+          function ntfTplSelect(id) {
+            ntfTplSelId = String(id || '');
+            ntfTplNewMode = false;
+            ntfTplRenderList();
+            ntfTplRenderEditor();
+            ntfTplSchedulePreview();
+          }
+          async function ntfTplSave() {
+            const name = String((ntfTplEl('ntf-tpl-ed-name') || {}).value || '').trim();
+            const type = String((ntfTplEl('ntf-tpl-ed-type') || {}).value || '');
+            const ctype = String((ntfTplEl('ntf-tpl-ed-channel') || {}).value || '');
+            const title = String((ntfTplEl('ntf-tpl-ed-title') || {}).value || '');
+            const body = String((ntfTplEl('ntf-tpl-ed-body') || {}).value || '');
+            if (!name) { ntfSetMsg('ntf-tpl-ed-msg', '请填写模板名称', 'err'); return; }
+            if (!type) { ntfSetMsg('ntf-tpl-ed-msg', '请选择模板键（事件类型）', 'err'); return; }
+            if (!title.trim() && !body.trim()) { ntfSetMsg('ntf-tpl-ed-msg', '标题模板与正文模板不能同时为空', 'err'); return; }
+            const editing = (!ntfTplNewMode && ntfTplSelId) ? ntfTplSelId : '';
+            const isBuiltin = editing ? ntfTplIsBuiltinId(editing) : false;
+            const prompt = isBuiltin
+              ? '确认将内置模板「' + name + '」保存为自定义覆盖？\\n\\n模板 ID：' + editing + '\\n模板键：' + type + ' / ' + (ctype || '全渠道') + '\\n\\n影响提示：覆盖后模板中心显示的该内置模板内容将改为当前编辑内容；可随时通过「恢复默认」删除覆盖并还原为内置默认。'
+              : '确认保存模板「' + name + '」？\\n\\n模板键：' + type + ' / ' + (ctype || '全渠道') + (editing ? ('\\n模板 ID：' + editing) : '\\n保存后由后端生成模板 ID。');
+            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消保存', 'info'); return; }
+            const tpl = { name: name, type: type, channel_type: ctype, content: ntfTplComposeContent(), enabled: (ntfTplEl('ntf-tpl-ed-enabled') || {}).checked ? 1 : 0 };
+            if (editing) tpl.id = editing;
+            ntfSetMsg('ntf-tpl-ed-msg', '正在保存模板…', 'info');
+            const out = await ntfAdminPost('notify_save_template', { template: tpl });
+            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '保存失败：' + ntfErrText(out && out.error), 'err'); return; }
+            ntfTplSelId = String(out.id || editing || '');
+            ntfTplNewMode = false;
+            ntfTplReqKey = '';
+            ntfSetMsg('ntf-tpl-msg', (out.created ? '模板已新增：' : '模板已更新：') + name, 'ok');
+            await ntfLoadTemplates(false, true);
+            ntfSetMsg('ntf-tpl-ed-msg', '保存成功（模板 ID：' + ntfTplSelId + '）', 'ok');
+          }
+          async function ntfTplDeleteCurrent() {
+            const id = ntfTplNewMode ? '' : ntfTplSelId;
+            if (!id) { ntfSetMsg('ntf-tpl-ed-msg', '请先在左侧选择一个模板', 'err'); return; }
+            const row = ntfTplFind(id);
+            const nm = row ? (row.name || id) : id;
+            const isBuiltin = ntfTplIsBuiltinId(id);
+            const prompt = isBuiltin
+              ? '确认删除内置模板「' + nm + '」的自定义覆盖？\\n\\n模板 ID：' + id + '\\n\\n影响提示：删除后该内置模板还原为系统默认内容；系统内置模板本身不会被删除。'
+              : '确认删除自定义模板「' + nm + '」？\\n\\n模板 ID：' + id + '\\n\\n影响提示：删除后该模板不再出现在模板中心，操作不可撤销（模板不参与通知投递，历史日志与队列不受影响）。';
+            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消删除', 'info'); return; }
+            ntfSetMsg('ntf-tpl-ed-msg', '正在删除模板…', 'info');
+            const out = await ntfAdminPost('notify_delete_template', { id: id });
+            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '删除失败：' + ntfErrText(out && out.error), 'err'); return; }
+            ntfTplSelId = '';
+            ntfTplNewMode = true;
+            ntfTplReqKey = '';
+            ntfSetMsg('ntf-tpl-msg', out.deleted ? ('模板已删除：' + nm) : ('未找到可删除的模板：' + nm), out.deleted ? 'ok' : 'warn');
+            await ntfLoadTemplates(false, true);
+            ntfTplNew();
+            ntfSetMsg('ntf-tpl-ed-msg', out.deleted ? ('已删除模板：' + nm) : ('未找到可删除的模板：' + nm), out.deleted ? 'ok' : 'warn');
+          }
+          async function ntfTplResetCurrent() {
+            const id = ntfTplNewMode ? '' : ntfTplSelId;
+            if (!id) { ntfSetMsg('ntf-tpl-ed-msg', '请先在左侧选择一个模板', 'err'); return; }
+            const row = ntfTplFind(id);
+            const nm = row ? (row.name || id) : id;
+            const isBuiltin = ntfTplIsBuiltinId(id);
+            const prompt = isBuiltin
+              ? '确认将内置模板「' + nm + '」恢复默认？\\n\\n模板 ID：' + id + '\\n\\n影响提示：将删除当前的自定义覆盖内容，模板还原为内置默认标题/正文模板。'
+              : '确认将模板「' + nm + '」的标题/正文模板恢复为同事件类型的内置默认内容？\\n\\n模板 ID：' + id + '\\n\\n影响提示：当前标题模板与正文模板将被内置默认内容覆盖（模板名称、模板键、渠道类型与启用状态保持不变）。';
+            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消恢复默认', 'info'); return; }
+            ntfSetMsg('ntf-tpl-ed-msg', '正在恢复默认…', 'info');
+            const out = await ntfAdminPost('notify_reset_template', { id: id });
+            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '恢复默认失败：' + ntfErrText(out && out.error), 'err'); return; }
+            ntfTplReqKey = '';
+            await ntfLoadTemplates(false, true);
+            ntfTplSelect(id);
+            ntfSetMsg('ntf-tpl-ed-msg', isBuiltin
+              ? (out.removed_override ? '已恢复内置默认内容（原自定义覆盖已删除）' : '该内置模板本就没有自定义覆盖，保持内置默认内容')
+              : '已按同事件类型的内置默认内容重置标题/正文模板', 'ok');
+          }
+          function ntfTplPreviewData() {
+            const el = ntfTplEl('ntf-tpl-sample');
+            const fallback = ntfTplSampleFromVars();
+            const raw = el ? String(el.value || '').trim() : '';
+            if (!raw) return fallback;
+            try {
+              const o = JSON.parse(raw);
+              if (o && typeof o === 'object') return o;
+            } catch (e) { return null; }
+            return null;
+          }
+          function ntfTplSchedulePreview() {
+            if (ntfTplPrevTimer) clearTimeout(ntfTplPrevTimer);
+            ntfTplPrevTimer = setTimeout(function () { ntfTplPreview(); }, 400);
+          }
+          async function ntfTplPreview() {
+            const box = ntfTplEl('ntf-tpl-preview');
+            if (!box) return;
+            const st = ntfTplEl('ntf-tpl-pv-state');
+            const title = String((ntfTplEl('ntf-tpl-ed-title') || {}).value || '');
+            const body = String((ntfTplEl('ntf-tpl-ed-body') || {}).value || '');
+            if (!title.trim() && !body.trim()) {
+              if (st) st.textContent = '';
+              box.innerHTML = '<div class="ntf-tpl-pv-title">（尚未渲染）</div><div class="ntf-tpl-pv-body">请先填写标题模板或正文模板。</div>';
+              return;
+            }
+            const data = ntfTplPreviewData();
+            if (data === null) {
+              if (st) st.textContent = '';
+              box.innerHTML = '<div class="ntf-tpl-pv-title">模拟数据不是合法 JSON</div><div class="ntf-tpl-pv-body">请修正「模拟数据」文本框内容，或点击「重置模拟数据」。</div>';
+              return;
+            }
+            const seq = ++ntfTplPrevSeq;
+            if (st) st.textContent = '渲染中…';
+            const out = await ntfAdminPost('notify_test_render', { content: JSON.stringify({ title: title, body: body }), data: data });
+            if (seq !== ntfTplPrevSeq) return;
+            if (!out || out.success !== true) {
+              if (st) st.textContent = '';
+              box.innerHTML = '<div class="ntf-tpl-pv-title">渲染失败</div><div class="ntf-tpl-pv-body">' + ntfEsc(ntfErrText(out && out.error)) + '</div>';
+              return;
+            }
+            const missing = out.vars_missing || [];
+            if (st) st.textContent = '已渲染' + (missing.length ? ('｜模拟数据未提供变量：' + missing.join('、')) : '');
+            box.innerHTML = '<div class="ntf-tpl-pv-title">' + ntfEsc(out.title || '（无标题）') + '</div>'
+              + '<div class="ntf-tpl-pv-body">' + ntfEsc(out.body || '（无正文）') + '</div>';
+          }
+          function ntfTplReload() {
+            ntfTplReqKey = '';
+            ntfLoadTemplates(true, true);
+          }
+          async function ntfLoadTemplates(showMsg, force) {
+            const box = ntfTplEl('ntf-tpl-list');
+            if (!box) return;
+            if (ntfTplLoading) return;
+            const key = [String(ntfFilterValue('ntf-tpl-type')), String(ntfFilterValue('ntf-tpl-channel')), String(ntfFilterValue('ntf-tpl-scope'))].join('|');
+            if (!force && ntfTplLoaded && ntfTplReqKey === key) { ntfTplRenderList(); return; }
+            ntfTplLoading = true;
+            if (showMsg) ntfSetMsg('ntf-tpl-msg', '正在加载模板列表…', 'info');
+            await ntfEnsureMeta();
+            if (!ntfTplTypes.length && ntfMetaCache && ntfMetaCache.template_types) ntfTplTypes = ntfMetaCache.template_types.slice();
+            if (!ntfTplVars.length && ntfMetaCache && ntfMetaCache.template_vars) ntfTplVars = ntfMetaCache.template_vars.slice();
+            if (!ntfTplBuiltins.length && ntfMetaCache && ntfMetaCache.template_builtins) ntfTplBuiltins = ntfMetaCache.template_builtins.slice();
+            const payload = {};
+            const fType = ntfFilterValue('ntf-tpl-type');
+            if (fType) payload.type = fType;
+            const fCh = ntfFilterValue('ntf-tpl-channel');
+            if (fCh) payload.channel_type = fCh;
+            const out = await ntfAdminPost('notify_list_templates', payload);
+            ntfTplLoading = false;
+            if (!out || out.success !== true) {
+              box.innerHTML = '<div class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</div>';
+              ntfSetMsg('ntf-tpl-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
+              return;
+            }
+            ntfTplItems = out.templates || [];
+            if (out.builtins && out.builtins.length) ntfTplBuiltins = out.builtins;
+            if (out.vars && out.vars.length) ntfTplVars = out.vars;
+            if (out.types && out.types.length) ntfTplTypes = out.types;
+            ntfTplLoaded = true;
+            ntfTplReqKey = key;
+            if (ntfTplSelId && !ntfTplFind(ntfTplSelId) && !ntfTplBuiltinById(ntfTplSelId)) { ntfTplSelId = ''; ntfTplNewMode = true; }
+            ntfTplFillFilterOptions();
+            ntfTplRenderVars();
+            ntfTplRenderList();
+            ntfTplRenderEditor();
+            ntfTplApplySampleDefault(false);
+            ntfTplSchedulePreview();
+            ntfSetMsg('ntf-tpl-msg', showMsg ? ('已加载：库中 ' + ntfTplItems.length + ' 条模板，内置默认 ' + ntfTplBuiltins.length + ' 个，可用变量 ' + ntfTplVars.length + ' 个') : '', 'ok');
+          }
+          function ntfEnsureTemplates() {
+            if (ntfTplLoaded) return;
+            ntfLoadTemplates(true, true);
+          }
+          (function ntfTplBindInputs() {
+            const ids = ['ntf-tpl-ed-title', 'ntf-tpl-ed-body', 'ntf-tpl-sample'];
+            for (let i = 0; i < ids.length; i++) {
+              const el = ntfTplEl(ids[i]);
+              if (el && el.addEventListener) el.addEventListener('input', ntfTplSchedulePreview);
+            }
+          })();
+          // ===== 通知中心 · 模板中心 END =====
+          // ===== 通知中心 · 通知日志 / 投递队列 END =====
+          // ===== 通知中心 · 绑定配置 END =====
+          // ===== 通知中心 · 规则管理列表 END =====
+          // ===== 通知中心 · 通道新增/编辑/测试 BEGIN =====
+          let ntfMetaCache = null;
+          let ntfModalId = '';
+          let ntfModalChannel = null;
+          async function ntfEnsureMeta() {
+            if (ntfMetaCache) return ntfMetaCache;
+            const out = await ntfAdminPost('notify_meta', {});
+            if (out && out.success) ntfMetaCache = out;
+            return ntfMetaCache;
+          }
+          function ntfProviders() { return (ntfMetaCache && ntfMetaCache.providers) ? ntfMetaCache.providers : []; }
+          function ntfProviderByType(t) {
+            const ps = ntfProviders();
+            for (let i = 0; i < ps.length; i++) { if (ps[i].type === t) return ps[i]; }
+            return null;
+          }
+          function ntfProviderLabel(t) { const p = ntfProviderByType(t); return (p && p.name) ? p.name : t; }
+          function ntfFieldCssKeySafe(k) { return String(k).replace(/[^A-Za-z0-9_]/g, '_'); }
+          // 单个配置字段 → 表单控件 HTML（按 schema 动态渲染）
+          function ntfFieldHtml(key, f, val) {
+            const fd = f || {};
+            const label = ntfEsc(fd.label || key);
+            const req = fd.required ? '<span class="ntf-req">*</span>' : '';
+            const type = fd.type || 'string';
+            const ph = ntfEsc(fd.placeholder || '');
+            const hint = fd.description ? '<div class="ntf-hint">' + ntfEsc(fd.description) + '</div>' : '';
+            const cid = 'ntf_f_' + ntfFieldCssKeySafe(key);
+            const dkey = ' data-key="' + ntfEsc(key) + '"';
+            if (type === 'select') {
+              const opts = fd.options || [];
+              let html = '<select id="' + cid + '"' + dkey + ' data-ftype="select">';
+              if (!fd.required) html += '<option value="">（默认）</option>';
+              for (let i = 0; i < opts.length; i++) {
+                const ov = (opts[i] && typeof opts[i] === 'object') ? opts[i].value : opts[i];
+                const ol = (opts[i] && typeof opts[i] === 'object') ? (opts[i].label || opts[i].value) : opts[i];
+                const sel = (val !== undefined && val !== null && String(val) === String(ov)) ? ' selected' : '';
+                html += '<option value="' + ntfEsc(ov) + '"' + sel + '>' + ntfEsc(ol) + '</option>';
+              }
+              html += '</select>';
+              return '<div class="ntf-field"><label>' + label + req + '</label>' + html + hint + '</div>';
+            }
+            if (type === 'boolean') {
+              const checked = (val === true || val === 1 || val === 'true' || val === '1') ? ' checked' : '';
+              return '<div class="ntf-field"><div class="checkbox-group"><input type="checkbox" id="' + cid + '"' + dkey + ' data-ftype="boolean"' + checked + '><span>' + label + '</span></div>' + hint + '</div>';
+            }
+            if (type === 'number') {
+              const v = (val === undefined || val === null) ? '' : ntfEsc(val);
+              return '<div class="ntf-field"><label>' + label + req + '</label><input type="number" id="' + cid + '"' + dkey + ' data-ftype="number" placeholder="' + ph + '" value="' + v + '">' + hint + '</div>';
+            }
+            if (type === 'object' || type === 'json') {
+              let txt = '';
+              if (val !== undefined && val !== null) txt = (typeof val === 'string') ? val : JSON.stringify(val);
+              return '<div class="ntf-field"><label>' + label + req + '</label><textarea rows="3" id="' + cid + '"' + dkey + ' data-ftype="json" placeholder="' + ph + '">' + ntfEsc(txt) + '</textarea><div class="ntf-hint">JSON 对象，如 {"X-Key":"xxx"}，留空表示不使用</div>' + hint + '</div>';
+            }
+            const it = (type === 'password') ? 'password' : 'text';
+            const v = (val === undefined || val === null) ? '' : ntfEsc(val);
+            return '<div class="ntf-field"><label>' + label + req + '</label><input type="' + it + '" id="' + cid + '"' + dkey + ' data-ftype="' + (type === 'password' ? 'password' : 'string') + '" autocomplete="new-password" placeholder="' + ph + '" value="' + v + '">' + hint + '</div>';
+          }
+          function ntfRenderChannelFields() {
+            const box = document.getElementById('ntf_ch_fields');
+            const sel = document.getElementById('ntf_ch_type');
+            if (!box || !sel) return;
+            const t = sel.value;
+            const p = ntfProviderByType(t);
+            const schema = (p && p.configSchema) ? p.configSchema : {};
+            const cur = (ntfModalChannel && ntfModalChannel.type === t && ntfModalChannel.config) ? ntfModalChannel.config : {};
+            const keys = Object.keys(schema);
+            let html = '<div class="ntf-ch-form">';
+            if (!keys.length) html += '<div class="ntf-hint">该类型无额外配置项</div>';
+            for (let i = 0; i < keys.length; i++) html += ntfFieldHtml(keys[i], schema[keys[i]], cur[keys[i]]);
+            html += '</div>';
+            box.innerHTML = html;
+          }
+          // 收集表单 → config（含必填与 URL 格式校验）
+          function ntfCollectConfig(schema) {
+            const cfg = {};
+            const keys = Object.keys(schema || {});
+            for (let i = 0; i < keys.length; i++) {
+              const key = keys[i];
+              const fd = schema[key] || {};
+              const el = document.getElementById('ntf_f_' + ntfFieldCssKeySafe(key));
+              const label = fd.label || key;
+              if (!el) continue;
+              const ftype = el.getAttribute('data-ftype') || 'string';
+              if (ftype === 'boolean') { cfg[key] = el.checked ? true : false; continue; }
+              let raw = String(el.value === undefined || el.value === null ? '' : el.value).trim();
+              if (raw === '') {
+                if (fd.required) return { ok: false, error: '请填写「' + label + '」（必填）' };
+                continue;
+              }
+              if (ftype === 'number') {
+                const n = parseInt(raw, 10);
+                if (isNaN(n) || n <= 0) return { ok: false, error: '「' + label + '」需为正整数' };
+                cfg[key] = n;
+                continue;
+              }
+              if (ftype === 'json') {
+                try { const o = JSON.parse(raw); cfg[key] = o; } catch (e) { return { ok: false, error: '「' + label + '」不是合法 JSON' }; }
+                continue;
+              }
+              if (key === 'url' || ftype === 'url') {
+                if (!/^https?:\\/\\//i.test(raw)) return { ok: false, error: '「' + label + '」需以 http:// 或 https:// 开头' };
+              }
+              cfg[key] = raw;
+            }
+            return { ok: true, error: '', config: cfg };
+          }
+          async function ntfOpenChannelModal(id) {
+            await ntfEnsureMeta();
+            const modal = document.getElementById('ntfChannelModal');
+            if (!modal) return;
+            const ps = ntfProviders();
+            if (!ps.length) { ntfSetMsg('ntf-channel-msg', '未能获取通道类型元数据（notify_meta），请稍后重试', 'err'); return; }
+            const sel = document.getElementById('ntf_ch_type');
+            let opts = '';
+            for (let i = 0; i < ps.length; i++) opts += '<option value="' + ntfEsc(ps[i].type) + '">' + ntfEsc(ps[i].name || ps[i].type) + '</option>';
+            sel.innerHTML = opts;
+            const ch = id ? ntfFindChannel(id) : null;
+            ntfModalId = ch ? ch.id : '';
+            ntfModalChannel = ch ? { type: ch.type, config: ch.config } : null;
+            document.getElementById('ntf-channel-title').textContent = ch ? ('✏️ 编辑通知通道：' + ch.name) : '📡 新增通知通道';
+            document.getElementById('ntf_ch_name').value = ch ? ch.name : '';
+            document.getElementById('ntf_ch_enabled').checked = ch ? (ch.enabled === 1) : true;
+            if (ch && ch.type) sel.value = ch.type;
+            sel.disabled = !!ch;
+            ntfRenderChannelFields();
+            ntfSetMsg('ntf-channel-modal-msg', ch ? '' : '请选择通道类型并填写配置后保存', 'info');
+            modal.style.display = 'block';
+          }
+          function ntfCloseChannelModal() {
+            const modal = document.getElementById('ntfChannelModal');
+            if (modal) modal.style.display = 'none';
+            ntfModalId = '';
+            ntfModalChannel = null;
+            ntfSetMsg('ntf-channel-modal-msg', '', 'info');
+          }
+          async function ntfSaveChannel() {
+            const sel = document.getElementById('ntf_ch_type');
+            const type = sel ? sel.value : '';
+            const p = ntfProviderByType(type);
+            const schema = (p && p.configSchema) ? p.configSchema : {};
+            const nameEl = document.getElementById('ntf_ch_name');
+            const name = nameEl ? String(nameEl.value || '').trim() : '';
+            const cv = ntfCollectConfig(schema);
+            if (!cv.ok) { ntfSetMsg('ntf-channel-modal-msg', cv.error, 'err'); return; }
+            const channel = {
+              type: type,
+              name: name || (ntfProviderLabel(type) + ' 通道'),
+              config: cv.config,
+              enabled: document.getElementById('ntf_ch_enabled').checked ? 1 : 0
+            };
+            if (ntfModalId) channel.id = ntfModalId;
+            const btn = document.getElementById('ntf-ch-save-btn');
+            if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+            ntfSetMsg('ntf-channel-modal-msg', '正在保存通道…', 'info');
+            const out = await ntfAdminPost('notify_save_channel', { channel: channel });
+            if (btn) { btn.disabled = false; btn.textContent = '保存通道'; }
+            if (!out || out.success !== true) {
+              ntfSetMsg('ntf-channel-modal-msg', '保存失败：' + ntfErrText(out && out.error), 'err');
+              return;
+            }
+            ntfCloseChannelModal();
+            ntfSetMsg('ntf-channel-msg', (channel.id ? '通道已更新：' : '通道已新增：') + channel.name, 'ok');
+            await ntfLoadChannels(false);
+          }
+          async function ntfTestChannel(id) {
+            const ch = ntfFindChannel(id);
+            const label = (ch && ch.name) ? ch.name : id;
+            ntfSetMsg('ntf-channel-msg', '正在向「' + label + '」发送测试消息…', 'info');
+            const out = await ntfAdminPost('notify_test_channel', { id: id });
+            return ntfReportTest(out, 'ntf-channel-msg', label);
+          }
+          async function ntfTestFromModal() {
+            if (!ntfModalId) { ntfSetMsg('ntf-channel-modal-msg', '请先保存通道，再进行测试发送', 'err'); return; }
+            const ch = ntfFindChannel(ntfModalId);
+            const label = (ch && ch.name) ? ch.name : ntfModalId;
+            ntfSetMsg('ntf-channel-modal-msg', '正在向「' + label + '」发送测试消息…', 'info');
+            const out = await ntfAdminPost('notify_test_channel', { id: ntfModalId });
+            return ntfReportTest(out, 'ntf-channel-modal-msg', label);
+          }
+          function ntfReportTest(out, msgId, label) {
+            if (!out || out.success !== true) {
+              ntfSetMsg(msgId, '测试发送失败：' + ntfErrText(out && out.error) + '（通道「' + label + '」）', 'err');
+              return false;
+            }
+            const r = out.result || {};
+            if (out.ok === true) {
+              ntfSetMsg(msgId, '测试发送成功：通道「' + label + '」已收到消息' + (out.log_id ? '（日志 ' + out.log_id + '）' : ''), 'ok');
+              return true;
+            }
+            ntfSetMsg(msgId, '测试发送失败：' + ntfErrText(r.error) + '（HTTP ' + (r.status || 0) + '）', 'err');
+            return false;
+          }
+          // ===== 通知中心 · 通道新增/编辑/测试 END =====
+          // ===== 通知中心 · 规则新增/编辑弹窗 BEGIN =====
+          let ntfRuleModalId = '';
+          let ntfRuleModalRow = null;
+          // 规则行级字段（非 params）：冷却时间 / 免打扰时段 / 聚合摘要 / 恢复通知
+          const NTF_RULE_COMMON_FIELDS = [
+            { key: 'cooldown', label: '冷却时间', unit: '秒', type: 'number', default: 0, min: 0, max: 86400, help: '同一节点重复触发的最小间隔，0 表示不限制' },
+            { key: 'silent_window', label: '免打扰时段', type: 'string', placeholder: '22:00-08:00（多段用英文逗号分隔）', help: '留空表示不启用；命中时段内的通知将抑制投递（仍记录告警状态）' },
+            { key: 'digest', label: '聚合摘要', type: 'select', options: ['off', 'on'], option_labels: { off: '关闭（逐条推送）', on: '开启（同轮同类聚合）' }, default: 'off', help: '同轮内多节点同类事件聚合为一条推送，防消息风暴' },
+            { key: 'recover_notify', label: '发送恢复通知', type: 'boolean', default: 1, help: '节点恢复正常时补发一条恢复通知' }
+          ];
+          function ntfRuleTypes() { return (ntfMetaCache && ntfMetaCache.rule_types) ? ntfMetaCache.rule_types : []; }
+          function ntfRuleSeverities() { return (ntfMetaCache && ntfMetaCache.severities) ? ntfMetaCache.severities : []; }
+          function ntfRuleTypeMetaByType(t) {
+            const ts = ntfRuleTypes();
+            for (let i = 0; i < ts.length; i++) { if (ts[i].type === t) return ts[i]; }
+            return null;
+          }
+          function ntfRuleKeySafe(k) { return String(k).replace(/[^A-Za-z0-9_]/g, '_'); }
+          // 作用范围说明（本轮不提供范围编辑界面，仅展示当前范围）
+          function ntfRuleScopeText(scope) {
+            const sc = (scope && typeof scope === 'object') ? scope : {};
+            const gs = Array.isArray(sc.groups) ? sc.groups : [];
+            const isx = Array.isArray(sc.ids) ? sc.ids : [];
+            const tgs = Array.isArray(sc.tags) ? sc.tags : [];
+            if (gs.length) return '分组：' + gs.join('、');
+            if (isx.length) return '节点：' + isx.join('、');
+            if (tgs.length) return '标签：' + tgs.join('、');
+            return '全部节点';
+          }
+          // ===== 作用范围编辑（B-1b-ii-2：模式 all / groups / ids / tags + 多选 + 手动添加） =====
+          let ntfRuleScopeMode = 'all';
+          let ntfRuleScopeSel = { groups: [], ids: [], tags: [] };
+          function ntfScopeOptions() {
+            const o = (ntfMetaCache && ntfMetaCache.scope_options) ? ntfMetaCache.scope_options : {};
+            return {
+              groups: Array.isArray(o.groups) ? o.groups : [],
+              nodes: Array.isArray(o.nodes) ? o.nodes : [],
+              tags: Array.isArray(o.tags) ? o.tags : []
+            };
+          }
+          function ntfScopeArrHas(arr, v) {
+            const list = Array.isArray(arr) ? arr : [];
+            for (let i = 0; i < list.length; i++) { if (String(list[i]) === String(v)) return true; }
+            return false;
+          }
+          function ntfRuleScopeModeLabel(mode) {
+            if (mode === 'groups') return '分组';
+            if (mode === 'ids') return '节点';
+            if (mode === 'tags') return '标签';
+            return '全部节点';
+          }
+          function ntfRuleScopeNoteText() {
+            if (ntfRuleScopeMode === 'all') return '作用范围：全部节点（所有节点都会匹配该规则）';
+            const lab = ntfRuleScopeModeLabel(ntfRuleScopeMode);
+            const sel = ntfRuleScopeSel[ntfRuleScopeMode] || [];
+            if (!sel.length) return '作用范围：尚未选择' + lab + '（至少需要选择或添加一项）';
+            return '作用范围：已选 ' + sel.length + ' 个' + lab + '（' + sel.join('、') + '）';
+          }
+          function ntfRuleScopeBoxHtml() {
+            const mode = ntfRuleScopeMode;
+            if (mode === 'all') return '';
+            const ops = ntfScopeOptions();
+            let items = [];
+            if (mode === 'groups') {
+              items = ops.groups.map(function (g) { return { v: g, t: g }; });
+            } else if (mode === 'ids') {
+              items = ops.nodes.map(function (n) { return { v: n.id, t: (n.name || n.id) + (n.group ? '（' + n.group + '）' : '') + ' · ' + n.id }; });
+            } else {
+              items = ops.tags.map(function (t) { return { v: t, t: t }; });
+            }
+            const sel = ntfRuleScopeSel[mode] || [];
+            let html = '';
+            if (items.length) {
+              html += '<div class="ntf-scope-list">';
+              for (let i = 0; i < items.length; i++) {
+                const it = items[i];
+                const cid = 'ntf_rs_' + ntfRuleKeySafe(mode) + '_' + i;
+                html += '<label class="ntf-scope-item" for="' + cid + '"><input type="checkbox" id="' + cid + '" data-scope-mode="' + ntfEsc(mode) + '" data-scope-val="' + ntfEsc(it.v) + '"'
+                  + (ntfScopeArrHas(sel, it.v) ? ' checked' : '') + ' onchange="ntfRuleScopeToggle(this)"><span>' + ntfEsc(it.t) + '</span></label>';
+              }
+              html += '</div>';
+            } else {
+              html += '<div class="ntf-hint">' + (mode === 'tags' ? '暂无标签数据' : ('暂无可选' + ntfRuleScopeModeLabel(mode) + '数据')) + '，可在下方手动添加</div>';
+            }
+            const ph = mode === 'groups' ? '输入分组名' : (mode === 'ids' ? '输入节点 ID' : '输入标签名');
+            html += '<div class="ntf-scope-add"><input type="text" id="ntf_rule_scope_input" placeholder="' + ph + '（回车添加）"'
+              + ' onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();ntfRuleScopeAdd();}">'
+              + '<button type="button" class="btn btn-gray" onclick="ntfRuleScopeAdd()">添加</button></div>';
+            if (mode === 'ids') html += '<div class="ntf-hint">节点 ID 可从上方列表勾选，也可手动输入绑定的节点 ID</div>';
+            return html;
+          }
+          function ntfRuleScopeRender() {
+            const box = document.getElementById('ntf_rule_scope_box');
+            if (box) box.innerHTML = ntfRuleScopeBoxHtml();
+            const note = document.getElementById('ntf-rule-scope-note');
+            if (note) note.textContent = ntfRuleScopeNoteText();
+          }
+          function ntfRuleScopeModeChange() {
+            const sel = document.getElementById('ntf_rule_scope_mode');
+            ntfRuleScopeMode = sel ? String(sel.value || 'all') : 'all';
+            if (ntfRuleScopeMode === 'all') ntfRuleScopeSel = { groups: [], ids: [], tags: [] };
+            ntfRuleScopeRender();
+          }
+          function ntfRuleScopeToggle(el) {
+            if (!el) return;
+            const mode = String(el.getAttribute('data-scope-mode') || '');
+            const val = String(el.getAttribute('data-scope-val') || '');
+            if (!mode || !val || mode === 'all') return;
+            let arr = ntfRuleScopeSel[mode] || [];
+            if (el.checked) { if (!ntfScopeArrHas(arr, val)) arr = arr.concat([val]); }
+            else { const next = []; for (let i = 0; i < arr.length; i++) { if (String(arr[i]) !== val) next.push(arr[i]); } arr = next; }
+            ntfRuleScopeSel[mode] = arr;
+            ntfRuleScopeRender();
+          }
+          function ntfRuleScopeAdd() {
+            const mode = ntfRuleScopeMode;
+            if (mode === 'all') return;
+            const inp = document.getElementById('ntf_rule_scope_input');
+            const raw = inp ? String(inp.value || '').trim() : '';
+            if (raw === '') { ntfSetMsg('ntf-rule-modal-msg', '请输入要添加的' + ntfRuleScopeModeLabel(mode), 'err'); return; }
+            let arr = ntfRuleScopeSel[mode] || [];
+            if (!ntfScopeArrHas(arr, raw)) arr = arr.concat([raw]);
+            ntfRuleScopeSel[mode] = arr;
+            if (inp) inp.value = '';
+            ntfSetMsg('ntf-rule-modal-msg', '', 'info');
+            ntfRuleScopeRender();
+          }
+          // 作用范围回填：按既有 scope 推断模式（分组 > 节点 > 标签）并选中对应项
+          function ntfRuleScopeFill(scope) {
+            const sc = (scope && typeof scope === 'object') ? scope : {};
+            const gs = Array.isArray(sc.groups) ? sc.groups.map(String) : [];
+            const isx = Array.isArray(sc.ids) ? sc.ids.map(String) : [];
+            const tgs = Array.isArray(sc.tags) ? sc.tags.map(String) : [];
+            let mode = 'all';
+            if (gs.length) mode = 'groups';
+            else if (isx.length) mode = 'ids';
+            else if (tgs.length) mode = 'tags';
+            else if (sc.all === false) mode = 'groups';
+            ntfRuleScopeMode = mode;
+            ntfRuleScopeSel = { groups: gs, ids: isx, tags: tgs };
+            const sel = document.getElementById('ntf_rule_scope_mode');
+            if (sel) sel.value = mode;
+            ntfRuleScopeRender();
+          }
+          // 作用范围收集：all 模式提交全量；其余模式必须至少选择/添加一项（与 notifyMatchScope 语义对齐：all 恒为 true）
+          function ntfRuleScopePayload() {
+            if (ntfRuleScopeMode === 'all') return { scope: { all: true, groups: [], ids: [], tags: [] } };
+            const arr = (ntfRuleScopeSel[ntfRuleScopeMode] || []).slice();
+            if (!arr.length) return { error: '请至少选择或添加一个' + ntfRuleScopeModeLabel(ntfRuleScopeMode) };
+            return { scope: {
+              all: true,
+              groups: ntfRuleScopeMode === 'groups' ? arr : [],
+              ids: ntfRuleScopeMode === 'ids' ? arr : [],
+              tags: ntfRuleScopeMode === 'tags' ? arr : []
+            } };
+          }
+          // 单个参数/字段 → 表单控件 HTML（按 schema 动态渲染，id 前缀 ntf_rf_ 避免与通道弹窗冲突）
+          function ntfRuleFieldHtml(key, fd, val) {
+            const f = fd || {};
+            const label = ntfEsc(f.label || key) + (f.unit ? '（' + ntfEsc(f.unit) + '）' : '');
+            const req = f.required ? '<span class="ntf-req">*</span>' : '';
+            const cid = 'ntf_rf_' + ntfRuleKeySafe(key);
+            const dk = ' data-key="' + ntfEsc(key) + '"';
+            const hint = f.help ? '<div class="ntf-hint">' + ntfEsc(f.help) + '</div>' : '';
+            const type = f.type || 'string';
+            if (type === 'select') {
+              let html = '<select id="' + cid + '"' + dk + ' data-ftype="select">';
+              if (f.default === undefined || f.default === null) html += '<option value="">（默认）</option>';
+              const opts = f.options || [];
+              for (let i = 0; i < opts.length; i++) {
+                const ov = String(opts[i]);
+                const ol = (f.option_labels && f.option_labels[ov]) ? f.option_labels[ov] : ov;
+                const sel = (val !== undefined && val !== null && String(val) === ov) ? ' selected' : '';
+                html += '<option value="' + ntfEsc(ov) + '"' + sel + '>' + ntfEsc(ol) + '</option>';
+              }
+              html += '</select>';
+              return '<div class="ntf-field"><label>' + label + req + '</label>' + html + hint + '</div>';
+            }
+            if (type === 'boolean') {
+              const ck = (val === true || val === 1 || val === '1' || val === 'true') ? ' checked' : '';
+              return '<div class="ntf-field"><div class="checkbox-group"><input type="checkbox" id="' + cid + '"' + dk + ' data-ftype="boolean"' + ck + '><span>' + label + '</span></div>' + hint + '</div>';
+            }
+            if (type === 'number') {
+              const v = (val === undefined || val === null || val === '') ? '' : ntfEsc(val);
+              const ph = (f.default === undefined || f.default === null) ? '留空表示不限制' : ('默认 ' + f.default);
+              const mn = (f.min === undefined || f.min === null) ? '' : ' data-min="' + ntfEsc(f.min) + '"';
+              const mx = (f.max === undefined || f.max === null) ? '' : ' data-max="' + ntfEsc(f.max) + '"';
+              return '<div class="ntf-field"><label>' + label + req + '</label><input type="number" id="' + cid + '"' + dk + ' data-ftype="number"' + mn + mx + ' placeholder="' + ntfEsc(ph) + '" value="' + v + '">' + hint + '</div>';
+            }
+            const sv = (val === undefined || val === null) ? '' : ntfEsc(val);
+            return '<div class="ntf-field"><label>' + label + req + '</label><input type="text" id="' + cid + '"' + dk + ' data-ftype="string" placeholder="' + ntfEsc(f.placeholder || '') + '" value="' + sv + '">' + hint + '</div>';
+          }
+          function ntfRuleParamsHtml(type, params) {
+            const m = ntfRuleTypeMetaByType(type);
+            const defs = (m && m.params) ? m.params : [];
+            const p = params || {};
+            let html = '';
+            if (!defs.length) html += '<div class="ntf-hint">该规则类型无额外参数</div>';
+            for (let i = 0; i < defs.length; i++) html += ntfRuleFieldHtml(defs[i].key, defs[i], p[defs[i].key]);
+            return html;
+          }
+          // 按选中类型动态渲染参数区（含类型切换后回退默认）
+          function ntfRenderRuleForm() {
+            const box = document.getElementById('ntf_rule_fields');
+            const sel = document.getElementById('ntf_rule_type');
+            if (!box || !sel) return;
+            const t = String(sel.value || '');
+            const m = ntfRuleTypeMetaByType(t);
+            const desc = document.getElementById('ntf-rule-type-desc');
+            if (desc) desc.textContent = (m && m.description) ? m.description : '';
+            const r = ntfRuleModalRow || {};
+            const cur = (String(r.type || '') === t) ? r : {};
+            const p = cur.params || {};
+            let html = '<div class="ntf-ch-form"><div class="ntf-hint" style="font-weight:600; color:var(--text); margin-top:10px;">参数设置</div>';
+            html += ntfRuleParamsHtml(t, p);
+            html += '<div class="ntf-hint" style="font-weight:600; color:var(--text); margin-top:12px;">触发控制</div>';
+            for (let i = 0; i < NTF_RULE_COMMON_FIELDS.length; i++) {
+              const f = NTF_RULE_COMMON_FIELDS[i];
+              let v = cur[f.key];
+              if (v === undefined || v === null) v = f.default;
+              if (f.key === 'digest') v = (String(v || 'off').toLowerCase() === 'off') ? 'off' : 'on';
+              html += ntfRuleFieldHtml(f.key, f, v);
+            }
+            html += '</div>';
+            box.innerHTML = html;
+          }
+          async function ntfOpenRuleModal(id) {
+            await ntfEnsureMeta();
+            const modal = document.getElementById('ntfRuleModal');
+            if (!modal) return;
+            const types = ntfRuleTypes();
+            if (!types.length) { ntfSetMsg('ntf-rule-msg', '未能获取规则类型元数据（notify_meta），请稍后重试', 'err'); return; }
+            const selT = document.getElementById('ntf_rule_type');
+            let opts = '';
+            for (let i = 0; i < types.length; i++) opts += '<option value="' + ntfEsc(types[i].type) + '">' + ntfEsc(types[i].name || types[i].type) + '</option>';
+            selT.innerHTML = opts;
+            const svs = ntfRuleSeverities();
+            const sev = document.getElementById('ntf_rule_severity');
+            let sopts = '';
+            for (let i = 0; i < svs.length; i++) sopts += '<option value="' + ntfEsc(svs[i].value || svs[i].id) + '">' + ntfEsc(svs[i].label || svs[i].name || svs[i].value) + '</option>';
+            sev.innerHTML = sopts;
+            const row = id ? ntfFindRule(id) : null;
+            ntfRuleModalRow = row || null;
+            ntfRuleModalId = row ? String(row.id || '') : '';
+            const r = row || {};
+            selT.value = (r.type && ntfRuleTypeMetaByType(r.type)) ? r.type : types[0].type;
+            document.getElementById('ntf_rule_name').value = r.name ? String(r.name) : '';
+            sev.value = r.severity ? String(r.severity) : 'warning';
+            document.getElementById('ntf_rule_enabled').checked = row ? (r.enabled === 1 || r.enabled === true) : true;
+            ntfRuleScopeFill(row ? r.scope : null);
+            document.getElementById('ntf-rule-title').textContent = row ? ('✏️ 编辑通知规则：' + (r.name || r.id)) : '🔔 新增通知规则';
+            const saveBtn = document.getElementById('ntf-rule-save-btn');
+            if (saveBtn) { saveBtn.textContent = row ? '保存修改' : '创建规则'; saveBtn.disabled = false; }
+            ntfSetMsg('ntf-rule-modal-msg', '', 'info');
+            ntfRenderRuleForm();
+            modal.style.display = 'flex';
+          }
+          function ntfCloseRuleModal() {
+            const modal = document.getElementById('ntfRuleModal');
+            if (modal) modal.style.display = 'none';
+            ntfRuleModalId = '';
+            ntfRuleModalRow = null;
+            ntfSetMsg('ntf-rule-modal-msg', '', 'info');
+          }
+          // 按类型 params schema 收集参数（必填 + 数值范围 + 恢复阈值方向校验）
+          function ntfRuleCollectParams(type) {
+            const m = ntfRuleTypeMetaByType(type);
+            const defs = (m && m.params) ? m.params : [];
+            const params = {};
+            for (let i = 0; i < defs.length; i++) {
+              const d = defs[i];
+              const el = document.getElementById('ntf_rf_' + ntfRuleKeySafe(d.key));
+              if (!el) continue;
+              const lab = (d.label || d.key) + (d.unit ? '（' + d.unit + '）' : '');
+              const ft = d.type || 'string';
+              if (ft === 'select') {
+                const v = String(el.value === undefined || el.value === null ? '' : el.value);
+                if (v === '') { if (d.required) return { error: '请选择「' + lab + '」' }; continue; }
+                params[d.key] = v;
+                continue;
+              }
+              const raw = String(el.value === undefined || el.value === null ? '' : el.value).trim();
+              if (ft === 'number') {
+                if (raw === '') { if (d.required) return { error: '请填写「' + lab + '」' }; continue; }
+                if (!/^-?\\d+(\\.\\d+)?$/.test(raw)) return { error: '「' + lab + '」必须是数字' };
+                const n = parseFloat(raw);
+                if (d.min !== undefined && d.min !== null && n < d.min) return { error: '「' + lab + '」不能小于 ' + d.min };
+                if (d.max !== undefined && d.max !== null && n > d.max) return { error: '「' + lab + '」不能大于 ' + d.max };
+                params[d.key] = n;
+                continue;
+              }
+              if (raw === '') { if (d.required) return { error: '请填写「' + lab + '」' }; continue; }
+              params[d.key] = raw;
+            }
+            const thr = params.threshold;
+            const clr = params.clear_threshold;
+            if (thr !== undefined && clr !== undefined) {
+              if (type === 'expire_days') {
+                if (clr < thr) return { error: '「恢复阈值」不能小于「剩余天数阈值」（剩余天数回升到该值以上才判定恢复）' };
+              } else if (clr > thr) {
+                return { error: '「恢复阈值」不能大于「触发阈值」（指标回落到该值以下才判定恢复）' };
+              }
+            }
+            return { params: params };
+          }
+          // 行级字段收集（冷却 / 免打扰 / 聚合 / 恢复通知）
+          function ntfRuleCollectCommon() {
+            const out = {};
+            const cdEl = document.getElementById('ntf_rf_cooldown');
+            const raw = cdEl ? String(cdEl.value === undefined || cdEl.value === null ? '' : cdEl.value).trim() : '';
+            if (raw !== '' && !/^\\d+$/.test(raw)) return { error: '「冷却时间（秒）」必须是非负整数' };
+            out.cooldown = raw === '' ? 0 : parseInt(raw, 10);
+            const swEl = document.getElementById('ntf_rf_silent_window');
+            const sw = swEl ? String(swEl.value || '').trim() : '';
+            if (sw !== '' && !/^(\\d{1,2}:\\d{2}\\s*-\\s*\\d{1,2}:\\d{2})(\\s*[,;]\\s*\\d{1,2}:\\d{2}\\s*-\\s*\\d{1,2}:\\d{2})*$/.test(sw)) {
+              return { error: '「免打扰时段」格式有误，应为 22:00-08:00（多段用英文逗号分隔）' };
+            }
+            out.silent_window = sw;
+            const dgEl = document.getElementById('ntf_rf_digest');
+            out.digest = dgEl ? (String(dgEl.value || 'off') || 'off') : 'off';
+            const rcEl = document.getElementById('ntf_rf_recover_notify');
+            out.recover_notify = (rcEl && rcEl.checked) ? 1 : 0;
+            return { common: out };
+          }
+          async function ntfSaveRule() {
+            const selT = document.getElementById('ntf_rule_type');
+            const pw = document.getElementById('ntf_rule_name');
+            const type = selT ? String(selT.value || '') : '';
+            const name = pw ? String(pw.value || '').trim() : '';
+            if (!name) { ntfSetMsg('ntf-rule-modal-msg', '请填写规则名称', 'err'); return; }
+            if (name.length > 60) { ntfSetMsg('ntf-rule-modal-msg', '规则名称不能超过 60 个字符', 'err'); return; }
+            const scopeRes = ntfRuleScopePayload();
+            if (scopeRes.error) { ntfSetMsg('ntf-rule-modal-msg', scopeRes.error, 'err'); return; }
+            const pRes = ntfRuleCollectParams(type);
+            if (pRes.error) { ntfSetMsg('ntf-rule-modal-msg', pRes.error, 'err'); return; }
+            const cRes = ntfRuleCollectCommon();
+            if (cRes.error) { ntfSetMsg('ntf-rule-modal-msg', cRes.error, 'err'); return; }
+            const sevEl = document.getElementById('ntf_rule_severity');
+            const enEl = document.getElementById('ntf_rule_enabled');
+            const rule = {
+              type: type,
+              name: name,
+              scope: scopeRes.scope,
+              params: pRes.params,
+              severity: sevEl ? String(sevEl.value || 'warning') : 'warning',
+              cooldown: cRes.common.cooldown,
+              silent_window: cRes.common.silent_window,
+              digest: cRes.common.digest,
+              recover_notify: cRes.common.recover_notify,
+              enabled: (enEl && enEl.checked) ? 1 : 0
+            };
+            const isNew = !ntfRuleModalId;
+            if (!isNew) rule.id = ntfRuleModalId;
+            const btn = document.getElementById('ntf-rule-save-btn');
+            if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+            ntfSetMsg('ntf-rule-modal-msg', '正在保存规则…', 'info');
+            const out = await ntfAdminPost('notify_save_rule', { rule: rule });
+            if (btn) { btn.disabled = false; btn.textContent = isNew ? '创建规则' : '保存修改'; }
+            if (!out || !out.success) { ntfSetMsg('ntf-rule-modal-msg', '保存失败：' + ntfErrText(out && out.error), 'err'); return; }
+            ntfCloseRuleModal();
+            await ntfLoadRules(false);
+            let extra = '';
+            const sync = out.threshold_sync;
+            if (sync && sync.ok) extra = '；已同步系统设置 alert_threshold = ' + notifyAdminStr(sync.value) + ' 秒';
+            ntfSetMsg('ntf-rule-msg', (isNew ? '已新增' : '已更新') + '规则「' + name + '」' + extra + '（共 ' + ntfRuleCache.length + ' 条）', 'ok');
+          }
+          // ===== 通知中心 · 规则新增/编辑弹窗 END =====
+          // ===== 通知中心 · 通道管理列表 END =====
+          // ===== 通知中心前端骨架 END =====
+        </script>`
+      }), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
     // ==========================================
@@ -2439,7 +6590,8 @@ rm -f /tmp/cf_install.sh
     // 大盘主程序、聚合渲染及 Gossip 路由分发
     // ==========================================
     // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
-    if (!(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
+    const isDashboardApi = request.method === 'GET' && url.pathname === '/api/dashboard';
+    if (!isDashboardApi && !(request.method === 'GET' && url.pathname === '/')) return new Response('Not Found', { status: 404 });
     let { results } = await env.DB.prepare('SELECT id,name,cpu,ram,disk,load_avg,uptime,last_updated,ram_total,net_rx,net_tx,net_in_speed,net_out_speed,os,cpu_info,arch,boot_time,ram_used,swap_total,swap_used,disk_total,disk_used,processes,tcp_conn,udp_conn,country,ip_v4,ip_v6,server_group,price,expire_date,bandwidth,traffic_limit,agent_os,ping_ct,ping_cu,ping_cm,ping_bd,ping_gg,ping_cf,ping_ct_m,ping_cu_m,ping_cm_m,ping_bd_m,ping_gg_m,ping_cf_m,monthly_rx,monthly_tx,last_rx,last_tx,reset_month,is_hidden,virt,reset_day,sort_order FROM servers ORDER BY sort_order ASC, rowid ASC').all();
 
     const now = Date.now();
@@ -2525,6 +6677,53 @@ rm -f /tmp/cf_install.sh
       }
     }
 
+    // ==========================================
+    // UI-3 第二批：大盘数据构造（/api/dashboard 与首页内联初始数据共用同一份聚合结果）
+    // 纯抽取：字段与顺序与既有接口输出完全一致，不新增查询、不改动聚合逻辑
+    // ==========================================
+    const buildDashboardPayload = () => {
+      const apiNodes = [];
+      for (const grp of Object.keys(groups)) {
+        for (const s of groups[grp]) {
+          apiNodes.push(Object.assign({}, s, { group: grp, online: (now - s.last_updated) < offlineThresMs }));
+        }
+      }
+      return {
+        ok: true,
+        generated_at: now,
+        offline_threshold: parseInt(sys.offline_threshold || '30'),
+        site_title: sys.site_title || '',
+        stats: {
+          total_gossip: totalServersGossip,
+          visible: visibleServersCount,
+          online: globalOnline,
+          offline: globalOffline,
+          speed_in: globalSpeedIn,
+          speed_out: globalSpeedOut,
+          net_rx: globalNetRx,
+          net_tx: globalNetTx,
+          asset_total: totalAssetGossip,
+          asset_visible: visibleAsset,
+          rem_value_visible: visibleRemAsset
+        },
+        countries: countryStats,
+        groups: Object.keys(groups),
+        nodes: apiNodes
+      };
+    };
+
+    // ==========================================
+    // UI-3：大盘 JSON 数据接口（与首页 HTML 渲染并存，仅输出结构化数据）
+    // 复用上方同一份全表查询与聚合结果，不额外查询、不改动首页渲染与前端脚本
+    // ==========================================
+    if (isDashboardApi) {
+      if (sys.is_public !== 'true' && !(await isAdminAuthed(request, env))) {
+        return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
+      }
+      const payload = buildDashboardPayload();
+      return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Cache-Control': 'no-store' } });
+    }
+
     if (request.method === 'GET' && url.pathname === '/') {
       if (sys.is_public !== 'true' && !(await isAdminAuthed(request, env))) return authResponse(sys.site_title);
 
@@ -2547,71 +6746,16 @@ rm -f /tmp/cf_install.sh
         const lastUpdAbsText = lastUpdMs > 0 ? fmtBJ(lastUpdMs) : '-';
         const lastUpdText = lastUpdMs > 0 ? `${lastUpdSec}秒前 · ${lastUpdAbsText}` : '未知';
 
-        const detailHtml = `<!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-          <title>${server.name} - ${esc(sys.site_title)}</title>
-          <script>
-          /* 主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
-          (function(){
-            var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
-            var THEME_MODE_KEY = 'monitor_theme_mode';
-            function getThemeMode(){
-              try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; }
-            }
-            function isDarkTheme(){
-              var cls = document.body ? document.body.className : '';
-              for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
-              return false;
-            }
-            function applyThemeMode(notify){
-              if (!document.body) return;
-              var mode = getThemeMode();
-              document.body.classList.remove('forced-dark','forced-light');
-              if (mode === 'dark') document.body.classList.add('forced-dark');
-              else if (mode === 'light') document.body.classList.add('forced-light');
-              else {
-                var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-                if (sysDark && !isDarkTheme()) document.body.classList.add('forced-dark');
-              }
-              var btns = document.querySelectorAll('.theme-mode-btn');
-              var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
-              for (var j=0;j<btns.length;j++){ btns[j].textContent = label; btns[j].setAttribute('data-mode', mode); }
-              if (notify && window.__uiThemeChanged) window.__uiThemeChanged();
-            }
-            window.getThemeMode = getThemeMode;
-            window.applyThemeMode = applyThemeMode;
-            window.setThemeMode = function(m){
-              try { localStorage.setItem(THEME_MODE_KEY, m); } catch(e){}
-              applyThemeMode(true);
-            };
-            window.cycleThemeMode = function(){
-              var order = ['system','dark','light'];
-              window.setThemeMode(order[(order.indexOf(getThemeMode()) + 1) % 3]);
-            };
-            window.uiDark = function(){
-              var cls = document.body ? document.body.className : '';
-              if (cls.indexOf('forced-dark') !== -1) return true;
-              if (cls.indexOf('forced-light') !== -1) return false;
-              return isDarkTheme() || !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-            };
-            function initThemeMode(){
-              applyThemeMode(false);
-              try {
-                var mql = window.matchMedia('(prefers-color-scheme: dark)');
-                var onSchemeChange = function(){ if (getThemeMode() === 'system') applyThemeMode(true); };
-                if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
-                else if (mql.addListener) mql.addListener(onSchemeChange);
-              } catch(e){}
-            }
-            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initThemeMode);
-            else initThemeMode();
-          })();
+        return new Response(renderLayout({
+          title: `${server.name} - ${esc(sys.site_title)}`,
+          bodyClass: `${sys.theme || 'theme1'}`,
+          headExtra: `<script>
+          ${buildThemeBootJs(darkThemeIds)}
           </script>
-          ${sys.custom_head || ''}
-          <style>
+`,
+          customHead: `          ${sys.custom_head || ''}
+`,
+          headTail: `          <style>
             /* 层叠顺序：外部主题 / 自定义 CSS（themeOverrides） → 页面私有样式 → themeStyles 设计系统（最后注入，确保苹果风设计系统胜出） */
             ${themeOverrides}
             /* 页面私有样式：仅保留设计系统未覆盖的页面级布局 */
@@ -2633,10 +6777,8 @@ rm -f /tmp/cf_install.sh
               .hist-box-lg { height: 180px; }
               .hist-box-md { height: 160px; }
             }
-          </style>
-        </head>
-        <body class="${sys.theme || 'theme1'}">
-          <div class="container" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
+          </style>`,
+          content: `          <div class="container" style="max-width: 1200px; margin: 0 auto; padding: 20px;">
             <div style="margin-bottom: 20px;">
               <a href="/" style="color: var(--accent); text-decoration: none; font-weight: 600; font-size: 15px; display:inline-flex; align-items:center;">← 返回大盘</a>
             </div>
@@ -2739,8 +6881,8 @@ rm -f /tmp/cf_install.sh
             
             ${getFooterHtml(sys)}
           </div>
-
-          <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+`,
+          scripts: `          <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
           <script>
             const serverId = "${idParam}";
             let charts = {};
@@ -3257,11 +7399,10 @@ rm -f /tmp/cf_install.sh
                });
                chart.update();
             }
-          </script>
-          ${sys.custom_script || ''}
-        </body>
-        </html>`;
-        return new Response(detailHtml, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+          </script>`,
+          customScript: `          ${sys.custom_script || ''}
+`,
+        }), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
 
       if (!isAjax) {
@@ -3338,6 +7479,20 @@ rm -f /tmp/cf_install.sh
         ctx.waitUntil(runGossip());
       }
       
+
+      // ==========================================
+      // UI-3 第二批：首页内联初始大盘数据（与 GET /api/dashboard 同一份聚合结果，供客户端增量渲染复用）
+      // 纯新增：不改变数据来源、不影响既有服务端渲染与 4s 整页轮询
+      // ==========================================
+      const dashboardDataJson = JSON.stringify(buildDashboardPayload()).replace(/</g, '\\u003c');
+      const dashboardConfigJson = JSON.stringify({
+        show_price: sys.show_price === 'true',
+        show_expire: sys.show_expire === 'true',
+        show_bw: sys.show_bw === 'true',
+        show_tf: sys.show_tf === 'true',
+        auto_reset_traffic: sys.auto_reset_traffic === 'true',
+        asset_currency: sys.asset_currency || '元'
+      }).replace(/</g, '\\u003c');
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${visibleServersCount}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
@@ -3487,83 +7642,29 @@ const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getCol
         }
       }
 
-      const html = `<!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-        <title>${esc(sys.site_title)}</title>
-        <script>
-        /* 主题三态：跟随系统(system) / 夜间(dark) / 日间(light)，本地记忆(localStorage)，默认跟随系统 */
-        (function(){
-          var DARK_THEMES = ['theme2','theme4','theme5','theme6','theme8'];
-          var THEME_MODE_KEY = 'monitor_theme_mode';
-          function getThemeMode(){
-            try { var m = localStorage.getItem(THEME_MODE_KEY); return (m === 'dark' || m === 'light') ? m : 'system'; } catch(e){ return 'system'; }
-          }
-          function isDarkTheme(){
-            var cls = document.body ? document.body.className : '';
-            for (var i=0;i<DARK_THEMES.length;i++){ if(cls.indexOf(DARK_THEMES[i]) !== -1) return true; }
-            return false;
-          }
-          function applyThemeMode(notify){
-            if (!document.body) return;
-            var mode = getThemeMode();
-            document.body.classList.remove('forced-dark','forced-light');
-            if (mode === 'dark') document.body.classList.add('forced-dark');
-            else if (mode === 'light') document.body.classList.add('forced-light');
-            else {
-              var sysDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-              if (sysDark && !isDarkTheme()) document.body.classList.add('forced-dark');
-            }
-            var btns = document.querySelectorAll('.theme-mode-btn');
-            var label = mode === 'dark' ? '🌙 夜间模式' : (mode === 'light' ? '☀️ 日间模式' : '🌗 跟随系统');
-            for (var j=0;j<btns.length;j++){ btns[j].textContent = label; btns[j].setAttribute('data-mode', mode); }
-            if (notify && window.__uiThemeChanged) window.__uiThemeChanged();
-          }
-          window.getThemeMode = getThemeMode;
-          window.applyThemeMode = applyThemeMode;
-          window.setThemeMode = function(m){
-            try { localStorage.setItem(THEME_MODE_KEY, m); } catch(e){}
-            applyThemeMode(true);
-          };
-          window.cycleThemeMode = function(){
-            var order = ['system','dark','light'];
-            window.setThemeMode(order[(order.indexOf(getThemeMode()) + 1) % 3]);
-          };
-          window.uiDark = function(){
-            var cls = document.body ? document.body.className : '';
-            if (cls.indexOf('forced-dark') !== -1) return true;
-            if (cls.indexOf('forced-light') !== -1) return false;
-            return isDarkTheme() || !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-          };
-          function initThemeMode(){
-            applyThemeMode(false);
-            try {
-              var mql = window.matchMedia('(prefers-color-scheme: dark)');
-              var onSchemeChange = function(){ if (getThemeMode() === 'system') applyThemeMode(true); };
-              if (mql.addEventListener) mql.addEventListener('change', onSchemeChange);
-              else if (mql.addListener) mql.addListener(onSchemeChange);
-            } catch(e){}
-          }
-          if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initThemeMode);
-          else initThemeMode();
-        })();
+      return new Response(renderLayout({
+        title: `${esc(sys.site_title)}`,
+        bodyClass: `${sys.theme || 'theme1'}`,
+        headExtra: `        <script>
+        ${buildThemeBootJs(darkThemeIds)}
         </script>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
         <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
-        ${sys.custom_head || ''}
-        <style>
+        <script id="dashboard-data" type="application/json">${dashboardDataJson}</script>
+        <script id="dashboard-config" type="application/json">${dashboardConfigJson}</script>
+
+`,
+        customHead: `        ${sys.custom_head || ''}
+`,
+        headTail: `        <style>
           /* 层叠顺序：外部主题 / 自定义 CSS（themeOverrides） → 页面私有样式 → themeStyles 设计系统（最后注入，确保苹果风设计系统胜出） */
           ${themeOverrides}
           /* 页面私有样式：仅保留设计系统未覆盖的页面级布局 */
           body { padding: 20px; }
 
           ${themeStyles}
-        </style>
-      </head>
-      <body class="${sys.theme || 'theme1'}">
-        <div class="container" id="app-container">
+        </style>`,
+        content: `        <div class="container" id="app-container">
           
           <div class="header" style="flex-wrap: wrap; gap: 15px;">
             <h1 style="margin:0;">${esc(sys.site_title)}</h1>
@@ -3667,8 +7768,8 @@ const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getCol
           
           ${getFooterHtml(sys)}
         </div>
-
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+`,
+        scripts: `        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
         
         <script>
           // 统一北京时间(UTC+8)格式化，返回 "YYYY-MM-DD HH:mm:ss"
@@ -3710,6 +7811,272 @@ const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getCol
                   else { el.innerText = formatBytesJs(newVal) + '/s'; }
               });
           }
+
+          // ==========================================
+          // UI-3 第二批：客户端增量渲染函数组（纯新增）
+          // 渲染口径与服务端 cardContentHtml / tableBodyHtml / filterTagsHtml / 全局统计区完全一致，
+          // 数据来源为首页内联的 #dashboard-data（与 GET /api/dashboard 同构）+ #dashboard-config。
+          // 仅提供「数据 → HTML 字符串」的纯函数，供后续局部更新复用；
+          // 不替换现有服务端渲染，不改变数据源，也不干预 4s 整页轮询。
+          // 说明：name/os/arch/virt/uptime/cpu_info/price 等字段服务端已做 esc 处理，
+          //       此处沿用服务端插值方式（仅分组名额外转义），避免二次转义导致显示异常。
+          // ==========================================
+          const dashInlineJson = (id) => {
+            const el = document.getElementById(id);
+            if (!el) return null;
+            try { return JSON.parse(el.textContent || '{}'); } catch (e) { return null; }
+          };
+          const dashGetData = () => dashInlineJson('dashboard-data');
+          const dashGetConfig = () => dashInlineJson('dashboard-config') || {};
+          const dashEsc = (s) => String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+          const dashGetColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
+          const dashIsPingFail = (v) => { const s = String(v === undefined || v === null ? '' : v).trim().toLowerCase(); if (!s || s === 'fail' || s === '0' || s === 'null' || s === 'undefined') return true; const p = parseInt(s); return isNaN(p) || p <= 0; };
+          const dashPingTag = (v) => { if (dashIsPingFail(v)) return '超时'; return v + 'ms'; };
+          const dashCountry = (country) => {
+            const cCode = String(country || 'xx').toLowerCase();
+            const flagCode = cCode === 'tw' ? 'cn' : cCode;
+            return { cCode: cCode, flagCode: flagCode, flagHtml: flagCode !== 'xx' ? \`<img src="https://flagcdn.com/24x18/\${flagCode}.png" alt="\${flagCode}" style="vertical-align: sub; margin-right: 5px; border-radius: 2px;">\` : '🏳️' };
+          };
+          const dashFormatBytes = (v) => (typeof formatBytesJs === 'function' ? formatBytesJs(v) : String(v));
+          const dashFmtBJ = (ts) => (parseInt(ts) > 0 && typeof fmtBJ === 'function' ? fmtBJ(ts) : '-');
+          const dashIsOnline = (node, nowMs, offlineThresMs) => (node && node.online !== undefined ? !!node.online : ((nowMs - parseInt((node && node.last_updated) || 0)) < offlineThresMs));
+          const dashGroupOf = (node) => (node && node.group) || '默认分组';
+
+          // 单节点卡片：结构、类名、字段顺序与服务端 cardContentHtml 单卡模板一致
+          const dashRenderCard = (server, nowMs, offlineThresMs) => {
+            const cfg = dashGetConfig();
+            const isOnline = dashIsOnline(server, nowMs, offlineThresMs);
+            const statusColor = isOnline ? '#10b981' : '#ef4444';
+            const cpu = parseFloat(server.cpu || '0').toFixed(1);
+            const ram = parseFloat(server.ram || '0').toFixed(1);
+            const disk = parseFloat(server.disk || '0').toFixed(1);
+            const netInSpeedRaw = parseFloat(server.net_in_speed) || 0;
+            const netOutSpeedRaw = parseFloat(server.net_out_speed) || 0;
+            const cf = dashCountry(server.country);
+            const cCode = cf.cCode;
+            const flagHtml = cf.flagHtml;
+
+            let metaHtml = '';
+            if (cfg.show_price) {
+              let priceHtml = \`价格: \${server.price || '免费'}\`;
+              if (server._amount > 0) priceHtml += \` <span style="color:#8b5cf6;font-weight:600;margin-left:8px;">剩余价值: \${Number(server._remValue).toFixed(2)}\${cfg.asset_currency || '元'}</span>\`;
+              metaHtml += \`<div class="card-meta" style="margin-top:8px;">\${priceHtml}</div>\`;
+            }
+            if (cfg.show_expire) {
+              let expireText = '永久';
+              if (server.expire_date) {
+                const expTime = new Date(server.expire_date).getTime();
+                if (!isNaN(expTime)) {
+                  const diff = expTime - nowMs;
+                  expireText = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) + ' 天' : '已过期';
+                }
+              }
+              metaHtml += \`<div class="card-meta" style="\${cfg.show_price ? '' : 'margin-top:8px;'}">剩余天数: \${expireText}</div>\`;
+            }
+
+            const rx_val_str = dashFormatBytes(cfg.auto_reset_traffic ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0));
+            const tx_val_str = dashFormatBytes(cfg.auto_reset_traffic ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
+            metaHtml += \`<div class="card-meta" style="\${cfg.show_price || cfg.show_expire ? '' : 'margin-top:8px;'}">流量: <span style="color:#10b981">↓</span> \${rx_val_str} | <span style="color:#3b82f6">↑</span> \${tx_val_str}</div>\`;
+
+            let upTimeFormat = (server.uptime || '-').replace('days', '天').replace('day', '天');
+            const lastUpdAbs = dashFmtBJ(server.last_updated);
+            metaHtml += \`<div class="card-meta" style="margin-top:2px;">在线: \${upTimeFormat}</div>\`;
+            metaHtml += \`<div class="card-meta" style="margin-top:1px; font-size:11px; color: var(--text3); line-height:1.5;">最后更新: \${lastUpdAbs}</div>\`;
+
+            let badgesHtml = '';
+            if (cfg.show_bw && server.bandwidth) badgesHtml += \`<span class="badge badge-bw">\${server.bandwidth}</span>\`;
+            if (cfg.show_tf && server.traffic_limit) badgesHtml += \`<span class="badge badge-tf">\${server.traffic_limit}</span>\`;
+            if (server.ip_v4 === '1') badgesHtml += \`<span class="badge badge-v4">IPv4</span>\`;
+            if (server.ip_v6 === '1') badgesHtml += \`<span class="badge badge-v6">IPv6</span>\`;
+
+            const pingHtml = \`<div class="ping-box"><span>电信 <span style="color:\${dashGetColor(server.ping_ct)}; font-weight:bold;">\${dashPingTag(server.ping_ct)}</span></span><span>联通 <span style="color:\${dashGetColor(server.ping_cu)}; font-weight:bold;">\${dashPingTag(server.ping_cu)}</span></span><span>移动 <span style="color:\${dashGetColor(server.ping_cm)}; font-weight:bold;">\${dashPingTag(server.ping_cm)}</span></span><span>字节 <span style="color:\${dashGetColor(server.ping_bd)}; font-weight:bold;">\${dashPingTag(server.ping_bd)}</span></span><span>Google <span style="color:\${dashGetColor(server.ping_gg)}; font-weight:bold;">\${dashPingTag(server.ping_gg)}</span></span><span>Cloudflare <span style="color:\${dashGetColor(server.ping_cf)}; font-weight:bold;">\${dashPingTag(server.ping_cf)}</span></span></div>\`;
+
+            const ramUsedStr = dashFormatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
+            const ramTotalStr = dashFormatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
+            const diskUsedStr = dashFormatBytes((parseFloat(server.disk_used || 0) * 1048576).toString());
+            const diskTotalStr = dashFormatBytes((parseFloat(server.disk_total || 0) * 1048576).toString());
+
+            return \`
+              <a href="/?id=\${server.id}" class="vps-card" data-id="\${server.id}" data-country="\${cCode}">
+                <div class="card-left">
+                  <div class="card-title">
+                    <div class="status-dot" style="background:\${statusColor};"></div>
+                    \${flagHtml} <span style="font-size:15px;" class="card-title-text">\${server.name}</span>
+                    \${isOnline ? '' : '<span style="color:#ef4444; font-weight:bold; font-size:11px; margin-left:6px; border:1px solid rgba(239,68,68,0.45); border-radius:4px; padding:1px 5px; line-height:1.4; flex-shrink:0;">离线</span>'}
+                  </div>
+                  \${metaHtml}
+                  <div class="card-badges">\${badgesHtml}</div>
+                  \${pingHtml}
+                </div>
+                
+                <div class="card-right">
+                  <div class="stat-group">
+                    <div class="stat-header"><span>CPU</span><span style="color: \${cpu > 80 ? '#ef4444' : 'inherit'};">\${cpu}%</span></div>
+                    <div class="stat-bar-full"><div style="width:\${cpu}%; background: \${cpu > 80 ? '#ef4444' : '#3b82f6'};"></div></div>
+                    <div class="stat-subtext" title="\${server.cpu_info || '-'}">\${server.cpu_info || '-'}</div>
+                  </div>
+                  
+                  <div class="stat-group">
+                    <div class="stat-header"><span>内存</span><span style="color: \${ram > 80 ? '#ef4444' : 'inherit'};">\${ram}%</span></div>
+                    <div class="stat-bar-full"><div style="width:\${ram}%; background: \${ram > 80 ? '#ef4444' : '#10b981'};"></div></div>
+                    <div class="stat-subtext">\${ramUsedStr} / \${ramTotalStr}</div>
+                  </div>
+
+                  <div class="stat-group">
+                    <div class="stat-header"><span>存储</span><span style="color: \${disk > 80 ? '#ef4444' : 'inherit'};">\${disk}%</span></div>
+                    <div class="stat-bar-full"><div style="width:\${disk}%; background: \${disk > 80 ? '#ef4444' : '#10b981'};"></div></div>
+                    <div class="stat-subtext">\${diskUsedStr} / \${diskTotalStr}</div>
+                  </div>
+                  
+                  <div style="font-size: 11px; color: var(--text2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="\${server.os || '-'} | \${server.arch || '-'} | \${server.virt || '-'}">\${server.os || '-'} | \${server.arch || '-'} | \${server.virt || '-'}</div>
+
+                  <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--text2); margin-top: 4px; white-space: nowrap; gap: 8px;">
+                    <div style="flex-shrink: 0;">TCP/UDP: \${server.tcp_conn || '0'} / \${server.udp_conn || '0'}</div>
+                    <div style="overflow: hidden; text-overflow: ellipsis; text-align: right;"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="c-in-\${server.id}" data-val="\${netInSpeedRaw}">0 B/s</span> <span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="c-out-\${server.id}" data-val="\${netOutSpeedRaw}">0 B/s</span></div>
+                  </div>
+                </div>
+              </a>
+            \`;
+          };
+
+          // 单节点表格行：结构与服务端 tableBodyHtml 单行模板一致
+          const dashRenderTableRow = (server, nowMs, offlineThresMs) => {
+            const cfg = dashGetConfig();
+            const isOnline = dashIsOnline(server, nowMs, offlineThresMs);
+            const statusColor = isOnline ? '#10b981' : '#ef4444';
+            const cpu = parseFloat(server.cpu || '0').toFixed(1);
+            const ram = parseFloat(server.ram || '0').toFixed(1);
+            const disk = parseFloat(server.disk || '0').toFixed(1);
+            const netInSpeedRaw = parseFloat(server.net_in_speed) || 0;
+            const netOutSpeedRaw = parseFloat(server.net_out_speed) || 0;
+            const cf = dashCountry(server.country);
+            const cCode = cf.cCode;
+            const flagHtml = cf.flagHtml;
+            const rx_val_str = dashFormatBytes(cfg.auto_reset_traffic ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0));
+            const tx_val_str = dashFormatBytes(cfg.auto_reset_traffic ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
+
+            return \`
+              <tr onclick="window.location.href='/?id=\${server.id}'" style="cursor:pointer;" data-country="\${cCode}">
+                <td style="text-align:center;"><div class="status-dot" style="background:\${statusColor}; display:inline-block; margin:0;"></div></td>
+                <td><b>\${server.name}</b></td>
+                <td>\${flagHtml}</td>
+                <td><span class="os-text">\${server.os || '-'} / \${server.arch || '-'} / \${server.virt || '-'}</span></td>
+                <td style="min-width:100px;">
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:\${cpu}%; background:#3b82f6;"></div></div>
+                    <span>\${cpu}%</span>
+                  </div>
+                </td>
+                <td style="min-width:100px;">
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:\${ram}%; background:#10b981;"></div></div>
+                    <span>\${ram}%</span>
+                  </div>
+                </td>
+                <td style="min-width:100px;">
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:\${disk}%; background:#10b981;"></div></div>
+                    <span>\${disk}%</span>
+                  </div>
+                </td>
+                <td style="color: var(--text2); font-size:12px; white-space: nowrap;">\${rx_val_str} | \${tx_val_str}</td>
+                <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-in-\${server.id}" data-val="\${netInSpeedRaw}">0 B/s</span></td>
+                <td style="white-space: nowrap;"><span class="speed-anim" data-id="t-out-\${server.id}" data-val="\${netOutSpeedRaw}">0 B/s</span></td>
+                <td style="color: var(--text2); font-size:12px; white-space: nowrap;">\${dashFmtBJ(server.last_updated)}</td>
+              </tr>
+            \`;
+          };
+
+          // 卡片区（含分组头，无数据时空态文案与服务端一致）
+          const dashRenderCards = (nodes, nowMs, offlineThresMs) => {
+            const list = Array.isArray(nodes) ? nodes : [];
+            if (list.length === 0) return '<p style="text-align:center; width: 100%; color: var(--text2);">暂无公开服务器</p>';
+            const grouped = new Map();
+            list.forEach((n) => {
+              const g = dashGroupOf(n);
+              if (!grouped.has(g)) grouped.set(g, []);
+              grouped.get(g).push(n);
+            });
+            let html = '';
+            for (const [grpName, grpServers] of grouped.entries()) {
+              html += \`<div class="group-header">\${dashEsc(grpName)}</div><div class="grid-container">\`;
+              for (const server of grpServers) html += dashRenderCard(server, nowMs, offlineThresMs);
+              html += \`</div>\`;
+            }
+            return html;
+          };
+
+          // 表格区（无数据时空态行与服务端一致）
+          const dashRenderTableBody = (nodes, nowMs, offlineThresMs) => {
+            const list = Array.isArray(nodes) ? nodes : [];
+            if (list.length === 0) return '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>';
+            let html = '';
+            for (const server of list) html += dashRenderTableRow(server, nowMs, offlineThresMs);
+            return html;
+          };
+
+          // 全局统计区：结构、类名、speed-anim 的 data-id 与服务端一致
+          const dashRenderStats = (stats) => {
+            const cfg = dashGetConfig();
+            const s = stats || {};
+            const num = (v) => parseFloat(v) || 0;
+            const cur = cfg.asset_currency || '元';
+            return \`<div class="stats-row top-row">
+              <div class="g-item">
+                <div class="g-label">本机服务器总数</div>
+                <div class="g-val">\${num(s.visible)}</div>
+                <div class="g-sub">在线 <span style="color:#10b981">\${num(s.online)}</span> | 离线 <span style="color:#ef4444">\${num(s.offline)}</span></div>
+              </div>
+              
+
+              <div class="g-item">
+                <div class="g-label">本机可见数字资产 (\${cur})</div>
+                <div class="g-val">\${num(s.asset_visible).toFixed(2)} <span style="font-size:16px;color: var(--text2);">总</span> | \${num(s.rem_value_visible).toFixed(2)} <span style="font-size:16px;color: var(--text2);">余</span></div>
+              </div>
+            </div>
+            
+            <div class="stats-row bottom-row">
+              <div class="g-item">
+                <div class="g-label">实时网速 (入 | 出)</div>
+                <div class="g-val"><span style="color:#10b981">↓</span> <span class="speed-anim" data-id="g-in" data-val="\${num(s.speed_in)}">0 B/s</span> | <span style="color:#3b82f6">↑</span> <span class="speed-anim" data-id="g-out" data-val="\${num(s.speed_out)}">0 B/s</span></div>
+              </div>
+
+              <div class="g-item">
+                <div class="g-label">本机流量 (入 | 出) \${cfg.auto_reset_traffic ? '<span style="font-size:10px; color:#c2410c;">(按期)</span>' : ''}</div>
+                <div class="g-val">\${dashFormatBytes(num(s.net_rx))} | \${dashFormatBytes(num(s.net_tx))}</div>
+              </div>
+            </div>\`;
+          };
+
+          // 地区筛选标签：结构与服务端 filterTagsHtml 一致
+          const dashRenderFilters = (countries, totalVisible) => {
+            const data = countries || {};
+            const total = (totalVisible === undefined || totalVisible === null)
+              ? Object.values(data).reduce((acc, v) => acc + (parseInt(v) || 0), 0)
+              : totalVisible;
+            let html = \`<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 \${total}</span>\`;
+            for (const [code, count] of Object.entries(data)) {
+              const lowerCode = String(code).toLowerCase();
+              const flagCode = lowerCode === 'tw' ? 'cn' : lowerCode;
+              html += \`<span class="filter-tag" data-code="\${lowerCode}" onclick="setFilter('\${lowerCode}')"><img src="https://flagcdn.com/16x12/\${flagCode}.png" alt="\${code}"> \${code} \${count}</span>\`;
+            }
+            return html;
+          };
+
+          // 统一入口：一份大盘数据 → 四块 HTML（供后续局部更新按需取用）
+          const dashRenderDashboard = (payload) => {
+            const p = payload || {};
+            const nodes = Array.isArray(p.nodes) ? p.nodes : [];
+            const nowMs = parseInt(p.generated_at) > 0 ? parseInt(p.generated_at) : Date.now();
+            const offlineThresMs = (parseInt(p.offline_threshold) > 0 ? parseInt(p.offline_threshold) : 30) * 1000;
+            const stats = p.stats || {};
+            return {
+              filtersHtml: dashRenderFilters(p.countries || {}, stats.visible),
+              statsHtml: dashRenderStats(stats),
+              cardsHtml: dashRenderCards(nodes, nowMs, offlineThresMs),
+              tableHtml: dashRenderTableBody(nodes, nowMs, offlineThresMs)
+            };
+          };
 
           let mapInitialized = false;
           window.currentFilter = 'all';
@@ -3911,7 +8278,36 @@ const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getCol
              switchView(savedView); applyFilter(); applySpeedAnimations();
           });
 
-          setInterval(async () => {
+          // ==========================================
+          // UI-3 第三批：首页常态刷新切换为 JSON 增量更新
+          // 数据源：GET /api/dashboard（与首屏内联 #dashboard-data 同构）
+          // 渲染：复用 dashRenderDashboard() 产出四块 HTML，仅局部替换
+          // 降级：JSON 连续失败达阈值后自动回退到原整页 HTML 轮询（原实现完整保留，不删除）
+          // ==========================================
+          let dashJsonFailStreak = 0;
+          let dashDegraded = false;
+          let dashDegradedUntil = 0;
+          const DASH_JSON_FAIL_LIMIT = 3;
+          const DASH_DEGRADED_PROBE_MS = 60000;
+
+          const refreshByJson = async () => {
+            const res = await fetch('/api/dashboard', { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
+            if (!res.ok) throw new Error('dashboard api status ' + res.status);
+            const data = await res.json();
+            if (!data || data.ok !== true) throw new Error('dashboard api payload invalid');
+            const blocks = dashRenderDashboard(data);
+            const setBlockHtml = (id, val) => { const el = document.getElementById(id); if (el) el.innerHTML = val; };
+            setBlockHtml('ajax-stats', blocks.statsHtml);
+            setBlockHtml('ajax-filters', blocks.filtersHtml);
+            setBlockHtml('ajax-cards', blocks.cardsHtml);
+            setBlockHtml('ajax-table', blocks.tableHtml);
+            const mapDataEl = document.getElementById('map-data');
+            if (mapDataEl) mapDataEl.textContent = JSON.stringify(data.countries || {});
+            drawMarkers(); applyFilter(); applySpeedAnimations();
+          };
+
+          // 降级兜底：原 4s 整页 HTML 重取 + DOMParser 局部替换（逻辑保持不变）
+          const refreshByFullPage = async () => {
             try {
               const currentUrl = new URL(location.href);
               currentUrl.searchParams.set('ajax', '1');
@@ -3929,13 +8325,32 @@ const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getCol
 
               drawMarkers(); applyFilter(); applySpeedAnimations();
             } catch (e) {}
-          }, 4000);
-        </script>
-        ${sys.custom_script || ''}
-      </body>
-      </html>`;
+          };
 
-      return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+          const dashScheduledRefresh = async () => {
+            const canTryJson = !dashDegraded || Date.now() >= dashDegradedUntil;
+            if (canTryJson) {
+              try {
+                await refreshByJson();
+                dashJsonFailStreak = 0;
+                dashDegraded = false;
+                return;
+              } catch (e) {
+                dashJsonFailStreak++;
+                if (dashJsonFailStreak >= DASH_JSON_FAIL_LIMIT) {
+                  dashDegraded = true;
+                  dashDegradedUntil = Date.now() + DASH_DEGRADED_PROBE_MS;
+                }
+              }
+            }
+            await refreshByFullPage();
+          };
+
+          setInterval(dashScheduledRefresh, 4000);
+        </script>`,
+        customScript: `        ${sys.custom_script || ''}
+`,
+      }), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
     return new Response('Not Found', { status: 404 });

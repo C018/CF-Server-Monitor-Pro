@@ -1441,146 +1441,11 @@ function notifyAdminQueueRow(row) {
 }
 function notifyAdminTemplateRow(row) {
   const r = row || {};
-  const parts = notifyTemplateParseContent(r.content);
   return {
     id: notifyAdminStr(r.id), name: notifyAdminStr(r.name), type: notifyAdminStr(r.type), channel_type: notifyAdminStr(r.channel_type),
     content: notifyAdminStr(r.content), enabled: notifyTruthy(r.enabled) ? 1 : 0,
-    title: parts.title, body: parts.body, plain_content: parts.json ? 0 : 1,
     created_at: notifyToNum(r.created_at) || 0, updated_at: notifyToNum(r.updated_at) || 0
   };
-}
-// ---------- 模板中心：事件类型 / 占位符变量表 / 内置默认模板 / 渲染（通知重构第4步B-2b） ----------
-// 事件类型取值与规则引擎真实 rule.type 一致（见 NOTIFY_RULE_TYPE_META）
-const NOTIFY_TEMPLATE_TYPES = ['offline', 'recover', 'metric', 'traffic_ratio', 'expire_days'];
-// 占位符变量表：键名与 notifyBuildEvent 的真实事件字段严格一致
-// （rule_id / rule_name / rule_type / severity / kind / server_id / server_name / group / title / text / at / dedupe_key），
-// 另含三个只读派生字段 severity_label / kind_label / at_text
-const NOTIFY_TEMPLATE_VARS = [
-  { key: 'severity_label', label: '严重级别名称', sample: '警告', derived: true },
-  { key: 'severity', label: '严重级别（info / warning / critical）', sample: 'warning' },
-  { key: 'kind_label', label: '事件动作名称', sample: '触发告警', derived: true },
-  { key: 'kind', label: '事件动作（fire / recover / clear / pending）', sample: 'fire' },
-  { key: 'title', label: '事件标题（引擎生成的原始标题）', sample: '节点离线告警' },
-  { key: 'text', label: '事件正文（引擎生成的纯文本正文）', sample: '节点名称: 香港-01\n状态: 离线 (超过判定阈值未上报)' },
-  { key: 'rule_name', label: '规则名称', sample: '节点离线告警' },
-  { key: 'rule_type', label: '规则类型', sample: 'offline' },
-  { key: 'rule_id', label: '规则 ID', sample: 'rule_offline_default' },
-  { key: 'server_name', label: '节点名称', sample: '香港-01' },
-  { key: 'server_id', label: '节点 ID', sample: 'srv_demo_01' },
-  { key: 'group', label: '节点分组', sample: '默认分组' },
-  { key: 'at_text', label: '事件时间（东八区文本）', sample: '2026-09-17 10:30:00', derived: true },
-  { key: 'at', label: '事件时间戳（毫秒）', sample: '1758076200000' },
-  { key: 'dedupe_key', label: '去重键', sample: 'rule_offline_default::srv_demo_01::fire' }
-];
-const NOTIFY_TEMPLATE_KIND_LABELS = { fire: '触发告警', recover: '恢复通知', clear: '指标回落', pending: '超阈值待确认' };
-// 内置默认模板：id 固定为 tpl_builtin_<事件类型>。用户在模板中心保存会写入同 id 的覆盖行，
-// “恢复默认”即删除该覆盖行（见 notify_reset_template）
-const NOTIFY_TEMPLATE_BUILTINS = [
-  { id: 'tpl_builtin_offline', name: '节点离线（内置默认）', type: 'offline',
-    title: '【{severity_label}】{server_name} 节点离线',
-    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n动作：{kind_label}\n时间：{at_text}\n\n{text}' },
-  { id: 'tpl_builtin_recover', name: '节点恢复（内置默认）', type: 'recover',
-    title: '✅ {server_name} 已恢复',
-    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
-  { id: 'tpl_builtin_metric', name: '指标阈值（内置默认）', type: 'metric',
-    title: '【{severity_label}】{server_name} 指标告警',
-    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
-  { id: 'tpl_builtin_traffic_ratio', name: '流量占比（内置默认）', type: 'traffic_ratio',
-    title: '【{severity_label}】{server_name} 流量占比提醒',
-    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' },
-  { id: 'tpl_builtin_expire_days', name: '到期提醒（内置默认）', type: 'expire_days',
-    title: '【{severity_label}】{server_name} 到期提醒',
-    body: '规则：{rule_name}（{rule_type}）\n节点：{server_name}（{server_id}）\n分组：{group}\n时间：{at_text}\n\n{text}' }
-];
-function notifyTemplateBuiltinById(id) {
-  const key = notifyAdminStr(id);
-  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) { if (NOTIFY_TEMPLATE_BUILTINS[i].id === key) return NOTIFY_TEMPLATE_BUILTINS[i]; }
-  return null;
-}
-function notifyTemplateBuiltinByType(type) {
-  const key = notifyAdminStr(type);
-  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) { if (NOTIFY_TEMPLATE_BUILTINS[i].type === key) return NOTIFY_TEMPLATE_BUILTINS[i]; }
-  return null;
-}
-// content 统一存储为 {"title":"...","body":"..."}；兼容历史纯文本（整体视为正文）
-function notifyTemplateSerializeContent(parts) {
-  const p = parts || {};
-  return JSON.stringify({ title: notifyAdminStr(p.title), body: notifyAdminStr(p.body) });
-}
-function notifyTemplateBuiltinContent(bi) {
-  const b = bi || {};
-  return notifyTemplateSerializeContent({ title: b.title, body: b.body });
-}
-function notifyTemplateParseContent(content) {
-  const raw = notifyAdminStr(content);
-  if (!raw) return { title: '', body: '', json: false };
-  if (raw.charAt(0) === '{') {
-    const o = notifyAdminJson(raw, null);
-    if (o && typeof o === 'object') return { title: notifyAdminStr(o.title), body: notifyAdminStr(o.body), json: true };
-  }
-  return { title: '', body: raw, json: false };
-}
-function notifyTemplateBuiltinRow(bi) {
-  const b = bi || {};
-  const content = notifyTemplateBuiltinContent(b);
-  return {
-    id: notifyAdminStr(b.id), name: notifyAdminStr(b.name), type: notifyAdminStr(b.type), channel_type: '',
-    content: content, enabled: 1, title: notifyAdminStr(b.title), body: notifyAdminStr(b.body), plain_content: 0,
-    builtin: 1, customized: 0, created_at: 0, updated_at: 0
-  };
-}
-function notifyTemplateBuiltinRows() {
-  const out = [];
-  for (let i = 0; i < NOTIFY_TEMPLATE_BUILTINS.length; i++) out.push(notifyTemplateBuiltinRow(NOTIFY_TEMPLATE_BUILTINS[i]));
-  return out;
-}
-// 变量取值表：在真实事件字段之上补三个只读派生字段
-function notifyTemplateVarMap(ev) {
-  const e = ev || {};
-  const sev = notifyAdminStr(e.severity);
-  let sevLabel = sev;
-  for (let i = 0; i < NOTIFY_SEVERITY_META.length; i++) {
-    const m = NOTIFY_SEVERITY_META[i];
-    if (notifyAdminStr(m.value) === sev) sevLabel = notifyAdminStr(m.label) || sev;
-  }
-  const kind = notifyAdminStr(e.kind);
-  const atMs = notifyToNum(e.at);
-  return Object.assign({}, e, {
-    severity_label: sevLabel,
-    kind_label: NOTIFY_TEMPLATE_KIND_LABELS[kind] || kind,
-    at_text: (atMs !== null && atMs > 0) ? notifyEventTime(atMs) : ''
-  });
-}
-function notifyTemplateSampleData() {
-  const m = {};
-  for (let i = 0; i < NOTIFY_TEMPLATE_VARS.length; i++) {
-    const v = NOTIFY_TEMPLATE_VARS[i];
-    m[v.key] = (v.sample === null || v.sample === undefined) ? '' : String(v.sample);
-  }
-  return notifyTemplateVarMap(m);
-}
-// 占位符渲染：{key} → 取值；未提供取值的占位符渲染为空串并记入 missing
-function notifyRenderTemplateText(text, data) {
-  const src = notifyAdminStr(text);
-  const d = data || {};
-  const used = [];
-  const missing = [];
-  const out = src.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, function (all, key) {
-    const v = d[key];
-    if (v === undefined || v === null) {
-      if (missing.indexOf(key) < 0) missing.push(key);
-      return '';
-    }
-    if (used.indexOf(key) < 0) used.push(key);
-    return String(v);
-  });
-  return { text: out, used: used, missing: missing };
-}
-function notifyMergeKeys(a, b) {
-  const out = (a || []).slice();
-  const src = b || [];
-  for (let i = 0; i < src.length; i++) { if (out.indexOf(src[i]) < 0) out.push(src[i]); }
-  return out;
 }
 function notifyAdminBindingRow(row, nameMaps) {
   const r = row || {};
@@ -1665,9 +1530,6 @@ async function handleNotifyAdminApi(data, env) {
         providers: notifyListProviders(),
         log_statuses: NOTIFY_LOG_STATUSES,
         queue_statuses: NOTIFY_QUEUE_STATUSES,
-        template_types: NOTIFY_TEMPLATE_TYPES,
-        template_vars: NOTIFY_TEMPLATE_VARS,
-        template_builtins: notifyTemplateBuiltinRows(),
         default_offline_rule_id: NOTIFY_DEFAULT_OFFLINE_RULE_ID,
         setting_keys: { offline_rule_threshold: 'alert_threshold' }
       };
@@ -1943,8 +1805,7 @@ async function handleNotifyAdminApi(data, env) {
       const sql = 'SELECT id, name, type, channel_type, content, enabled, created_at, updated_at FROM notify_templates' + where + ' ORDER BY updated_at DESC, created_at DESC';
       const res = await (binds.length ? env.DB.prepare(sql).bind.apply(env.DB.prepare(sql), binds) : env.DB.prepare(sql)).all();
       const templates = ((res && res.results) || []).map(notifyAdminTemplateRow);
-      return { success: true, total: templates.length, templates: templates,
-        builtins: notifyTemplateBuiltinRows(), vars: NOTIFY_TEMPLATE_VARS, types: NOTIFY_TEMPLATE_TYPES };
+      return { success: true, total: templates.length, templates: templates };
     }
     if (act === 'notify_get_template') {
       const id = notifyAdminStr(d.id || (d.template && d.template.id));
@@ -1976,50 +1837,6 @@ async function handleNotifyAdminApi(data, env) {
       return { success: true, id: id, deleted: (notifyToNum(res && res.meta && res.meta.changes) || 0) > 0 };
     }
 
-    // ---------- 模板渲染预览（模板中心：实时预览，数据为模拟或自定义） ----------
-    if (act === 'notify_test_render') {
-      const id = notifyAdminStr(d.id || (d.template && d.template.id));
-      let content = notifyAdminStr(d.content);
-      if (!content && id) {
-        const row = await env.DB.prepare('SELECT content FROM notify_templates WHERE id = ?').bind(id).first();
-        if (row) content = notifyAdminStr(row.content);
-        else {
-          const bi = notifyTemplateBuiltinById(id);
-          if (!bi) return fail('template_not_found');
-          content = notifyTemplateBuiltinContent(bi);
-        }
-      }
-      if (!content) return fail('missing_content');
-      const parts = notifyTemplateParseContent(content);
-      const data = notifyTemplateVarMap(Object.assign({}, notifyTemplateSampleData(), notifyAdminJson(d.data, {}) || {}));
-      const tRes = notifyRenderTemplateText(parts.title, data);
-      const bRes = notifyRenderTemplateText(parts.body, data);
-      return {
-        success: true, id: id, title: tRes.text, body: bRes.text,
-        vars_used: notifyMergeKeys(tRes.used, bRes.used),
-        vars_missing: notifyMergeKeys(tRes.missing, bRes.missing),
-        data: data, plain_content: parts.json ? 0 : 1
-      };
-    }
-    // ---------- 恢复默认（内置模板：删除覆盖行；自定义模板：按事件类型写回内置默认内容） ----------
-    if (act === 'notify_reset_template') {
-      const id = notifyAdminStr(d.id || (d.template && d.template.id));
-      if (!id) return fail('missing_id');
-      const row = await env.DB.prepare('SELECT id, name, type, channel_type, created_at FROM notify_templates WHERE id = ?').bind(id).first();
-      const bi = notifyTemplateBuiltinById(id);
-      if (bi) {
-        const del = await env.DB.prepare('DELETE FROM notify_templates WHERE id = ?').bind(id).run();
-        return { success: true, id: id, reset: true, removed_override: (notifyToNum(del && del.meta && del.meta.changes) || 0) > 0, template: notifyTemplateBuiltinRow(bi) };
-      }
-      if (!row) return fail('template_not_found');
-      const src = notifyTemplateBuiltinByType(row.type);
-      if (!src) return fail('no_default_template:' + notifyAdminStr(row.type));
-      const now = Date.now();
-      await env.DB.prepare('UPDATE notify_templates SET content = ?, updated_at = ? WHERE id = ?')
-        .bind(notifyTemplateBuiltinContent(src), now, id).run();
-      const upd = await env.DB.prepare('SELECT id, name, type, channel_type, content, enabled, created_at, updated_at FROM notify_templates WHERE id = ?').bind(id).first();
-      return { success: true, id: id, reset: true, removed_override: false, template: notifyAdminTemplateRow(upd) };
-    }
     return fail('unknown_action:' + act);
   } catch (e) {
     return fail((e && e.message) || e);
@@ -3379,25 +3196,6 @@ ${customScript}</body>
           .ntf-bind-main { flex:1; }
           .ntf-bind-meta { font-size:12px; color: var(--text2); margin-top:3px; word-break:break-all; }
           .ntf-scope-add button { white-space: nowrap; }
-          .ntf-tpl-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 14px; align-items: start; }
-          @media (max-width: 980px) { .ntf-tpl-layout { grid-template-columns: 1fr; } }
-          .ntf-tpl-list { border: 1px solid var(--separator); border-radius: var(--radius-xs); background: var(--card2); max-height: 64vh; overflow-y: auto; }
-          .ntf-tpl-item { display: block; width: 100%; text-align: left; border: none; border-bottom: 1px solid var(--separator); background: transparent; color: var(--text); padding: 9px 12px; cursor: pointer; font-size: 13px; }
-          .ntf-tpl-item:last-child { border-bottom: none; }
-          .ntf-tpl-item:hover { background: var(--card); }
-          .ntf-tpl-item.is-active { background: var(--card); box-shadow: inset 3px 0 0 var(--text2); }
-          .ntf-tpl-name { font-weight: 600; }
-          .ntf-tpl-meta { font-size: 11px; color: var(--text2); margin-top: 3px; word-break: break-all; }
-          .ntf-tpl-tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 9px; border: 1px solid var(--separator-strong); color: var(--text2); margin-left: 6px; vertical-align: middle; }
-          .ntf-tpl-tag.is-custom { color: #fff; background: var(--green); border-color: var(--green); }
-          .ntf-tpl-tag.is-builtin { color: #fff; background: var(--text2); border-color: var(--text2); }
-          .ntf-tpl-editor { border: 1px solid var(--separator); border-radius: var(--radius-xs); padding: 12px 14px; background: var(--card); }
-          .ntf-tpl-editor .ntf-tpl-textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; padding: 7px 9px; border: 1px solid var(--separator-strong); border-radius: 6px; background: var(--card2); color: var(--text); }
-          .ntf-tpl-preview { border: 1px dashed var(--separator-strong); border-radius: var(--radius-xs); background: var(--card2); padding: 10px 12px; margin-top: 8px; }
-          .ntf-tpl-pv-title { font-weight: 600; margin-bottom: 6px; word-break: break-all; }
-          .ntf-tpl-pv-body { font-size: 12px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
-          .ntf-tpl-var { display: inline-block; font-size: 11px; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 2px 7px; margin: 0 5px 5px 0; border: 1px solid var(--separator-strong); border-radius: 10px; background: var(--card2); color: var(--text); cursor: pointer; }
-          .ntf-tpl-var:hover { border-color: var(--text2); }
         </style>
         <script>
         ${buildThemeBootJs(darkThemeIds)}
@@ -3577,7 +3375,7 @@ ${customScript}</body>
           </div>
         <div class="card" id="adm-page-notify" style="display:none;">
           <h2>🔔 通知中心</h2>
-          <div style="font-size:13px; color:var(--text2); margin:-6px 0 4px 0;">多通道通知引擎、规则引擎与投递可靠性的统一管理入口（通道 / 规则 / 绑定 / 日志 / 队列 / 模板，切换时按需加载）。</div>
+          <div style="font-size:13px; color:var(--text2); margin:-6px 0 4px 0;">多通道通知引擎、规则引擎与投递可靠性的统一管理入口（当前为页面骨架，未接入数据）。</div>
           <div class="ntf-tabs" id="ntf-tabs">
             <button type="button" class="ntf-tab is-active" data-ntf-tab="channels" onclick="admNtfTab('channels')">📡 通道管理</button>
             <button type="button" class="ntf-tab" data-ntf-tab="rules" onclick="admNtfTab('rules')">📋 规则管理</button>
@@ -3686,58 +3484,7 @@ ${customScript}</body>
             </div>
             <div class="ntf-pager" id="ntf-queue-pager"></div>
           </section>
-          <section class="ntf-panel" id="ntf-panel-templates">
-            <div class="ntf-toolbar ntf-filter-bar">
-              <span class="ntf-fl">事件类型</span>
-              <select id="ntf-tpl-type" onchange="ntfTplReload()"><option value="">全部类型</option></select>
-              <span class="ntf-fl">渠道类型</span>
-              <select id="ntf-tpl-channel" onchange="ntfTplReload()"><option value="">全部渠道</option></select>
-              <span class="ntf-fl">范围</span>
-              <select id="ntf-tpl-scope" onchange="ntfTplReload()"><option value="">全部模板</option><option value="custom">仅自定义（含覆盖）</option><option value="builtin">仅内置未覆盖</option></select>
-            </div>
-            <div class="ntf-toolbar">
-              <button type="button" class="btn btn-blue" onclick="ntfTplNew()">＋ 新建自定义模板</button>
-              <button type="button" class="btn btn-gray" onclick="ntfLoadTemplates(true, true)">↻ 刷新</button>
-              <span class="ntf-count" id="ntf-tpl-count"></span>
-            </div>
-            <div class="ntf-msg" id="ntf-tpl-msg"></div>
-            <div class="ntf-tpl-layout">
-              <div class="ntf-tpl-list" id="ntf-tpl-list"><div class="ntf-empty">加载中…</div></div>
-              <div class="ntf-tpl-editor">
-                <div class="ntf-ch-form">
-                  <label>模板名称<span class="ntf-req">*</span></label>
-                  <input type="text" id="ntf-tpl-ed-name" placeholder="例如：离线告警（精简版）">
-                  <label>模板键 · 事件类型<span class="ntf-req">*</span></label>
-                  <select id="ntf-tpl-ed-type"></select>
-                  <label>渠道类型</label>
-                  <select id="ntf-tpl-ed-channel"><option value="">全渠道通用</option></select>
-                  <div class="ntf-hint">模板键 = 事件类型 + 渠道类型；同一事件类型可分别维护各渠道的模板。</div>
-                  <label style="display: flex; align-items: center; gap: 8px;"><input type="checkbox" id="ntf-tpl-ed-enabled" style="width: auto;"> 启用该模板</label>
-                  <label>标题模板</label>
-                  <textarea class="ntf-tpl-textarea" id="ntf-tpl-ed-title" rows="2" placeholder="例如：【{severity_label}】{server_name} 节点离线"></textarea>
-                  <label>正文模板</label>
-                  <textarea class="ntf-tpl-textarea" id="ntf-tpl-ed-body" rows="8" placeholder="用 {变量名} 引用变量，点击下方变量按钮可插入"></textarea>
-                  <label>可用变量（点击插入到正文模板，光标位置生效）</label>
-                  <div class="ntf-tpl-vars" id="ntf-tpl-vars"></div>
-                </div>
-                <div class="ntf-toolbar" style="margin-top: 10px;">
-                  <button type="button" class="btn btn-blue" onclick="ntfTplSave()">保存模板</button>
-                  <button type="button" class="btn btn-gray" onclick="ntfTplResetCurrent()">恢复默认</button>
-                  <button type="button" class="btn btn-gray" onclick="ntfTplDeleteCurrent()">删除自定义模板</button>
-                  <button type="button" class="btn btn-gray" onclick="ntfTplNew()">清空为新建</button>
-                </div>
-                <div class="ntf-msg" id="ntf-tpl-ed-msg"></div>
-                <label style="display: block; margin: 12px 0 4px; font-size: 13px;">实时预览（模拟数据）</label>
-                <div class="ntf-toolbar">
-                  <button type="button" class="btn btn-gray" onclick="ntfTplPreview()">立即渲染</button>
-                  <button type="button" class="btn btn-gray" onclick="ntfTplResetSample()">重置模拟数据</button>
-                  <span class="ntf-fl" id="ntf-tpl-pv-state"></span>
-                </div>
-                <textarea class="ntf-tpl-textarea" id="ntf-tpl-sample" rows="4" placeholder="模拟数据（JSON，键名与真实事件字段一致，可编辑）"></textarea>
-                <div class="ntf-tpl-preview" id="ntf-tpl-preview"><div class="ntf-tpl-pv-title">（尚未渲染）</div><div class="ntf-tpl-pv-body">点击「立即渲染」，或编辑标题/正文模板与模拟数据后自动预览。</div></div>
-              </div>
-            </div>
-          </section>
+          <section class="ntf-panel" id="ntf-panel-templates"><div class="ntf-placeholder">模板中心面板占位（数据接入将在后续步骤完成）</div></section>
 
         <div id="ntfRuleModal" class="modal">
           <div class="modal-content" style="max-width: 620px;">
@@ -3972,7 +3719,6 @@ ${customScript}</body>
             if (name === 'logs') ntfEnsureLogs();
             if (name === 'queue') ntfEnsureQueue();
             if (name === 'rules') ntfEnsureRules();
-            if (name === 'templates') ntfEnsureTemplates();
           }
           if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', admRoute); } else { admRoute(); }
           window.addEventListener('hashchange', admRoute);
@@ -3997,9 +3743,7 @@ ${customScript}</body>
             const map = { missing_id: '缺少必要参数 ID', missing_type: '未指定通道类型', channel_not_found: '通道不存在（可能已被删除）', db_unavailable: '数据库不可用', invalid_json: '响应不是合法 JSON',
               missing_bot_token: 'Telegram Bot Token 未填写', missing_chat_id: 'Telegram Chat ID 未填写',
               missing_url: '推送地址未填写', invalid_url: '推送地址需以 http:// 或 https:// 开头',
-              missing_config: '通道配置缺失', channel_disabled: '通道已停用',
-              template_not_found: '模板不存在（可能已被删除）', missing_content: '模板内容为空，无法生成预览' };
-            if (e.indexOf('no_default_template:') === 0) return '该事件类型没有内置默认模板：' + e.slice(20);
+              missing_config: '通道配置缺失', channel_disabled: '通道已停用' };
             if (map[e]) return map[e];
             if (e.indexOf('unknown_channel_type:') === 0) return '未知通道类型：' + e.slice(20);
             if (e.indexOf('unknown_rule_type:') === 0) return '未知规则类型：' + e.slice(18);
@@ -4704,383 +4448,6 @@ ${customScript}</body>
           }
           function ntfEnsureLogs() { if (ntfLogsLoaded) return; ntfLogsLoaded = true; ntfLoadLogs(true, true); }
           function ntfEnsureQueue() { if (ntfQueueLoaded) return; ntfQueueLoaded = true; ntfLoadQueue(true, true); }
-          // ===== 通知中心 · 模板中心（第4步B-2b：列表 + 编辑器 + 变量表 + 实时预览 + 恢复默认）BEGIN =====
-          let ntfTplLoaded = false, ntfTplLoading = false, ntfTplReqKey = '';
-          let ntfTplItems = [], ntfTplBuiltins = [], ntfTplTypes = [], ntfTplVars = [];
-          let ntfTplSelId = '', ntfTplNewMode = false, ntfTplSampleDefault = '';
-          let ntfTplPrevTimer = null, ntfTplPrevSeq = 0;
-          const NTF_TPL_TYPE_LABELS = { offline: '节点离线', recover: '节点恢复', metric: '指标阈值', traffic_ratio: '流量占比', expire_days: '到期提醒' };
-          function ntfTplEl(id) { return document.getElementById(id); }
-          function ntfTplTypeLabel(t) { const s = String(t || ''); return NTF_TPL_TYPE_LABELS[s] || s || '—'; }
-          function ntfTplBuiltinById(id) { for (let i = 0; i < ntfTplBuiltins.length; i++) { if (ntfTplBuiltins[i].id === id) return ntfTplBuiltins[i]; } return null; }
-          function ntfTplFind(id) { for (let i = 0; i < ntfTplItems.length; i++) { if (ntfTplItems[i].id === id) return ntfTplItems[i]; } return null; }
-          function ntfTplIsBuiltinId(id) { return String(id || '').indexOf('tpl_builtin_') === 0; }
-          // content 兼容两种形态：{title, body} JSON 与历史纯文本（整体作为正文）
-          function ntfTplParseContentText(content) {
-            const raw = String(content === null || content === undefined ? '' : content);
-            if (!raw) return { title: '', body: '' };
-            if (raw.charAt(0) === '{') {
-              try {
-                const o = JSON.parse(raw);
-                if (o && typeof o === 'object') return { title: String(o.title === null || o.title === undefined ? '' : o.title), body: String(o.body === null || o.body === undefined ? '' : o.body) };
-              } catch (e) {}
-            }
-            return { title: '', body: raw };
-          }
-          function ntfTplComposeContent() {
-            const t = ntfTplEl('ntf-tpl-ed-title'), b = ntfTplEl('ntf-tpl-ed-body');
-            return JSON.stringify({ title: String(t ? t.value : ''), body: String(b ? b.value : '') });
-          }
-          function ntfTplTypeOptionsHtml() {
-            let html = '';
-            for (let i = 0; i < ntfTplTypes.length; i++) {
-              html += '<option value="' + ntfEsc(ntfTplTypes[i]) + '">' + ntfEsc(ntfTplTypeLabel(ntfTplTypes[i]) + '（' + ntfTplTypes[i] + '）') + '</option>';
-            }
-            return html;
-          }
-          function ntfTplChannelOptionsHtml() {
-            const ps = ntfProviders();
-            let html = '<option value="">全渠道通用</option>';
-            for (let i = 0; i < ps.length; i++) html += '<option value="' + ntfEsc(ps[i].type) + '">' + ntfEsc(ps[i].name || ps[i].type) + '</option>';
-            return html;
-          }
-          function ntfTplKeepSelect(id, html) {
-            const el = ntfTplEl(id);
-            if (!el) return;
-            const cur = String(el.value || '');
-            el.innerHTML = html;
-            el.value = cur;
-          }
-          function ntfTplFillFilterOptions() {
-            let ty = '<option value="">全部类型</option>';
-            for (let i = 0; i < ntfTplTypes.length; i++) ty += '<option value="' + ntfEsc(ntfTplTypes[i]) + '">' + ntfEsc(ntfTplTypeLabel(ntfTplTypes[i])) + '</option>';
-            ntfTplKeepSelect('ntf-tpl-type', ty);
-            let ch = '<option value="">全部渠道</option>';
-            const ps = ntfProviders();
-            for (let j = 0; j < ps.length; j++) ch += '<option value="' + ntfEsc(ps[j].type) + '">' + ntfEsc(ps[j].name || ps[j].type) + '</option>';
-            ntfTplKeepSelect('ntf-tpl-channel', ch);
-          }
-          // 合并内置与库中数据：库中存在与内置同 id 的行时视为「内置的自定义覆盖」
-          function ntfTplRows() {
-            const fType = ntfFilterValue('ntf-tpl-type'), fCh = ntfFilterValue('ntf-tpl-channel'), fScope = ntfFilterValue('ntf-tpl-scope');
-            const out = [];
-            const usedIds = {};
-            for (let i = 0; i < ntfTplBuiltins.length; i++) {
-              const bi = ntfTplBuiltins[i];
-              const ov = ntfTplFind(bi.id);
-              usedIds[bi.id] = 1;
-              out.push(ov ? Object.assign({}, ov, { builtin: 1, customized: 1, enabled: (ov.enabled === 0 ? 0 : 1) })
-                          : Object.assign({}, bi, { builtin: 1, customized: 0, enabled: 1 }));
-            }
-            for (let j = 0; j < ntfTplItems.length; j++) {
-              const it = ntfTplItems[j];
-              if (usedIds[it.id]) continue;
-              out.push(Object.assign({}, it, { builtin: 0, customized: 1 }));
-            }
-            const filtered = [];
-            for (let k = 0; k < out.length; k++) {
-              const r = out[k];
-              if (fType && String(r.type) !== fType) continue;
-              if (fCh && String(r.channel_type || '') !== fCh) continue;
-              if (fScope === 'custom' && r.customized !== 1) continue;
-              if (fScope === 'builtin' && !(r.builtin === 1 && r.customized === 0)) continue;
-              filtered.push(r);
-            }
-            return filtered;
-          }
-          function ntfTplRenderList() {
-            const box = ntfTplEl('ntf-tpl-list');
-            if (!box) return;
-            const rows = ntfTplRows();
-            const cnt = ntfTplEl('ntf-tpl-count');
-            if (cnt) cnt.textContent = '当前显示 ' + rows.length + ' 个模板（库中 ' + ntfTplItems.length + ' 条，内置 ' + ntfTplBuiltins.length + ' 个）';
-            if (!rows.length) { box.innerHTML = '<div class="ntf-empty">暂无符合条件的模板。</div>'; return; }
-            let html = '';
-            for (let i = 0; i < rows.length; i++) {
-              const r = rows[i];
-              let tags = r.customized === 1 ? '<span class="ntf-tpl-tag is-custom">自定义</span>' : '<span class="ntf-tpl-tag is-builtin">内置</span>';
-              if (r.builtin === 1 && r.customized === 1) tags += '<span class="ntf-tpl-tag">内置·已覆盖</span>';
-              if (r.enabled === 0) tags += '<span class="ntf-tpl-tag">已停用</span>';
-              const chLabel = r.channel_type ? ntfProviderLabel(r.channel_type) : '全渠道';
-              html += '<button type="button" class="ntf-tpl-item' + (r.id === ntfTplSelId ? ' is-active' : '') + '" onclick="ntfTplSelect(\\'' + ntfEsc(r.id) + '\\')">'
-                + '<span class="ntf-tpl-name">' + ntfEsc(r.name || r.id) + '</span>' + tags
-                + '<div class="ntf-tpl-meta">' + ntfEsc(ntfTplTypeLabel(r.type) + ' · ' + chLabel) + '</div>'
-                + '<div class="ntf-tpl-meta">模板键：' + ntfEsc(String(r.type || '—')) + ' / ' + ntfEsc(String(r.channel_type || '全渠道')) + '</div>'
-                + '</button>';
-            }
-            box.innerHTML = html;
-          }
-          function ntfTplRenderVars() {
-            const box = ntfTplEl('ntf-tpl-vars');
-            if (!box) return;
-            let html = '';
-            for (let i = 0; i < ntfTplVars.length; i++) {
-              const v = ntfTplVars[i];
-              const tip = v.label + '｜示例：' + String(v.sample === null || v.sample === undefined ? '' : v.sample);
-              html += '<button type="button" class="ntf-tpl-var" title="' + ntfEsc(tip) + '" onclick="ntfTplInsertVar(\\'' + ntfEsc(v.key) + '\\')">{' + ntfEsc(v.key) + '}</button>';
-            }
-            box.innerHTML = html || '<div class="ntf-tpl-meta">未获取到变量表（notify_meta / notify_list_templates 未返回 vars）。</div>';
-          }
-          function ntfTplInsertVar(key) {
-            const ta = ntfTplEl('ntf-tpl-ed-body');
-            if (!ta) return;
-            const token = '{' + key + '}';
-            const val = String(ta.value || '');
-            const start = (ta.selectionStart === undefined || ta.selectionStart === null) ? val.length : ta.selectionStart;
-            const end = (ta.selectionEnd === undefined || ta.selectionEnd === null) ? val.length : ta.selectionEnd;
-            ta.value = val.slice(0, start) + token + val.slice(end);
-            try { ta.focus(); ta.selectionStart = ta.selectionEnd = start + token.length; } catch (e) {}
-            ntfTplSchedulePreview();
-          }
-          function ntfTplSampleFromVars() {
-            const m = {};
-            for (let i = 0; i < ntfTplVars.length; i++) {
-              const v = ntfTplVars[i];
-              m[v.key] = String(v.sample === null || v.sample === undefined ? '' : v.sample);
-            }
-            m.severity = m.severity || 'warning';
-            m.severity_label = m.severity_label || '警告';
-            m.kind = m.kind || 'fire';
-            m.kind_label = m.kind_label || '触发告警';
-            m.at_text = m.at_text || ntfFmtTs(Date.now());
-            return m;
-          }
-          function ntfTplApplySampleDefault(force) {
-            const el = ntfTplEl('ntf-tpl-sample');
-            if (!el) return;
-            if (!ntfTplSampleDefault) {
-              try { ntfTplSampleDefault = JSON.stringify(ntfTplSampleFromVars(), null, 2); } catch (e) { ntfTplSampleDefault = '{}'; }
-            }
-            if (force || !String(el.value || '').trim()) el.value = ntfTplSampleDefault;
-          }
-          function ntfTplResetSample() {
-            const el = ntfTplEl('ntf-tpl-sample');
-            if (el) el.value = ntfTplSampleDefault;
-            ntfSetMsg('ntf-tpl-ed-msg', '已重置模拟数据', 'info');
-            ntfTplPreview();
-          }
-          function ntfTplRenderEditor() {
-            const nameEl = ntfTplEl('ntf-tpl-ed-name');
-            if (!nameEl) return;
-            const ty = ntfTplEl('ntf-tpl-ed-type'), ch = ntfTplEl('ntf-tpl-ed-channel');
-            if (ty) { const cur = String(ty.value || ''); ty.innerHTML = ntfTplTypeOptionsHtml(); ty.value = ntfTplNewMode ? (ntfTplTypes.length ? ntfTplTypes[0] : '') : cur; }
-            if (ch) { const cur2 = String(ch.value || ''); ch.innerHTML = ntfTplChannelOptionsHtml(); ch.value = ntfTplNewMode ? '' : cur2; }
-            if (ntfTplNewMode) return;
-            const row = ntfTplFind(ntfTplSelId);
-            const bi = ntfTplBuiltinById(ntfTplSelId);
-            const cur3 = row || bi;
-            if (!cur3) {
-              nameEl.value = '';
-              if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = '';
-              if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = '';
-              ntfSetMsg('ntf-tpl-ed-msg', '请在左侧选择模板，或点击「新建自定义模板」。', 'info');
-              return;
-            }
-            nameEl.value = String(cur3.name || '');
-            if (ty) ty.value = String(cur3.type || '');
-            if (ch) ch.value = String(cur3.channel_type || '');
-            const en = ntfTplEl('ntf-tpl-ed-enabled');
-            if (en) en.checked = row ? (row.enabled !== 0) : true;
-            const parts = ntfTplParseContentText(cur3.content);
-            if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = parts.title;
-            if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = parts.body;
-            const kindTxt = row ? (bi ? '内置模板的自定义覆盖（保存将更新覆盖内容）' : '自定义模板') : '内置默认模板（保存将生成自定义覆盖）';
-            const legacy = (!parts.title && String(cur3.content || '').charAt(0) !== '{') ? '｜该模板内容为历史纯文本格式，保存后将转为「标题 + 正文」结构' : '';
-            ntfSetMsg('ntf-tpl-ed-msg', '正在编辑：' + String(cur3.name || cur3.id) + '（' + kindTxt + '，ID：' + String(cur3.id || '') + '）' + legacy, 'info');
-          }
-          function ntfTplNew() {
-            ntfTplNewMode = true;
-            ntfTplSelId = '';
-            ntfTplRenderList();
-            const nameEl = ntfTplEl('ntf-tpl-ed-name');
-            if (nameEl) nameEl.value = '';
-            const ty = ntfTplEl('ntf-tpl-ed-type');
-            if (ty) ty.value = ntfTplTypes.length ? ntfTplTypes[0] : '';
-            const ch = ntfTplEl('ntf-tpl-ed-channel');
-            if (ch) ch.value = '';
-            const en = ntfTplEl('ntf-tpl-ed-enabled');
-            if (en) en.checked = true;
-            if (ntfTplEl('ntf-tpl-ed-title')) ntfTplEl('ntf-tpl-ed-title').value = '';
-            if (ntfTplEl('ntf-tpl-ed-body')) ntfTplEl('ntf-tpl-ed-body').value = '';
-            ntfSetMsg('ntf-tpl-ed-msg', '新建模式：填写模板名称、模板键（事件类型）与渠道类型后保存。', 'info');
-            ntfTplSchedulePreview();
-          }
-          function ntfTplSelect(id) {
-            ntfTplSelId = String(id || '');
-            ntfTplNewMode = false;
-            ntfTplRenderList();
-            ntfTplRenderEditor();
-            ntfTplSchedulePreview();
-          }
-          async function ntfTplSave() {
-            const name = String((ntfTplEl('ntf-tpl-ed-name') || {}).value || '').trim();
-            const type = String((ntfTplEl('ntf-tpl-ed-type') || {}).value || '');
-            const ctype = String((ntfTplEl('ntf-tpl-ed-channel') || {}).value || '');
-            const title = String((ntfTplEl('ntf-tpl-ed-title') || {}).value || '');
-            const body = String((ntfTplEl('ntf-tpl-ed-body') || {}).value || '');
-            if (!name) { ntfSetMsg('ntf-tpl-ed-msg', '请填写模板名称', 'err'); return; }
-            if (!type) { ntfSetMsg('ntf-tpl-ed-msg', '请选择模板键（事件类型）', 'err'); return; }
-            if (!title.trim() && !body.trim()) { ntfSetMsg('ntf-tpl-ed-msg', '标题模板与正文模板不能同时为空', 'err'); return; }
-            const editing = (!ntfTplNewMode && ntfTplSelId) ? ntfTplSelId : '';
-            const isBuiltin = editing ? ntfTplIsBuiltinId(editing) : false;
-            const prompt = isBuiltin
-              ? '确认将内置模板「' + name + '」保存为自定义覆盖？\\n\\n模板 ID：' + editing + '\\n模板键：' + type + ' / ' + (ctype || '全渠道') + '\\n\\n影响提示：覆盖后模板中心显示的该内置模板内容将改为当前编辑内容；可随时通过「恢复默认」删除覆盖并还原为内置默认。'
-              : '确认保存模板「' + name + '」？\\n\\n模板键：' + type + ' / ' + (ctype || '全渠道') + (editing ? ('\\n模板 ID：' + editing) : '\\n保存后由后端生成模板 ID。');
-            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消保存', 'info'); return; }
-            const tpl = { name: name, type: type, channel_type: ctype, content: ntfTplComposeContent(), enabled: (ntfTplEl('ntf-tpl-ed-enabled') || {}).checked ? 1 : 0 };
-            if (editing) tpl.id = editing;
-            ntfSetMsg('ntf-tpl-ed-msg', '正在保存模板…', 'info');
-            const out = await ntfAdminPost('notify_save_template', { template: tpl });
-            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '保存失败：' + ntfErrText(out && out.error), 'err'); return; }
-            ntfTplSelId = String(out.id || editing || '');
-            ntfTplNewMode = false;
-            ntfTplReqKey = '';
-            ntfSetMsg('ntf-tpl-msg', (out.created ? '模板已新增：' : '模板已更新：') + name, 'ok');
-            await ntfLoadTemplates(false, true);
-            ntfSetMsg('ntf-tpl-ed-msg', '保存成功（模板 ID：' + ntfTplSelId + '）', 'ok');
-          }
-          async function ntfTplDeleteCurrent() {
-            const id = ntfTplNewMode ? '' : ntfTplSelId;
-            if (!id) { ntfSetMsg('ntf-tpl-ed-msg', '请先在左侧选择一个模板', 'err'); return; }
-            const row = ntfTplFind(id);
-            const nm = row ? (row.name || id) : id;
-            const isBuiltin = ntfTplIsBuiltinId(id);
-            const prompt = isBuiltin
-              ? '确认删除内置模板「' + nm + '」的自定义覆盖？\\n\\n模板 ID：' + id + '\\n\\n影响提示：删除后该内置模板还原为系统默认内容；系统内置模板本身不会被删除。'
-              : '确认删除自定义模板「' + nm + '」？\\n\\n模板 ID：' + id + '\\n\\n影响提示：删除后该模板不再出现在模板中心，操作不可撤销（模板不参与通知投递，历史日志与队列不受影响）。';
-            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消删除', 'info'); return; }
-            ntfSetMsg('ntf-tpl-ed-msg', '正在删除模板…', 'info');
-            const out = await ntfAdminPost('notify_delete_template', { id: id });
-            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '删除失败：' + ntfErrText(out && out.error), 'err'); return; }
-            ntfTplSelId = '';
-            ntfTplNewMode = true;
-            ntfTplReqKey = '';
-            ntfSetMsg('ntf-tpl-msg', out.deleted ? ('模板已删除：' + nm) : ('未找到可删除的模板：' + nm), out.deleted ? 'ok' : 'warn');
-            await ntfLoadTemplates(false, true);
-            ntfTplNew();
-            ntfSetMsg('ntf-tpl-ed-msg', out.deleted ? ('已删除模板：' + nm) : ('未找到可删除的模板：' + nm), out.deleted ? 'ok' : 'warn');
-          }
-          async function ntfTplResetCurrent() {
-            const id = ntfTplNewMode ? '' : ntfTplSelId;
-            if (!id) { ntfSetMsg('ntf-tpl-ed-msg', '请先在左侧选择一个模板', 'err'); return; }
-            const row = ntfTplFind(id);
-            const nm = row ? (row.name || id) : id;
-            const isBuiltin = ntfTplIsBuiltinId(id);
-            const prompt = isBuiltin
-              ? '确认将内置模板「' + nm + '」恢复默认？\\n\\n模板 ID：' + id + '\\n\\n影响提示：将删除当前的自定义覆盖内容，模板还原为内置默认标题/正文模板。'
-              : '确认将模板「' + nm + '」的标题/正文模板恢复为同事件类型的内置默认内容？\\n\\n模板 ID：' + id + '\\n\\n影响提示：当前标题模板与正文模板将被内置默认内容覆盖（模板名称、模板键、渠道类型与启用状态保持不变）。';
-            if (!confirm(prompt)) { ntfSetMsg('ntf-tpl-ed-msg', '已取消恢复默认', 'info'); return; }
-            ntfSetMsg('ntf-tpl-ed-msg', '正在恢复默认…', 'info');
-            const out = await ntfAdminPost('notify_reset_template', { id: id });
-            if (!out || out.success !== true) { ntfSetMsg('ntf-tpl-ed-msg', '恢复默认失败：' + ntfErrText(out && out.error), 'err'); return; }
-            ntfTplReqKey = '';
-            await ntfLoadTemplates(false, true);
-            ntfTplSelect(id);
-            ntfSetMsg('ntf-tpl-ed-msg', isBuiltin
-              ? (out.removed_override ? '已恢复内置默认内容（原自定义覆盖已删除）' : '该内置模板本就没有自定义覆盖，保持内置默认内容')
-              : '已按同事件类型的内置默认内容重置标题/正文模板', 'ok');
-          }
-          function ntfTplPreviewData() {
-            const el = ntfTplEl('ntf-tpl-sample');
-            const fallback = ntfTplSampleFromVars();
-            const raw = el ? String(el.value || '').trim() : '';
-            if (!raw) return fallback;
-            try {
-              const o = JSON.parse(raw);
-              if (o && typeof o === 'object') return o;
-            } catch (e) { return null; }
-            return null;
-          }
-          function ntfTplSchedulePreview() {
-            if (ntfTplPrevTimer) clearTimeout(ntfTplPrevTimer);
-            ntfTplPrevTimer = setTimeout(function () { ntfTplPreview(); }, 400);
-          }
-          async function ntfTplPreview() {
-            const box = ntfTplEl('ntf-tpl-preview');
-            if (!box) return;
-            const st = ntfTplEl('ntf-tpl-pv-state');
-            const title = String((ntfTplEl('ntf-tpl-ed-title') || {}).value || '');
-            const body = String((ntfTplEl('ntf-tpl-ed-body') || {}).value || '');
-            if (!title.trim() && !body.trim()) {
-              if (st) st.textContent = '';
-              box.innerHTML = '<div class="ntf-tpl-pv-title">（尚未渲染）</div><div class="ntf-tpl-pv-body">请先填写标题模板或正文模板。</div>';
-              return;
-            }
-            const data = ntfTplPreviewData();
-            if (data === null) {
-              if (st) st.textContent = '';
-              box.innerHTML = '<div class="ntf-tpl-pv-title">模拟数据不是合法 JSON</div><div class="ntf-tpl-pv-body">请修正「模拟数据」文本框内容，或点击「重置模拟数据」。</div>';
-              return;
-            }
-            const seq = ++ntfTplPrevSeq;
-            if (st) st.textContent = '渲染中…';
-            const out = await ntfAdminPost('notify_test_render', { content: JSON.stringify({ title: title, body: body }), data: data });
-            if (seq !== ntfTplPrevSeq) return;
-            if (!out || out.success !== true) {
-              if (st) st.textContent = '';
-              box.innerHTML = '<div class="ntf-tpl-pv-title">渲染失败</div><div class="ntf-tpl-pv-body">' + ntfEsc(ntfErrText(out && out.error)) + '</div>';
-              return;
-            }
-            const missing = out.vars_missing || [];
-            if (st) st.textContent = '已渲染' + (missing.length ? ('｜模拟数据未提供变量：' + missing.join('、')) : '');
-            box.innerHTML = '<div class="ntf-tpl-pv-title">' + ntfEsc(out.title || '（无标题）') + '</div>'
-              + '<div class="ntf-tpl-pv-body">' + ntfEsc(out.body || '（无正文）') + '</div>';
-          }
-          function ntfTplReload() {
-            ntfTplReqKey = '';
-            ntfLoadTemplates(true, true);
-          }
-          async function ntfLoadTemplates(showMsg, force) {
-            const box = ntfTplEl('ntf-tpl-list');
-            if (!box) return;
-            if (ntfTplLoading) return;
-            const key = [String(ntfFilterValue('ntf-tpl-type')), String(ntfFilterValue('ntf-tpl-channel')), String(ntfFilterValue('ntf-tpl-scope'))].join('|');
-            if (!force && ntfTplLoaded && ntfTplReqKey === key) { ntfTplRenderList(); return; }
-            ntfTplLoading = true;
-            if (showMsg) ntfSetMsg('ntf-tpl-msg', '正在加载模板列表…', 'info');
-            await ntfEnsureMeta();
-            if (!ntfTplTypes.length && ntfMetaCache && ntfMetaCache.template_types) ntfTplTypes = ntfMetaCache.template_types.slice();
-            if (!ntfTplVars.length && ntfMetaCache && ntfMetaCache.template_vars) ntfTplVars = ntfMetaCache.template_vars.slice();
-            if (!ntfTplBuiltins.length && ntfMetaCache && ntfMetaCache.template_builtins) ntfTplBuiltins = ntfMetaCache.template_builtins.slice();
-            const payload = {};
-            const fType = ntfFilterValue('ntf-tpl-type');
-            if (fType) payload.type = fType;
-            const fCh = ntfFilterValue('ntf-tpl-channel');
-            if (fCh) payload.channel_type = fCh;
-            const out = await ntfAdminPost('notify_list_templates', payload);
-            ntfTplLoading = false;
-            if (!out || out.success !== true) {
-              box.innerHTML = '<div class="ntf-empty">加载失败：' + ntfEsc(ntfErrText(out && out.error)) + '</div>';
-              ntfSetMsg('ntf-tpl-msg', '加载失败：' + ntfErrText(out && out.error), 'err');
-              return;
-            }
-            ntfTplItems = out.templates || [];
-            if (out.builtins && out.builtins.length) ntfTplBuiltins = out.builtins;
-            if (out.vars && out.vars.length) ntfTplVars = out.vars;
-            if (out.types && out.types.length) ntfTplTypes = out.types;
-            ntfTplLoaded = true;
-            ntfTplReqKey = key;
-            if (ntfTplSelId && !ntfTplFind(ntfTplSelId) && !ntfTplBuiltinById(ntfTplSelId)) { ntfTplSelId = ''; ntfTplNewMode = true; }
-            ntfTplFillFilterOptions();
-            ntfTplRenderVars();
-            ntfTplRenderList();
-            ntfTplRenderEditor();
-            ntfTplApplySampleDefault(false);
-            ntfTplSchedulePreview();
-            ntfSetMsg('ntf-tpl-msg', showMsg ? ('已加载：库中 ' + ntfTplItems.length + ' 条模板，内置默认 ' + ntfTplBuiltins.length + ' 个，可用变量 ' + ntfTplVars.length + ' 个') : '', 'ok');
-          }
-          function ntfEnsureTemplates() {
-            if (ntfTplLoaded) return;
-            ntfLoadTemplates(true, true);
-          }
-          (function ntfTplBindInputs() {
-            const ids = ['ntf-tpl-ed-title', 'ntf-tpl-ed-body', 'ntf-tpl-sample'];
-            for (let i = 0; i < ids.length; i++) {
-              const el = ntfTplEl(ids[i]);
-              if (el && el.addEventListener) el.addEventListener('input', ntfTplSchedulePreview);
-            }
-          })();
-          // ===== 通知中心 · 模板中心 END =====
           // ===== 通知中心 · 通知日志 / 投递队列 END =====
           // ===== 通知中心 · 绑定配置 END =====
           // ===== 通知中心 · 规则管理列表 END =====
