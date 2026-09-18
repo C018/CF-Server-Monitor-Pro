@@ -3169,7 +3169,7 @@ ${customScript}</body>
           } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
         }
         else if (data.action === 'ping_snapshot') {
-          // 延迟测速页（独立菜单）：只读拉取节点最近一次上报的延迟结果与探测方式；不触发远端重测（Worker 无法反向调度探针）
+          // 延迟测试页（独立菜单）：只读拉取节点最近一次上报的延迟结果与探测方式；不触发远端重测（Worker 无法反向调度探针）
           const PING_COLS = ['id', 'name', 'server_group', 'last_updated', 'is_hidden',
             'ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'ping_gg', 'ping_cf',
             'ping_intl_hk', 'ping_intl_tyo', 'ping_intl_sin', 'ping_intl_syd', 'ping_intl_lax',
@@ -3414,7 +3414,7 @@ ${customScript}</body>
           .ntf-tpl-pv-body { font-size: 12px; color: var(--text2); white-space: pre-wrap; word-break: break-all; }
           .ntf-tpl-var { display: inline-block; font-size: 11px; font-family: ui-monospace, Menlo, Consolas, monospace; padding: 2px 7px; margin: 0 5px 5px 0; border: 1px solid var(--separator-strong); border-radius: 10px; background: var(--card2); color: var(--text); cursor: pointer; }
           .ntf-tpl-var:hover { border-color: var(--text2); }
-          /* ===== 延迟测速页（独立菜单，沿用 themeTokenCss 设计令牌） ===== */
+          /* ===== 延迟测试页（独立菜单，沿用 themeTokenCss 设计令牌） ===== */
           .ping-tip { font-size:13px; line-height:1.8; color: var(--text2); background: var(--card2); border:1px dashed var(--separator-strong); border-radius: var(--radius-xs); padding:10px 13px; margin-bottom:16px; }
           .ping-sec { border:1px solid var(--separator); border-radius: var(--radius-s); padding:16px 18px; margin-bottom:16px; background: var(--card); box-shadow: var(--shadow); }
           .ping-sec-title { font-size:14px; font-weight:600; margin-bottom:12px; color: var(--text); }
@@ -3463,7 +3463,7 @@ ${customScript}</body>
         <div class="adm-nav" id="adm-nav">
           <a class="adm-nav-item is-active" href="#settings" data-adm-nav="settings" onclick="return admGo('settings')">⚙️ 全局设置</a>
           <a class="adm-nav-item" href="#notify" data-adm-nav="notify" onclick="return admGo('notify')">🔔 通知中心</a>
-          <a class="adm-nav-item" href="#ping" data-adm-nav="ping" onclick="return admGo('ping')">📡 延迟测速</a>
+          <a class="adm-nav-item" href="#ping" data-adm-nav="ping" onclick="return admGo('ping')">📡 延迟测试</a>
         </div>
 
         <div id="adm-page-settings">
@@ -3560,22 +3560,11 @@ ${customScript}</body>
               </div>
                 <input type="hidden" id="cfg_seed_nodes" value="still-cell-000f.a6856191801.workers.dev">
 
-              <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--red);">✈️ Telegram 机器人管理与告警</label>
-              <p style="font-size: 12px; color: var(--text2); margin-top: -5px; margin-bottom: 10px;">填写下方信息并保存后，将在机器人内解锁<b>交互式控制面板</b> (发 <code>/menu</code>) 并自动开通节点离线通知。由于机制原因修改保存后会自动绑定 Webhook。</p>
-              <div class="form-group">
-                <label>开启状态</label>
-                <select id="cfg_tg_notify">
-                  <option value="false" ${sys.tg_notify !== 'true' ? 'selected' : ''}>关闭告警 (仅使用机器人管理功能)</option>
-                  <option value="true" ${sys.tg_notify === 'true' ? 'selected' : ''}>开启告警与管理 (掉线自动推送)</option>
-                </select>
-              </div>
-              <div class="form-group"><label>Bot Token</label><input type="text" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}" placeholder="如: 12345678:ABCDEFG..."></div>
-              <div class="form-group"><label>Chat ID</label><input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789"></div>
+              <!-- TG 推送配置已按需求从设置页隐藏：仅保留隐藏域（维持 saveSettings 提交链路），后端推送功能不变 -->
+              <input type="hidden" id="cfg_tg_notify" value="${sys.tg_notify === 'true' ? 'true' : 'false'}">
+              <input type="hidden" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}">
+              <input type="hidden" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}">
 
-              <hr style="margin: 20px 0; border: none; border-top: 1px dashed var(--separator-strong);">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: var(--purple);">📡 延迟测速（已迁移为独立菜单，与「通知中心」并列）</label>
-              <p style="font-size: 12px; color: var(--text2); margin: 0; line-height: 1.7;">测速目标配置、延迟结果总览、单节点重测与批量测试已统一收敛到独立页面「延迟测速」，此处不再重复渲染（相关控件 id 保持不变，保存逻辑不受影响）。<a href="#ping" onclick="return admGo('ping')" style="color: var(--accent); font-weight: 600; text-decoration: none;">前往延迟测速 →</a></p>
             </div>
           </div>
           <button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
@@ -3848,8 +3837,8 @@ ${customScript}</body>
         </div>
 
         <div class="card" id="adm-page-ping" style="display:none;" data-offline-sec="${parseInt(sys.offline_threshold || '30') || 30}">
-          <h2>📡 延迟测速</h2>
-          <div style="font-size:13px; color:var(--text2); margin:-6px 0 12px 0;">独立延迟测速页：测速目标配置、全节点延迟结果总览、单节点重测与批量测试（数据来源为各节点探针最近一次上报）。</div>
+          <h2>📡 延迟测试</h2>
+          <div style="font-size:13px; color:var(--text2); margin:-6px 0 12px 0;">独立延迟测试页：测速目标配置、全节点延迟结果总览、单节点重测与批量测试（数据来源为各节点探针最近一次上报）。</div>
 
           <div class="ping-tip">
             <b>关于「重测 / 批量测试」</b>：延迟由各节点探针按上报间隔自动测量并上报，Worker 无法反向调度探针，因此本页的测试动作 = 重新拉取探针最新上报值，并与上一次快照对比给出变化（Δ）与失败原因；测速目标（CT / CU / CM / GG / CF）修改后需点击下方「保存测速配置」，探针将在下一次上报时生效。
@@ -4082,7 +4071,7 @@ ${customScript}</body>
           }
           if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', admRoute); } else { admRoute(); }
           window.addEventListener('hashchange', admRoute);
-          // ===== 延迟测速页（独立菜单）：结果排序/筛选/分档着色/单节点重测/批量回测/失败原因（第5步-1） =====
+          // ===== 延迟测试页（独立菜单）：结果排序/筛选/分档着色/单节点重测/批量回测/失败原因（第5步-1） =====
           var pingItems = [], pingLoaded = false, pingBusy = false, pingDelta = {}, pingLastAt = 0;
           var PING_MAIN = [
             { k: 'ping_ct', label: '电信' }, { k: 'ping_cu', label: '联通' }, { k: 'ping_cm', label: '移动' },
