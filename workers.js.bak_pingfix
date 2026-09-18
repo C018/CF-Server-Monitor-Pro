@@ -4113,13 +4113,13 @@ ${customScript}</body>
           function pingOnline(it) {
             var lu = parseFloat(it && it.last_updated);
             if (!lu || isNaN(lu)) return false;
-            // last_updated 为毫秒级时间戳（探针上报写入处 Date.now()），与首页/详情页判定口径保持一致
-            return (Date.now() - lu) < pingOfflineMs();
+            var age = Date.now() - lu * 1000;
+            return age >= 0 && age < pingOfflineMs();
           }
           function pingAgeText(it) {
             var lu = parseFloat(it && it.last_updated);
             if (!lu || isNaN(lu)) return '从未上报';
-            var sec = Math.floor((Date.now() - lu) / 1000);
+            var sec = Math.floor((Date.now() - lu * 1000) / 1000);
             if (sec < 0) sec = 0;
             if (sec < 60) return sec + ' 秒前';
             if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
