@@ -6,6 +6,7 @@ compatibility_date = "2026-06-05"
 
 [vars]
 # ⚠️ 请按实际 Pages 域名修改（Pages 部署后 Cloudflare 会分配 <项目名>.pages.dev 域名，也可绑定自定义域名）
+# 该 SITE_URL 也可改在 Dashboard 该 Worker 的变量中配置，届时以 Dashboard 为准（本文件仅作本地兜底）。
 SITE_URL = "https://tanzhen.pages.dev"
 
 # ⚠️ 还需要配置与 Pages 端完全一致的 API_SECRET，否则 /api/cron 会返回 403 Forbidden。

@@ -1,22 +1,27 @@
-# Cloudflare Pages 项目配置（默认部署入口）
-# 说明：本文件用于 Pages 部署（wrangler pages deploy dist）；旧 Workers 部署配置已迁出至 wrangler.workers.toml
+# Cloudflare Pages 项目配置
+# ==============================================================================
+# 职责说明：本文件仅用于【本地开发】（wrangler pages dev）与【项目标识】。
+# 生产环境的绑定、变量与密钥统一在 Cloudflare Dashboard 管理，本文件一概不持有。
+# ==============================================================================
+#
+# 【D1 绑定点位】
+#   Workers & Pages → 选择本项目 → Settings → Bindings → D1 database
+#   ⚠️ 绑定变量名必须为 DB（与代码中的 env.DB 对应）
+#
+# 【环境变量与密钥点位】
+#   Workers & Pages → 选择本项目 → Settings → Variables and Secrets（如 API_SECRET）
+#
+# 【构建配置点位】
+#   本文件刻意不含 pages_build_output_dir，Cloudflare 会将其视为仅本地开发用，
+#   不作为 Pages 生产配置来源。构建命令与输出目录请在 Dashboard 的
+#   Build configuration 中设置：
+#       Build command          = node scripts/build.js
+#       Build output directory = dist
+#
+# 【本地开发需要 D1 时】用命令行传参：
+#   npx wrangler pages dev dist --d1=DB
+#
+# 注意：Pages 不支持 Cron Triggers，定时告警由 cron/ 目录下的独立 Worker 承担。
+
 name = "tanzhen"
 compatibility_date = "2026-06-05"
-
-# Pages 构建产物目录（scripts/build.js 会生成 dist/_worker.js 作为单文件 Worker 入口）
-pages_build_output_dir = "dist"
-
-# 告诉 Cloudflare 该项目需要一个 D1 数据库，绑定名称必须是 DB
-[[d1_databases]]
-binding = "DB"
-database_name = "monitor_db" # 默认数据库名称，用户可以在部署向导中新建或修改
-database_id = "" # 留空即可，一键部署时向导会自动处理
-
-# 部署向导会把 API_SECRET 写入 vars（明文）；正式环境建议删除 [vars] 后改用：
-#   wrangler secret put API_SECRET
-[vars]
-API_SECRET = "你的密码" # 默认探针通信密钥和后台管理密码（请勿公开此值）
-
-# 注意：Pages 不支持 Cron Triggers，原 [triggers] crons = ["*/1 * * * *"] 已移除。
-# 定时告警已改由 cron/ 目录下的独立 Worker（cron/worker.js + cron/wrangler.toml）
-# 每分钟调用本站点 /api/cron 端点代为触发，Pages 侧无需再配置任何定时任务。

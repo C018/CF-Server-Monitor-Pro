@@ -10,7 +10,7 @@
 
 ### 安全部署提示
 
-* 一键部署向导会把 `API_SECRET` 写入 Cloudflare 的 `vars`（明文）。正式使用建议改为 **Secret**：先删除 `wrangler.toml` 中的 `[vars] API_SECRET`，再执行 `wrangler secret put API_SECRET`（旧值即作废，已安装探针需重新复制安装）。
+* 本仓库的配置文件（`wrangler.toml` / `wrangler.workers.toml`）**不写入** `API_SECRET`，也不写死 D1 UUID。密钥请用 **Secret** 方式配置：执行 `wrangler secret put API_SECRET`，或到 Dashboard 的 **Settings → Variables and Secrets** 添加加密 Secret（旧值即作废，已安装探针需重新复制安装）。
 * 源码改 `src/index.js`（唯一真源），`npm run build` 会自动同步生成根目录 `workers.js` 与 Pages 入口 `dist/_worker.js`，请勿单独手改这两份文件。部署方式已迁移到 Cloudflare Pages，详见下文「部署到 Cloudflare Pages」。
 
 ### 第二步：添加节点并挂载探针
@@ -29,9 +29,23 @@
 本项目已适配 Cloudflare Pages 部署：Pages 侧使用 **`_worker.js`（Advanced Mode）单文件**承接全部路由与内联前端，无需拆分静态资源目录。
 
 * **构建产物**：`dist/` 由 `scripts/build.js` 生成，`dist/_worker.js` 即 Pages 入口，该目录已加入 `.gitignore`，不入库。
-* **部署配置**：根目录 `wrangler.toml` 已改为 Pages 配置，`pages_build_output_dir = "dist"`；原 Workers 部署配置迁移到 `wrangler.workers.toml` 保留兼容。
-* **D1 绑定**：`[[d1_databases]] binding = "DB"` 保持不变，Pages 与 Workers 共用同一个 `monitor_db`，无需重新建库。
+* **部署配置**：仓库内配置文件**不再持有** D1 UUID 与 `API_SECRET`，生产环境的绑定、变量与密钥统一在 Cloudflare Dashboard 管理；原 Workers 部署配置保留在 `wrangler.workers.toml` 中兼容。
+* **D1 绑定**：在 Dashboard 绑定 D1 数据库，变量名必须为 `DB`（对应代码中的 `env.DB`）；Pages 与 Workers 共用同一个 `monitor_db`，无需重新建库。
 * **Cron 差异**：Pages 不支持 Cron Triggers，定时告警改由 `cron/` 目录下的独立 Worker 承担，详见下文「定时告警（Cron）」。
+
+### 运行配置在哪里
+
+**D1 绑定、环境变量与密钥全部在 Cloudflare Dashboard 配置**，仓库内的配置文件只服务于本地开发与项目标识，不再持有任何 UUID 或密钥，从根上避免「仓库与 Dashboard 两边配置冲突」。
+
+| 配置项 | Dashboard 路径 | 填写要求 |
+| --- | --- | --- |
+| D1 数据库绑定 | Workers & Pages → 选择本项目 → **Settings → Bindings → D1 database** | 变量名必须填 `DB`（对应代码中的 `env.DB`），指向 `monitor_db` |
+| 环境变量与密钥 | Workers & Pages → 选择本项目 → **Settings → Variables and Secrets** | 例如 `API_SECRET`，建议存为加密的 Secret，不要写进仓库 |
+| 构建命令与输出目录 | Workers & Pages → 选择本项目 → **Settings → Build configuration** | Build command = `node scripts/build.js`；Build output directory = `dist` |
+
+* 根目录 `wrangler.toml` 刻意不含 `pages_build_output_dir`，Cloudflare 会将其视为**仅本地开发用**，不作为 Pages 生产配置来源。
+* `wrangler.toml` 与 `wrangler.workers.toml` 均已删除 `[[d1_databases]]` 与 `[vars]` 段，不写死 D1 UUID，也不写 `API_SECRET`。
+* 定时告警 Worker（`cron/`）的 `API_SECRET` 需单独配置，且取值必须与 Pages 端一致，详见下文「定时告警（Cron）」。
 
 ### 首次部署步骤（命令行）
 
@@ -39,19 +53,18 @@
 # 1. 登录 Cloudflare
 npx wrangler login
 
-# 2. 创建 D1 数据库，并把输出的 database_id 回填到 wrangler.toml 的 [[d1_databases]]
-npx wrangler d1 create monitor_db
-
-# 3. 创建 Pages 项目（生产分支 main）
+# 2. 创建 Pages 项目（生产分支 main）
 npx wrangler pages project create tanzhen --production-branch=main
 
-# 4. 构建并部署
+# 3. 构建并部署
 npm run deploy
 ```
 
+> 部署完成后，务必到 Dashboard 的 **Settings → Bindings** 绑定 D1（变量名 `DB`），并在 **Settings → Variables and Secrets** 配置 `API_SECRET`，否则站点无法读写数据库。
+
 ### 首次部署步骤（Dashboard + Git 集成）
 
-在 Cloudflare Dashboard → **Workers & Pages → Create → Pages → Connect to Git**，选择本仓库后按下表填写：
+在 Cloudflare Dashboard → **Workers & Pages → Create application → Pages → Connect to Git**，选择本仓库后按下表填写：
 
 | 配置项 | 填写值 |
 | --- | --- |
@@ -59,7 +72,7 @@ npm run deploy
 | Build output directory | `dist` |
 | Production branch | `main` |
 
-创建完成后，需在 Pages 项目的 **Settings → Functions → D1 database bindings** 中手动添加绑定，变量名填 `DB`，并指向 `monitor_db`。
+创建完成后，需在 Pages 项目的 **Settings → Bindings → D1 database** 中添加绑定，变量名填 `DB`，并指向 `monitor_db`；同时在 **Settings → Variables and Secrets** 中配置 `API_SECRET`。
 
 ---
 
@@ -89,15 +102,7 @@ npm run deploy
 
 1. **已存在的 Direct Upload 项目无法转成 Git 集成**：若此前已用 `wrangler pages deploy`（Direct Upload 方式）创建过 Pages 项目，该项目**不能**改为 Git 集成，需**新建一个 Git 集成类型的 Pages 项目**，再把 D1 绑定与 `API_SECRET` 配置到新项目上。
 2. **构建命令必须执行 `node scripts/build.js`**：`dist/` 已被 `.gitignore` 忽略、不存在于仓库中，若 Build command 留空或写错，构建时找不到 `dist/` 会直接失败。该命令会生成 `dist/_worker.js` 并同步 `workers.js`。
-3. **预览部署会复用同一个生产 D1 数据库**：Git 集成产生的预览部署共用生产库 `monitor_db`，预览环境的读写会直接落到生产数据上。如需隔离，可在 `wrangler.toml` 中用 `[env.preview]` 单独绑定一个预览库，例如：
-
-```toml
-[[env.preview.d1_databases]]
-binding = "DB"
-database_name = "monitor_db_preview"
-database_id = "<预览库的 database_id>"
-```
-
+3. **预览部署会复用同一个生产 D1 数据库**：Git 集成产生的预览部署共用生产库 `monitor_db`，预览环境的读写会直接落到生产数据上。如需隔离，请在 Pages 项目的 **Settings → Bindings** 中为 **Preview** 环境单独绑定一个预览库（Dashboard 的绑定面板区分 Production / Preview 两栏）。仓库配置文件已不再声明 D1，因此**不需要也不要**在 `wrangler.toml` 中写 `database_id`。
 
 ---
 
@@ -111,7 +116,7 @@ database_id = "<预览库的 database_id>"
 
 部署步骤：
 
-1. 修改 `cron/wrangler.toml` 中的 `SITE_URL` 为你的实际 Pages 域名（如 `https://tanzhen.pages.dev` 或自定义域名），不要带结尾斜杠。
+1. 配置 `SITE_URL` 为你的实际 Pages 域名（如 `https://tanzhen.pages.dev` 或自定义域名），不要带结尾斜杠。可改 `cron/wrangler.toml`，也可直接在该 Worker 的 Dashboard → **Settings → Variables and Secrets** 中配置；两处同时存在时以 Dashboard 为准。
 2. 为 cron Worker 配置与 Pages 端**完全一致**的 `API_SECRET`：
 
 ```bash
@@ -133,10 +138,13 @@ npm run deploy:cron
 ## 💻 本地开发
 
 ```bash
-npm run dev
+npm run build
+npx wrangler pages dev dist --d1=DB
 ```
 
-等价于 `node scripts/build.js && wrangler pages dev dist`，即在本地跑起 Pages 运行环境。本地密钥放在项目根目录 `.dev.vars`（已加入 `.gitignore`）：
+`npm run build` 先生成 `dist/_worker.js`，再以 `--d1=DB` 命令行传参的方式接入 D1（配置文件里已不再声明 D1 绑定，本地开发需显式传参）。若本地不涉及数据库读写，直接 `npm run dev`（等价于 `node scripts/build.js && wrangler pages dev dist`）即可。
+
+本地密钥放在项目根目录 `.dev.vars`（已加入 `.gitignore`）：
 
 ```
 API_SECRET = "你的密码"
@@ -152,8 +160,8 @@ workers.js              根目录 Workers 部署入口，由 npm run build 从 s
 scripts/build.js        零依赖构建脚本：生成 dist/_worker.js 并同步 workers.js
 dist/_worker.js         Pages 构建产物（_worker.js Advanced Mode 入口，不入库）
 cron/                   独立定时告警 Worker（worker.js + wrangler.toml）
-wrangler.toml           Pages 部署配置（pages_build_output_dir = "dist"）
-wrangler.workers.toml   原 Workers 部署配置（保留兼容）
+wrangler.toml           项目标识与本地开发用（不含 D1 UUID / API_SECRET，运行配置见 Dashboard）
+wrangler.workers.toml   Workers 回退部署兼容配置（D1 绑定与密钥同样在 Dashboard 配置）
 package.json            构建与部署脚本（build / dev / deploy / deploy:cron / deploy:workers）
 ```
 
@@ -170,6 +178,8 @@ npx wrangler deploy -c wrangler.workers.toml
 ```
 
 或使用脚本 `npm run deploy:workers`。此路线下定时告警仍由 Workers 自身的 `[triggers] crons`（每分钟）承担，**无需**部署 `cron/` 独立 Worker。
+
+> ⚠️ 由于 `wrangler.workers.toml` 已不再声明 D1 与变量，`wrangler deploy` 之后请到 Workers 的 Dashboard → **Settings → Bindings** 确认 D1 绑定（变量名 `DB`）仍存在，并在 **Settings → Variables and Secrets** 中配置 `API_SECRET`；若绑定丢失，需手动重新添加。
 
 ---
 ## 📸 界面预览

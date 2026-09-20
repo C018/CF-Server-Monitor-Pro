@@ -1,21 +1,19 @@
-# Cloudflare Workers 项目配置（旧部署方式，保留兼容）
-# 说明：Pages 迁移后本文件不再作为默认部署入口，仅供未迁移的旧环境继续使用：
-#   wrangler deploy -c wrangler.workers.toml
-# 内容与 Pages 改造前的原 wrangler.toml 等价。
+# Cloudflare Workers 项目配置（回退旧部署方式时使用的兼容配置）
+# ==============================================================================
+# 用途：仅当需要回退到 Workers 部署时使用
+#   npx wrangler deploy -c wrangler.workers.toml   （或 npm run deploy:workers）
+# ==============================================================================
+#
+# 【D1 绑定（变量名必须为 DB）】与【API_SECRET】请在 Dashboard 配置：
+#   Workers & Pages → 选择该 Worker 项目 → Settings → Bindings（D1 database，变量名填 DB）
+#   Workers & Pages → 选择该 Worker 项目 → Settings → Variables and Secrets（API_SECRET）
+#
+# ⚠️ 由于本文件不再声明 [[d1_databases]]，执行 wrangler deploy 后请到 Dashboard
+#    确认 DB 绑定仍然存在，否则运行时将缺少 env.DB。
+
 name = "tanzhen"
 main = "src/index.js"
 compatibility_date = "2026-06-05"
-
-# 告诉 Cloudflare 该项目需要一个 D1 数据库，绑定名称必须是 DB
-[[d1_databases]]
-binding = "DB"
-database_name = "monitor_db" # 默认数据库名称，用户可以在部署向导中新建或修改
-database_id = "" # 留空即可，一键部署时向导会自动处理
-
-# 部署向导会把 API_SECRET 写入 vars（明文）；正式环境建议删除 [vars] 后改用：
-#   wrangler secret put API_SECRET
-[vars]
-API_SECRET = "你的密码" # 默认探针通信密钥和后台管理密码（请勿公开此值）
 
 # 掉线告警定时扫描：全部节点掉线时没有上报流量触发检查，靠 Cron 保证告警可达
 [triggers]
