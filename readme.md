@@ -45,7 +45,7 @@
 
 * 根目录 `wrangler.toml` 刻意不含 `pages_build_output_dir`，Cloudflare 会将其视为**仅本地开发用**，不作为 Pages 生产配置来源。
 * `wrangler.toml` 与 `wrangler.workers.toml` 均已删除 `[[d1_databases]]` 与 `[vars]` 段，不写死 D1 UUID，也不写 `API_SECRET`。
-* 定时告警 Worker（`cron/`）的 `API_SECRET` 需单独配置，且取值必须与 Pages 端一致，详见下文「定时告警（Cron）」。
+* 定时告警 Worker（`cron/`）直接绑定 D1（变量名 `DB`）自行执行告警扫描，**无需**配置 `SITE_URL` / `API_SECRET`，详见下文「定时告警（Cron）」。
 
 ### 首次部署步骤（命令行）
 
@@ -108,30 +108,31 @@ npm run deploy
 
 ## ⏰ 定时告警（Cron）
 
-**Pages 不支持 Cron Triggers**，原 `wrangler.toml` 中的 `[triggers] crons = ["*/1 * * * *"]` 已移除。定时告警已拆分为 `cron/` 目录下的独立 Worker：
+**Pages 不支持 Cron Triggers**，原 `wrangler.toml` 中的 `[triggers] crons = ["*/1 * * * *"]` 已移除。定时告警由 `cron/` 目录下的独立 Worker 承担：
 
-* `cron/worker.js`：每分钟由 Cron 触发，向 `${SITE_URL}/api/cron` 发起 POST 请求（携带 `x-cf-secret` 头）。
-* `cron/wrangler.toml`：独立 Worker 配置，内含 `[triggers] crons = ["*/1 * * * *"]` 与 `SITE_URL` 变量。
-* `src/index.js` 侧新增 `/api/cron` 端点：校验 `x-cf-secret`（或 `secret` 参数）与 `API_SECRET` 一致后执行告警扫描，由 Pages 运行环境承载。
+* `cron/worker.js`：**构建生成物**——`node scripts/build.js` 会从 `src/index.js` 中 `@notify-core` 标记包裹的告警引擎区块抽取代码，并拼接 `scheduled` / `fetch` 入口生成该文件，**请勿手写修改**；改完源文件执行一次 `npm run build` 即自动重新生成。
+* `cron/wrangler.toml`：独立 Worker 配置，内含 `[triggers] crons = ["*/1 * * * *"]`，**不再声明任何变量**。
+* 该 Worker **直接绑定与 Pages 相同的 D1 数据库（变量名 `DB`）自行执行告警检查**，不请求 Pages 侧接口，因此**不需要 `SITE_URL`，也不需要 `API_SECRET`**。
+* Pages 侧的 `/api/cron` 端点及其 `API_SECRET` 鉴权**保持原样**，仍可用于后台手动触发与第三方定时器兜底。
 
 部署步骤：
 
-1. 配置 `SITE_URL` 为你的实际 Pages 域名（如 `https://tanzhen.pages.dev` 或自定义域名），不要带结尾斜杠。可改 `cron/wrangler.toml`，也可直接在该 Worker 的 Dashboard → **Settings → Variables and Secrets** 中配置；两处同时存在时以 Dashboard 为准。
-2. 为 cron Worker 配置与 Pages 端**完全一致**的 `API_SECRET`：
-
-```bash
-wrangler secret put API_SECRET -c cron/wrangler.toml
-```
-
-3. 部署 cron Worker：
+1. **绑定 D1**：Dashboard → **Workers & Pages** → 选择 `tanzhen-cron` → **Settings → Bindings** → **Add binding → D1 database**，**Variable name** 填 `DB`，**Database** 选 Pages 项目所用的同一个库（如 `monitor_db`）；Production 与 Preview 两栏各绑一次。
+2. **部署**（首次部署，以及每次改动 `src/index.js` 或 `cron/wrangler.toml` 后都要执行一次）：
 
 ```bash
 npm run deploy:cron
 ```
 
-> ⚠️ 两端 `API_SECRET` 不一致时，`/api/cron` 会返回 `403`，告警不会触发。
+> 📌 **注意**：`cron/` 目录不属于 Pages 构建产物，**不会被 Git 集成自动部署**。改动 `cron/worker.js`（重新构建生成后）或 `cron/wrangler.toml` 后，需在本地手动执行一次 `npm run deploy:cron` 重新部署该 Worker。
 
-> 📌 **注意**：`cron/` 目录不属于 Pages 构建产物，**不会被 Git 集成自动部署**。改动 `cron/worker.js` 或 `cron/wrangler.toml` 后，需在本地手动执行一次 `npm run deploy:cron` 重新部署该 Worker。
+手动触发与排障：直接访问该 Worker 的域名（GET / POST 均可）会立即执行一次告警检查并回显 JSON 结果：
+
+```bash
+curl "https://tanzhen-cron.<你的账号子域>.workers.dev"
+```
+
+> ⚠️ **D1 表结构尚未初始化时不会崩溃**：若建表逻辑还没跑过（例如 Pages 站点从未被访问），告警链路内部的查询失败会按 try/catch 降级，返回 `settings_read_failed` / `db_unavailable` 之类的失败原因，Worker 不抛异常也不中断调度；待 Pages 站点首次访问完成建表后自动恢复正常。
 
 ---
 
@@ -157,9 +158,9 @@ API_SECRET = "你的密码"
 ```
 src/index.js            唯一真源（后端逻辑 + 内联前端全部在此文件）
 workers.js              根目录 Workers 部署入口，由 npm run build 从 src/index.js 同步生成
-scripts/build.js        零依赖构建脚本：生成 dist/_worker.js 并同步 workers.js
+scripts/build.js        零依赖构建脚本：生成 dist/_worker.js、同步 workers.js，并从 @notify-core 区块抽取生成 cron/worker.js
 dist/_worker.js         Pages 构建产物（_worker.js Advanced Mode 入口，不入库）
-cron/                   独立定时告警 Worker（worker.js + wrangler.toml）
+cron/                   独立定时告警 Worker（worker.js 为构建生成物 + wrangler.toml）
 wrangler.toml           项目标识与本地开发用（不含 D1 UUID / API_SECRET，运行配置见 Dashboard）
 wrangler.workers.toml   Workers 回退部署兼容配置（D1 绑定与密钥同样在 Dashboard 配置）
 package.json            构建与部署脚本（build / dev / deploy / deploy:cron / deploy:workers）

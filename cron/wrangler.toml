@@ -1,17 +1,16 @@
-# 独立定时触发器 Worker 配置（Pages 无原生 Cron Triggers 的替代方案）
-# 部署：wrangler deploy -c cron/wrangler.toml
+# 独立定时告警 Worker 配置（Pages 无原生 Cron Triggers 的替代方案）
+# 部署：wrangler deploy -c cron/wrangler.toml（或 npm run deploy:cron）
+# ⚠️ main 指向的 worker.js 是构建生成物（node scripts/build.js 从 src/index.js 的 @notify-core 区块抽取生成），请勿手写修改。
 name = "tanzhen-cron"
 main = "worker.js"
 compatibility_date = "2026-06-05"
 
-[vars]
-# ⚠️ 请按实际 Pages 域名修改（Pages 部署后 Cloudflare 会分配 <项目名>.pages.dev 域名，也可绑定自定义域名）
-# 该 SITE_URL 也可改在 Dashboard 该 Worker 的变量中配置，届时以 Dashboard 为准（本文件仅作本地兜底）。
-SITE_URL = "https://tanzhen.pages.dev"
-
-# ⚠️ 还需要配置与 Pages 端完全一致的 API_SECRET，否则 /api/cron 会返回 403 Forbidden。
-# 推荐使用 Secret 方式（不要把密钥写进本文件提交到仓库）：
-#   wrangler secret put API_SECRET -c cron/wrangler.toml
+# 本 Worker 直接绑定与 Pages 相同的 D1 数据库（变量名 DB）自行执行告警检查，
+# 无需任何环境变量、无需任何密钥，也不调用任何 Pages 侧 HTTP 接口。
+# D1 绑定请在 Dashboard 配置（本文件不写死 database_id）：
+#   Workers & Pages → 选择本 Worker → Settings → Bindings → Add binding → D1 database
+#   Variable name 填 DB，Database 选 Pages 项目所用的同一个库（如 monitor_db）
+#   Production / Preview 两栏各绑一次；绑定保存后需重新部署一次使绑定生效。
 
 # 每分钟触发一次，与改造前 wrangler.toml 中的 [triggers] 保持一致
 [triggers]

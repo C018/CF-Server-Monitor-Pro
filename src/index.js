@@ -1,3 +1,4 @@
+/* @notify-core:start */
 // Telegram 告警专用转义（模块顶层，供 Cron 定时扫描复用）
 const tgEsc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -1300,6 +1301,7 @@ async function runNotifyTriggered(env, key, opts) {
   return out;
 }
 // ===== 通知触发接线 END =====
+/* @notify-core:end */
 
 // ===== 后台通知中心 / 模板中心 JSON 接口（通知重构第4步A：纯新增，仅输出 JSON，不做整页渲染）=====
 // 接入方式：后台单点入口 POST {admin_path}/api 内以 action 前缀 'notify_' 分发（见 fetch 路由），复用既有 isAdminAuthed 鉴权。
@@ -2086,6 +2088,7 @@ function buildThemeBootJs(darkThemeIds) {
 })();`;
 }
 
+/* @notify-core:start */
 // 定时告警扫描（B-3 起切换为统一引擎）：仅按独立节流键触发一次通知周期，并附带失败补发闭环，
 // 不再自行实现离线判定与直发（判定/投递/状态维护均由 runNotifyCycle 与 drainNotifyQueue 承担）
 async function scheduledAlertCheck(env) {
@@ -2093,6 +2096,7 @@ async function scheduledAlertCheck(env) {
     return await runNotifyTriggered(env, NOTIFY_TRIGGER_KEY_CRON, { drain: true });
   } catch (e) { return null; }
 }
+/* @notify-core:end */
 
 export default {
   async fetch(request, env, ctx) {
