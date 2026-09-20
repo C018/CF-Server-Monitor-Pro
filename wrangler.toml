@@ -1,6 +1,10 @@
+# Cloudflare Pages 项目配置（默认部署入口）
+# 说明：本文件用于 Pages 部署（wrangler pages deploy dist）；旧 Workers 部署配置已迁出至 wrangler.workers.toml
 name = "tanzhen"
-main = "src/index.js"
 compatibility_date = "2026-06-05"
+
+# Pages 构建产物目录（scripts/build.js 会生成 dist/_worker.js 作为单文件 Worker 入口）
+pages_build_output_dir = "dist"
 
 # 告诉 Cloudflare 该项目需要一个 D1 数据库，绑定名称必须是 DB
 [[d1_databases]]
@@ -13,6 +17,6 @@ database_id = "" # 留空即可，一键部署时向导会自动处理
 [vars]
 API_SECRET = "你的密码" # 默认探针通信密钥和后台管理密码（请勿公开此值）
 
-# 掉线告警定时扫描：全部节点掉线时没有上报流量触发检查，靠 Cron 保证告警可达
-[triggers]
-crons = ["*/1 * * * *"]
+# 注意：Pages 不支持 Cron Triggers，原 [triggers] crons = ["*/1 * * * *"] 已移除。
+# 定时告警已改由 cron/ 目录下的独立 Worker（cron/worker.js + cron/wrangler.toml）
+# 每分钟调用本站点 /api/cron 端点代为触发，Pages 侧无需再配置任何定时任务。

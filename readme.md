@@ -11,7 +11,7 @@
 ### 安全部署提示
 
 * 一键部署向导会把 `API_SECRET` 写入 Cloudflare 的 `vars`（明文）。正式使用建议改为 **Secret**：先删除 `wrangler.toml` 中的 `[vars] API_SECRET`，再执行 `wrangler secret put API_SECRET`（旧值即作废，已安装探针需重新复制安装）。
-* 维护代码请统一编辑 `src/index.js`，完成后**必须同步复制为根目录 `workers.js`**（两文件需保持一致）；本仓库约定同步部署入口即根目录 `workers.js`。
+* 源码改 `src/index.js`（唯一真源），`npm run build` 会自动同步生成根目录 `workers.js` 与 Pages 入口 `dist/_worker.js`，请勿单独手改这两份文件。部署方式已迁移到 Cloudflare Pages，详见下文「部署到 Cloudflare Pages」。
 
 ### 第二步：添加节点并挂载探针
 
@@ -21,6 +21,155 @@
 4. 等待 5~10 秒，回到前台大盘刷新即可看到数据跳动。
 
 > ⚠️ **安装命令含通信密钥（API_SECRET）**：请勿在群聊、工单、Telegram 等公开渠道转发安装命令；密钥仅用于探针与 Worker 间鉴权，泄露后可在 Cloudflare 后台执行 `wrangler secret put API_SECRET` 更新。
+
+---
+
+## ☁️ 部署到 Cloudflare Pages
+
+本项目已适配 Cloudflare Pages 部署：Pages 侧使用 **`_worker.js`（Advanced Mode）单文件**承接全部路由与内联前端，无需拆分静态资源目录。
+
+* **构建产物**：`dist/` 由 `scripts/build.js` 生成，`dist/_worker.js` 即 Pages 入口，该目录已加入 `.gitignore`，不入库。
+* **部署配置**：根目录 `wrangler.toml` 已改为 Pages 配置，`pages_build_output_dir = "dist"`；原 Workers 部署配置迁移到 `wrangler.workers.toml` 保留兼容。
+* **D1 绑定**：`[[d1_databases]] binding = "DB"` 保持不变，Pages 与 Workers 共用同一个 `monitor_db`，无需重新建库。
+* **Cron 差异**：Pages 不支持 Cron Triggers，定时告警改由 `cron/` 目录下的独立 Worker 承担，详见下文「定时告警（Cron）」。
+
+### 首次部署步骤（命令行）
+
+```bash
+# 1. 登录 Cloudflare
+npx wrangler login
+
+# 2. 创建 D1 数据库，并把输出的 database_id 回填到 wrangler.toml 的 [[d1_databases]]
+npx wrangler d1 create monitor_db
+
+# 3. 创建 Pages 项目（生产分支 main）
+npx wrangler pages project create tanzhen --production-branch=main
+
+# 4. 构建并部署
+npm run deploy
+```
+
+### 首次部署步骤（Dashboard + Git 集成）
+
+在 Cloudflare Dashboard → **Workers & Pages → Create → Pages → Connect to Git**，选择本仓库后按下表填写：
+
+| 配置项 | 填写值 |
+| --- | --- |
+| Build command | `node scripts/build.js` |
+| Build output directory | `dist` |
+| Production branch | `main` |
+
+创建完成后，需在 Pages 项目的 **Settings → Functions → D1 database bindings** 中手动添加绑定，变量名填 `DB`，并指向 `monitor_db`。
+
+---
+
+## 🔄 GitHub 更新自动同步到 Pages
+
+本项目通过 **Cloudflare Pages 的 Git 集成**实现「push 到 GitHub 即自动构建部署」，全程无需配置 CI 密钥（无需 API Token，也不需要在仓库里存放任何 Cloudflare 凭据）。
+
+### 配置步骤（照做即可）
+
+1. 登录 Cloudflare Dashboard，进入 **Workers & Pages**。
+2. 点击 **Create application** → 切换到 **Pages** 标签页 → 点击 **Connect to Git**。
+3. 授权 Cloudflare 访问你的 GitHub 账号，然后选择仓库 **`C018/CF-Server-Monitor-Pro`**。
+4. **Production branch** 填 `main`。
+5. **Build command** 填 `node scripts/build.js`。
+6. **Build output directory** 填 `dist`。
+7. 点击 **Save and Deploy**，首次构建与部署随即开始。
+
+首次部署完成后，还需在 Pages 项目的 **Settings → Functions → D1 database bindings** 中添加绑定，变量名填 `DB`，并指向 `monitor_db`（详见上文「部署到 Cloudflare Pages」）。
+
+### 自动部署行为
+
+* **push 到 `main`** → 自动构建并部署到**生产环境**。
+* **push 到其他分支、以及提交 Pull Request** → 自动生成**预览部署**（Preview Deployment），带独立预览域名，不影响生产。
+* 上述过程全部由 Cloudflare 侧完成，仓库内无需任何 CI 配置文件；仍在 Workers 侧使用的旧环境可按需手动 `npm run deploy:workers`。
+
+### 注意事项
+
+1. **已存在的 Direct Upload 项目无法转成 Git 集成**：若此前已用 `wrangler pages deploy`（Direct Upload 方式）创建过 Pages 项目，该项目**不能**改为 Git 集成，需**新建一个 Git 集成类型的 Pages 项目**，再把 D1 绑定与 `API_SECRET` 配置到新项目上。
+2. **构建命令必须执行 `node scripts/build.js`**：`dist/` 已被 `.gitignore` 忽略、不存在于仓库中，若 Build command 留空或写错，构建时找不到 `dist/` 会直接失败。该命令会生成 `dist/_worker.js` 并同步 `workers.js`。
+3. **预览部署会复用同一个生产 D1 数据库**：Git 集成产生的预览部署共用生产库 `monitor_db`，预览环境的读写会直接落到生产数据上。如需隔离，可在 `wrangler.toml` 中用 `[env.preview]` 单独绑定一个预览库，例如：
+
+```toml
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "monitor_db_preview"
+database_id = "<预览库的 database_id>"
+```
+
+
+---
+
+## ⏰ 定时告警（Cron）
+
+**Pages 不支持 Cron Triggers**，原 `wrangler.toml` 中的 `[triggers] crons = ["*/1 * * * *"]` 已移除。定时告警已拆分为 `cron/` 目录下的独立 Worker：
+
+* `cron/worker.js`：每分钟由 Cron 触发，向 `${SITE_URL}/api/cron` 发起 POST 请求（携带 `x-cf-secret` 头）。
+* `cron/wrangler.toml`：独立 Worker 配置，内含 `[triggers] crons = ["*/1 * * * *"]` 与 `SITE_URL` 变量。
+* `src/index.js` 侧新增 `/api/cron` 端点：校验 `x-cf-secret`（或 `secret` 参数）与 `API_SECRET` 一致后执行告警扫描，由 Pages 运行环境承载。
+
+部署步骤：
+
+1. 修改 `cron/wrangler.toml` 中的 `SITE_URL` 为你的实际 Pages 域名（如 `https://tanzhen.pages.dev` 或自定义域名），不要带结尾斜杠。
+2. 为 cron Worker 配置与 Pages 端**完全一致**的 `API_SECRET`：
+
+```bash
+wrangler secret put API_SECRET -c cron/wrangler.toml
+```
+
+3. 部署 cron Worker：
+
+```bash
+npm run deploy:cron
+```
+
+> ⚠️ 两端 `API_SECRET` 不一致时，`/api/cron` 会返回 `403`，告警不会触发。
+
+> 📌 **注意**：`cron/` 目录不属于 Pages 构建产物，**不会被 Git 集成自动部署**。改动 `cron/worker.js` 或 `cron/wrangler.toml` 后，需在本地手动执行一次 `npm run deploy:cron` 重新部署该 Worker。
+
+---
+
+## 💻 本地开发
+
+```bash
+npm run dev
+```
+
+等价于 `node scripts/build.js && wrangler pages dev dist`，即在本地跑起 Pages 运行环境。本地密钥放在项目根目录 `.dev.vars`（已加入 `.gitignore`）：
+
+```
+API_SECRET = "你的密码"
+```
+
+---
+
+## 📁 目录结构
+
+```
+src/index.js            唯一真源（后端逻辑 + 内联前端全部在此文件）
+workers.js              根目录 Workers 部署入口，由 npm run build 从 src/index.js 同步生成
+scripts/build.js        零依赖构建脚本：生成 dist/_worker.js 并同步 workers.js
+dist/_worker.js         Pages 构建产物（_worker.js Advanced Mode 入口，不入库）
+cron/                   独立定时告警 Worker（worker.js + wrangler.toml）
+wrangler.toml           Pages 部署配置（pages_build_output_dir = "dist"）
+wrangler.workers.toml   原 Workers 部署配置（保留兼容）
+package.json            构建与部署脚本（build / dev / deploy / deploy:cron / deploy:workers）
+```
+
+> `src/index.js` 是**唯一真源**，`npm run build` 会同步生成 `workers.js` 与 `dist/_worker.js`，三份文件内容一致（哈希相同），请勿单独修改后两者。
+
+---
+
+## 🧰 仍用 Workers 部署
+
+Pages 迁移后仍保留原 Workers 部署能力，供未迁移的旧环境继续使用：
+
+```bash
+npx wrangler deploy -c wrangler.workers.toml
+```
+
+或使用脚本 `npm run deploy:workers`。此路线下定时告警仍由 Workers 自身的 `[triggers] crons`（每分钟）承担，**无需**部署 `cron/` 独立 Worker。
 
 ---
 ## 📸 界面预览
@@ -44,7 +193,7 @@
 
 # ⚡ CF-Server-Monitor-Pro (Serverless 探针增强版)
 
-基于 Cloudflare Workers 和 D1 数据库构建的零成本、高定制化服务器探针大盘。
+基于 Cloudflare Workers / Pages 和 D1 数据库构建的零成本、高定制化服务器探针大盘。
 完全白嫖 Cloudflare 的免费 Serverless 资源，无需额外部署任何服务端 VPS！支持多节点大盘展示、单节点详情图表、全平台 Agent 监控与 Telegram 机器人深度交互。
 
 ## ✨ 核心特性

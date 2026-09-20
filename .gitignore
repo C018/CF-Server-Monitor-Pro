@@ -1,0 +1,13 @@
+# 依赖目录
+node_modules/
+
+# 构建产物（由 npm run build / CI 生成，不入库）
+dist/
+
+# Wrangler 本地缓存与状态
+.wrangler/
+
+# 本地环境变量与密钥
+.dev.vars
+.env
+.env.*

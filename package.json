@@ -1,0 +1,16 @@
+{
+  "name": "cf-server-monitor-pro",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Pages 部署版服务器探针（由 Workers 单文件版本适配而来）",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "npm run build && wrangler pages dev dist",
+    "deploy": "npm run build && wrangler pages deploy dist",
+    "deploy:cron": "wrangler deploy -c cron/wrangler.toml",
+    "deploy:workers": "npm run build && wrangler deploy -c wrangler.workers.toml"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

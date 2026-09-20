@@ -1,0 +1,22 @@
+# Cloudflare Workers 项目配置（旧部署方式，保留兼容）
+# 说明：Pages 迁移后本文件不再作为默认部署入口，仅供未迁移的旧环境继续使用：
+#   wrangler deploy -c wrangler.workers.toml
+# 内容与 Pages 改造前的原 wrangler.toml 等价。
+name = "tanzhen"
+main = "src/index.js"
+compatibility_date = "2026-06-05"
+
+# 告诉 Cloudflare 该项目需要一个 D1 数据库，绑定名称必须是 DB
+[[d1_databases]]
+binding = "DB"
+database_name = "monitor_db" # 默认数据库名称，用户可以在部署向导中新建或修改
+database_id = "" # 留空即可，一键部署时向导会自动处理
+
+# 部署向导会把 API_SECRET 写入 vars（明文）；正式环境建议删除 [vars] 后改用：
+#   wrangler secret put API_SECRET
+[vars]
+API_SECRET = "你的密码" # 默认探针通信密钥和后台管理密码（请勿公开此值）
+
+# 掉线告警定时扫描：全部节点掉线时没有上报流量触发检查，靠 Cron 保证告警可达
+[triggers]
+crons = ["*/1 * * * *"]

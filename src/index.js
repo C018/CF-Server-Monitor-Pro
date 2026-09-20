@@ -7069,6 +7069,21 @@ rm -f /tmp/cf_install.sh
     }
 
     // ==========================================
+    // 定时告警外部触发入口 (/api/cron)
+    // Pages 不支持 Cron Triggers，改由 cron/ 目录下的独立 Worker 每分钟调用本端点代为触发
+    // ==========================================
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/api/cron') {
+      const cronSecret = request.headers.get('x-cf-secret') || url.searchParams.get('secret') || '';
+      // 密钥严格比对：未配置 API_SECRET 时一律拒绝，避免空值互相匹配导致鉴权被绕过
+      if (!env.API_SECRET || !safeEqual(cronSecret, env.API_SECRET)) {
+        return new Response(JSON.stringify({ ok: false, error: 'Forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
+      }
+      // 复用既有定时告警扫描逻辑（scheduledAlertCheck），异步执行不阻塞响应
+      ctx.waitUntil(scheduledAlertCheck(env));
+      return new Response(JSON.stringify({ ok: true, triggered: 'alert_check', ts: Date.now() }), { status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
+    }
+
+    // ==========================================
     // 大盘主程序、聚合渲染及 Gossip 路由分发
     // ==========================================
     // 门卫：聚合渲染仅服务首页；其余未匹配路径直接 404，避免无关请求（favicon/爬虫/扫描）触发全表查询与聚合计算
