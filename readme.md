@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 2b01018e553984e9a5671567693ea87d_4dc5f5a1b4b711f193fb525400393706
-    ReservedCode1: VHWUvcaohyvT+CSQ5QcvWBB+CgvKVlpJP4Am/z9fQFFHsT1lilMQpaBpJyHKc1wB4xOA8WYu4SFFsaDtSvDo+iem3VheuMCAXki986rJZV+eb75y7PzJ/BJJPrKvkUoAbNyvxoFpTE0XaifK2fJ7Onbz/CgU9VgEchOVtS2oLD/4YWtnBlsCDUEdKT4=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 2b01018e553984e9a5671567693ea87d_4dc5f5a1b4b711f193fb525400393706
-    ReservedCode2: VHWUvcaohyvT+CSQ5QcvWBB+CgvKVlpJP4Am/z9fQFFHsT1lilMQpaBpJyHKc1wB4xOA8WYu4SFFsaDtSvDo+iem3VheuMCAXki986rJZV+eb75y7PzJ/BJJPrKvkUoAbNyvxoFpTE0XaifK2fJ7Onbz/CgU9VgEchOVtS2oLD/4YWtnBlsCDUEdKT4=
----
-
 ## 🚀 快速部署与使用
 
 ### 第一步：一键部署到 Cloudflare
