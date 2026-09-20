@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 2b01018e553984e9a5671567693ea87d_4dc5f5a1b4b711f193fb525400393706
+    ReservedCode1: VHWUvcaohyvT+CSQ5QcvWBB+CgvKVlpJP4Am/z9fQFFHsT1lilMQpaBpJyHKc1wB4xOA8WYu4SFFsaDtSvDo+iem3VheuMCAXki986rJZV+eb75y7PzJ/BJJPrKvkUoAbNyvxoFpTE0XaifK2fJ7Onbz/CgU9VgEchOVtS2oLD/4YWtnBlsCDUEdKT4=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 2b01018e553984e9a5671567693ea87d_4dc5f5a1b4b711f193fb525400393706
+    ReservedCode2: VHWUvcaohyvT+CSQ5QcvWBB+CgvKVlpJP4Am/z9fQFFHsT1lilMQpaBpJyHKc1wB4xOA8WYu4SFFsaDtSvDo+iem3VheuMCAXki986rJZV+eb75y7PzJ/BJJPrKvkUoAbNyvxoFpTE0XaifK2fJ7Onbz/CgU9VgEchOVtS2oLD/4YWtnBlsCDUEdKT4=
+---
+
 ## 🚀 快速部署与使用
 
 ### 第一步：一键部署到 Cloudflare
@@ -45,7 +56,7 @@
 
 * 根目录 `wrangler.toml` 刻意不含 `pages_build_output_dir`，Cloudflare 会将其视为**仅本地开发用**，不作为 Pages 生产配置来源。
 * `wrangler.toml` 与 `wrangler.workers.toml` 均已删除 `[[d1_databases]]` 与 `[vars]` 段，不写死 D1 UUID，也不写 `API_SECRET`。
-* 定时告警 Worker（`cron/`）直接绑定 D1（变量名 `DB`）自行执行告警扫描，**无需**配置 `SITE_URL` / `API_SECRET`，详见下文「定时告警（Cron）」。
+* 定时告警 Worker（`cron/`）直接绑定 D1（变量名 `DB`）自行执行告警扫描，**无需**配置 `SITE_URL`；其 `fetch` 手动触发入口需配置独立的本 Worker `API_SECRET`（与 Pages 侧各自独立，见下文「定时告警（Cron）」）。
 
 ### 首次部署步骤（命令行）
 
@@ -111,14 +122,22 @@ npm run deploy
 **Pages 不支持 Cron Triggers**，原 `wrangler.toml` 中的 `[triggers] crons = ["*/1 * * * *"]` 已移除。定时告警由 `cron/` 目录下的独立 Worker 承担：
 
 * `cron/worker.js`：**构建生成物**——`node scripts/build.js` 会从 `src/index.js` 中 `@notify-core` 标记包裹的告警引擎区块抽取代码，并拼接 `scheduled` / `fetch` 入口生成该文件，**请勿手写修改**；改完源文件执行一次 `npm run build` 即自动重新生成。
-* `cron/wrangler.toml`：独立 Worker 配置，内含 `[triggers] crons = ["*/1 * * * *"]`，**不再声明任何变量**。
-* 该 Worker **直接绑定与 Pages 相同的 D1 数据库（变量名 `DB`）自行执行告警检查**，不请求 Pages 侧接口，因此**不需要 `SITE_URL`，也不需要 `API_SECRET`**。
+* `cron/wrangler.toml`：独立 Worker 配置，内含 `[triggers] crons = ["*/1 * * * *"]`，不声明任何明文变量与密钥。
+* 该 Worker **直接绑定与 Pages 相同的 D1 数据库（变量名 `DB`）自行执行告警检查**，不请求 Pages 侧接口，因此**不需要 `SITE_URL`**。
+* 该 Worker 的 `fetch` 手动触发入口需要 `API_SECRET` 鉴权（密钥取值方式与 Pages 侧 `/api/cron` 一致：请求头 `x-cf-secret` 或查询参数 `?secret=`；未配置密钥时一律拒绝）；定时触发（`scheduled`）不需要密钥。
+* ⚠️ **cron Worker 与 Pages 侧的 `API_SECRET` 是两个各自独立的 Secret**，分别配置、互不影响：修改其中一个不会影响另一个。
 * Pages 侧的 `/api/cron` 端点及其 `API_SECRET` 鉴权**保持原样**，仍可用于后台手动触发与第三方定时器兜底。
 
 部署步骤：
 
 1. **绑定 D1**：Dashboard → **Workers & Pages** → 选择 `tanzhen-cron` → **Settings → Bindings** → **Add binding → D1 database**，**Variable name** 填 `DB`，**Database** 选 Pages 项目所用的同一个库（如 `monitor_db`）；Production 与 Preview 两栏各绑一次。
-2. **部署**（首次部署，以及每次改动 `src/index.js` 或 `cron/wrangler.toml` 后都要执行一次）：
+2. **配置 API_SECRET**（仅 `fetch` 手动入口鉴权用，定时触发不需要；请用 Secret 方式写入，**不要**写进仓库文件）：
+
+```bash
+wrangler secret put API_SECRET -c cron/wrangler.toml
+```
+
+3. **部署**（首次部署，以及每次改动 `src/index.js` 或 `cron/wrangler.toml` 后都要执行一次）：
 
 ```bash
 npm run deploy:cron
@@ -126,10 +145,14 @@ npm run deploy:cron
 
 > 📌 **注意**：`cron/` 目录不属于 Pages 构建产物，**不会被 Git 集成自动部署**。改动 `cron/worker.js`（重新构建生成后）或 `cron/wrangler.toml` 后，需在本地手动执行一次 `npm run deploy:cron` 重新部署该 Worker。
 
-手动触发与排障：直接访问该 Worker 的域名（GET / POST 均可）会立即执行一次告警检查并回显 JSON 结果：
+手动触发与排障：该 Worker 的 `fetch` 入口按 `x-cf-secret` 请求头（或 `?secret=` 查询参数）校验密钥，通过后立即执行一次告警检查并回显 JSON 结果；未携带或携带错误密钥时返回 `403 {"ok":false,"error":"Forbidden"}`。
 
 ```bash
-curl "https://tanzhen-cron.<你的账号子域>.workers.dev"
+# 请求头方式（推荐）
+curl -H "x-cf-secret: 你的API_SECRET" "https://tanzhen-cron.<你的账号子域>.workers.dev"
+
+# 查询参数方式
+curl "https://tanzhen-cron.<你的账号子域>.workers.dev/?secret=你的API_SECRET"
 ```
 
 > ⚠️ **D1 表结构尚未初始化时不会崩溃**：若建表逻辑还没跑过（例如 Pages 站点从未被访问），告警链路内部的查询失败会按 try/catch 降级，返回 `settings_read_failed` / `db_unavailable` 之类的失败原因，Worker 不抛异常也不中断调度；待 Pages 站点首次访问完成建表后自动恢复正常。
@@ -466,3 +489,4 @@ Remove-Item -Path C:\ProgramData\CFProbe -Recurse -Force -ErrorAction SilentlyCo
 
 本项目由纯 Serverless 爱好者开发，功能持续迭代中。
 如果你喜欢这个项目，欢迎提交 PR，或者给个 ⭐ **Star** 支持一下！
+*（内容由AI生成，仅供参考）*

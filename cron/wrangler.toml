@@ -6,11 +6,17 @@ main = "worker.js"
 compatibility_date = "2026-06-05"
 
 # 本 Worker 直接绑定与 Pages 相同的 D1 数据库（变量名 DB）自行执行告警检查，
-# 无需任何环境变量、无需任何密钥，也不调用任何 Pages 侧 HTTP 接口。
+# 不调用任何 Pages 侧 HTTP 接口，也不需要配置站点地址。
 # D1 绑定请在 Dashboard 配置（本文件不写死 database_id）：
 #   Workers & Pages → 选择本 Worker → Settings → Bindings → Add binding → D1 database
 #   Variable name 填 DB，Database 选 Pages 项目所用的同一个库（如 monitor_db）
 #   Production / Preview 两栏各绑一次；绑定保存后需重新部署一次使绑定生效。
+#
+# API_SECRET（仅用于 fetch 手动触发入口鉴权；定时触发 scheduled 不需要密钥）：
+#   请用命令行以 Secret 方式写入，不要把明文写进本文件（本文件不提供 [vars] 明文项）：
+#     wrangler secret put API_SECRET -c cron/wrangler.toml
+#   未配置该 Secret 时，手动触发入口一律返回 403 {"ok":false,"error":"Forbidden"}。
+#   ⚠️ 本 Worker 的 API_SECRET 与 Pages 项目侧的 API_SECRET 是两个各自独立的 Secret，需分别配置。
 
 # 每分钟触发一次，与改造前 wrangler.toml 中的 [triggers] 保持一致
 [triggers]

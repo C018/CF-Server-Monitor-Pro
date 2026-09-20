@@ -74,7 +74,12 @@ const CRON_HEADER = [
   ' *          源文件：src/index.js（唯一真源），改动请改源文件后重新执行 npm run build',
   ' *',
   ' * 运行方式：本 Worker 直接绑定与 Pages 相同的 D1 数据库（变量名 DB）自行执行告警检查，',
-  ' *          不依赖任何 Pages 侧 HTTP 接口，也不依赖共享密钥，因此无需额外配置站点地址或密钥。',
+  ' *          不依赖任何 Pages 侧 HTTP 接口，也不需要站点地址。',
+  ' *',
+  ' * 鉴权：仅 fetch 手动触发入口需要密钥（x-cf-secret 请求头或 ?secret= 查询参数），',
+  ' *      通过 wrangler secret put API_SECRET -c cron/wrangler.toml 配置（勿写入明文）；',
+  ' *      未配置时手动入口一律返回 403，定时触发（scheduled）不需要密钥。',
+  ' *      该密钥与本 Pages 项目侧的 API_SECRET 各自独立，需分别配置。',
   ' *',
   ' * 部署：npm run deploy:cron（wrangler deploy -c cron/wrangler.toml）',
   ' * 绑定：Dashboard → Workers & Pages → 本 Worker → Settings → Bindings → D1 database bindings，',
@@ -87,18 +92,44 @@ const CRON_HEADER = [
 
 const CRON_ENTRY = [
   '',
+  '// ---- 手动入口鉴权（入口模板自带，常量时间比较）----',
+  '// 与 Pages 侧手动触发接口的鉴权行为保持一致：取 x-cf-secret 请求头或 ?secret= 查询参数，未配置密钥一律拒绝。',
+  '// 说明：Pages 侧的 safeEqual 定义在其 fetch 处理器内部（局部作用域），无法在不扩大 @notify-core',
+  '//      抽取范围的前提下复用，故在入口模板内自带等价实现。',
+  'function cronSafeEqual(a, b) {',
+  '  const la = String(a || ""), lb = String(b || "");',
+  '  let res = la.length === lb.length ? 0 : 1;',
+  '  const n = Math.max(la.length, lb.length);',
+  '  for (let i = 0; i < n; i++) res |= (la.charCodeAt(i) || 0) ^ (lb.charCodeAt(i) || 0);',
+  '  return res === 0;',
+  '}',
+  '',
+  'function cronForbidden() {',
+  '  return new Response(JSON.stringify({ ok: false, error: "Forbidden" }), {',
+  '    status: 403,',
+  '    headers: { "Content-Type": "application/json;charset=UTF-8" }',
+  '  });',
+  '}',
+  '',
   'export default {',
   '  // Cron 触发（每分钟）：执行告警检查（含失败补发 drain），异步进行，不阻塞调度返回',
+  '  // 定时入口由 Cron Triggers 触发，不需要密钥',
   '  async scheduled(controller, env, ctx) {',
   '    ctx.waitUntil(Promise.resolve().then(() => scheduledAlertCheck(env)));',
   '  },',
   '',
-  '  // 手动触发入口：浏览器 / curl 访问本 Worker 域名，执行一次告警检查并回显 JSON 结果',
+  '  // 手动触发入口：必须携带密钥（x-cf-secret 请求头或 ?secret= 查询参数），鉴权通过才执行告警检查并回显 JSON 结果',
   '  async fetch(request, env, ctx) {',
+  '    // 未配置 API_SECRET 时一律拒绝，避免空值互相匹配导致鉴权被绕过',
+  '    if (!env.API_SECRET) return cronForbidden();',
+  '    const url = new URL(request.url);',
+  '    const provided = request.headers.get("x-cf-secret") || url.searchParams.get("secret") || "";',
+  '    if (!cronSafeEqual(provided, env.API_SECRET)) return cronForbidden();',
+  '',
   '    const startedAt = Date.now();',
   '    try {',
   '      const result = await scheduledAlertCheck(env);',
-  '      return new Response(JSON.stringify({ ok: true, elapsed_ms: Date.now() - startedAt, result }, null, 2), {',
+  '      return new Response(JSON.stringify({ ok: true, triggered: "alert_check", elapsed_ms: Date.now() - startedAt, result }, null, 2), {',
   '        status: 200,',
   '        headers: { "Content-Type": "application/json;charset=UTF-8" }',
   '      });',
@@ -157,10 +188,36 @@ function main() {
   if (built.code.indexOf('function scheduledAlertCheck') < 0) {
     fail('抽取结果中缺少 scheduledAlertCheck，请检查 src/index.js 的 @notify-core 标记边界');
   }
-  const residual = cronBuf.toString('utf8').match(/SITE_URL|API_SECRET|\/api\/cron/g);
+  const cronText = cronBuf.toString('utf8');
+
+  // 残留依赖校验（精确到用途，不再一律禁止 API_SECRET）：
+  //  1) 严禁 SITE_URL：定时 Worker 不得依赖 Pages 站点地址
+  //  2) 严禁 /api/cron 与 pages.dev：不得向 Pages 侧发起任何请求
+  //  3) @notify-core 抽取区块（告警链路本体）内 API_SECRET 必须 0 命中
+  //  4) API_SECRET 仅允许用于入口模板的两处鉴权语句：空值拒绝 + 常量时间比对
+  const residual = cronText.match(/SITE_URL|\/api\/cron|pages\.dev/gi);
   if (residual) {
     fail('生成的 cron/worker.js 残留 Pages 侧依赖：' + Array.from(new Set(residual)).join(', '));
   }
+
+  const blocksText = built.blocks.map((b) => b.text).join('\n');
+  if (blocksText.indexOf('API_SECRET') >= 0) {
+    fail('@notify-core 抽取区块内出现 API_SECRET，鉴权逻辑只应存在于生成物入口模板中');
+  }
+  const secretUses = cronText.match(/env\.API_SECRET/g) || [];
+  if (secretUses.length !== 2) {
+    fail('生成的 cron/worker.js 中 env.API_SECRET 应恰好出现 2 次（空值拒绝 + 常量时间比对），实际 ' + secretUses.length + ' 次');
+  }
+  if (!/if \(!env\.API_SECRET\) return cronForbidden\(\);/.test(cronText)) {
+    fail('生成的 cron/worker.js 缺少「未配置 API_SECRET 一律拒绝」判断');
+  }
+  if (!/if \(!cronSafeEqual\(provided, env\.API_SECRET\)\) return cronForbidden\(\);/.test(cronText)) {
+    fail('生成的 cron/worker.js 缺少常量时间比较的鉴权判断');
+  }
+  if (cronText.indexOf('x-cf-secret') < 0) {
+    fail('生成的 cron/worker.js 缺少 x-cf-secret 请求头读取');
+  }
+  console.log('[build] 残留依赖校验通过：SITE_URL / /api/cron / pages.dev 零命中；API_SECRET 仅用于入口鉴权（用途校验通过）');
 
   fs.mkdirSync(path.dirname(CRON_WORKER), { recursive: true });
   fs.writeFileSync(CRON_WORKER, cronBuf);
@@ -198,7 +255,7 @@ function main() {
   console.log('      路径   : ' + CRON_WORKER);
   console.log('      字节数 : ' + cronBuf.length + ' B');
   console.log('      SHA256 : ' + sha256(cronBuf));
-  console.log('      校验   : node --check 通过；零残留 SITE_URL / API_SECRET / /api/cron');
+  console.log('      校验   : node --check 通过；零残留 SITE_URL / /api/cron / pages.dev；API_SECRET 仅用于 fetch 手动入口鉴权');
 
   console.log('[build] 成功：三份入口文件 SHA256 一致 -> ' + hashes[0]);
 }
