@@ -1773,6 +1773,76 @@ async function handleNotifyAdminApi(data, env) {
       } catch (e) {}
       return { success: true, id: ch.id, ok: ok, result: r, log_id: logId };
     }
+    // ---------- 规则级测试发送（按规则绑定的通道真实投递一条测试通知） ----------
+    if (act === 'notify_test_rule') {
+      const id = notifyAdminStr(d.id || (d.rule && d.rule.id));
+      if (!id) return fail('missing_id');
+      const row = await env.DB.prepare('SELECT id, name, enabled, type, scope, params, severity, cooldown, silent_window, digest, recover_notify, created_at FROM notify_rules WHERE id = ?').bind(id).first();
+      if (!row) return fail('rule_not_found');
+      const rule = notifyNormalizeRuleRow(row);
+      // 该规则已绑定的通道（按创建顺序去重）；测试发送忽略规则/通道 enabled 开关，便于配置阶段验证
+      const bdRes = await env.DB.prepare('SELECT channel_id FROM notify_bindings WHERE rule_id = ? ORDER BY created_at ASC').bind(id).all();
+      const chIds = [];
+      for (const b of ((bdRes && bdRes.results) || [])) {
+        const cid = notifyAdminStr(b && b.channel_id);
+        if (cid && chIds.indexOf(cid) === -1) chIds.push(cid);
+      }
+      const rmeta = typeMetaById[rule.type] || null;
+      const now = Date.now();
+      const sdata = notifyTemplateVarMap(Object.assign(notifyTemplateSampleData(), {
+        rule_id: rule.id, rule_name: rule.name, rule_type: rule.type,
+        title: rmeta ? rmeta.name : rule.type, at: now, at_text: notifyEventTime(now),
+        dedupe_key: rule.id + '::test::' + now
+      }));
+      // 文案优先套用模板中心该类型的生效模板（自定义覆盖 > 内置默认），回退到通用测试文案
+      let tplId = '', tplTitle = '', tplBody = '';
+      try {
+        const tRow = await env.DB.prepare('SELECT id, content FROM notify_templates WHERE type = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1').bind(rule.type).first();
+        if (tRow) {
+          const parsed = notifyTemplateParseContent(tRow.content);
+          if (parsed.title || parsed.body) { tplId = notifyAdminStr(tRow.id); tplTitle = parsed.title; tplBody = parsed.body; }
+        }
+      } catch (e) {}
+      if (!tplTitle && !tplBody) {
+        const bi = notifyTemplateBuiltinByType(rule.type);
+        if (bi) { tplId = notifyAdminStr(bi.id); tplTitle = notifyAdminStr(bi.title); tplBody = notifyAdminStr(bi.body); }
+      }
+      const head = '【测试消息】本消息由后台「规则管理 - 测试发送」触发（非真实告警，不代表节点或指标当前状态）。\n\n';
+      const rTitle = tplTitle ? notifyRenderTemplateText(tplTitle, sdata).text : (notifyAdminStr(d.title) || ((rmeta ? rmeta.name : rule.type) + ' - ' + rule.name));
+      const rBody = tplBody ? notifyRenderTemplateText(tplBody, sdata).text : (notifyAdminStr(d.text) || ('规则: ' + rule.name + '\n类型: ' + (rmeta ? rmeta.name : rule.type) + '\n时间: ' + notifyEventTime(now)));
+      const payload = { title: '【测试】' + (rTitle || ('规则 ' + rule.name)), text: head + (rBody || '') };
+      const results = [];
+      let sent = 0, failed = 0;
+      for (const cid of chIds) {
+        const cRow = await env.DB.prepare('SELECT id, type, name, config, enabled, created_at FROM notify_channels WHERE id = ?').bind(cid).first();
+        if (!cRow) {
+          failed += 1;
+          results.push({ channel_id: cid, channel_name: '', channel_type: '', ok: false, status: 0, error: 'channel_not_found', log_id: '' });
+          continue;
+        }
+        const ch = notifyNormalizeChannelRow(cRow);
+        let r;
+        try { r = await sendViaChannel(Object.assign({}, ch, { enabled: 1 }), payload); }
+        catch (e) { r = notifyFail((e && e.message) || e); }
+        const ok = !!(r && r.ok === true);
+        if (ok) sent += 1; else failed += 1;
+        let logId = '';
+        try {
+          const lg = await notifyLogWrite(env, {
+            rule_id: rule.id, channel_id: ch.id, server_id: '', type: 'test', title: payload.title, content: payload.text,
+            status: ok ? 'sent' : 'failed', error: (r && r.error) || '', dedupe_key: 'test::' + rule.id + '::' + ch.id + '::' + now,
+            attempts: 1, created_at: now, sent_at: ok ? now : 0
+          });
+          logId = (lg && lg.id) || '';
+        } catch (e) {}
+        results.push({ channel_id: ch.id, channel_name: ch.name, channel_type: ch.type, ok: ok, status: (r && r.status) || 0, error: (r && r.error) || '', log_id: logId });
+      }
+      return {
+        success: true, id: rule.id, name: rule.name, rule_type: rule.type, enabled: rule.enabled,
+        total: chIds.length, sent: sent, failed: failed, ok: (chIds.length > 0 && failed === 0),
+        reason: chIds.length ? '' : 'no_binding', template_id: tplId, payload: payload, results: results
+      };
+    }
 
     // ---------- 规则 CRUD ----------
     if (act === 'notify_list_rules') {
@@ -4677,6 +4747,7 @@ ${customScript}</body>
               + '<td class="ntf-actions">'
               + '<button type="button" class="btn btn-gray" onclick="ntfOpenRuleModal(\\'' + ntfEsc(r.id) + '\\')">编辑</button>'
               + '<button type="button" class="btn ' + (r.enabled === 1 ? 'btn-yellow' : 'btn-green') + '" onclick="ntfToggleRule(\\'' + ntfEsc(r.id) + '\\',' + next + ')">' + (r.enabled === 1 ? '停用' : '启用') + '</button>'
+              + '<button type="button" class="btn btn-blue" onclick="ntfTestRule(\\'' + ntfEsc(r.id) + '\\')">测试发送</button>'
               + '<button type="button" class="btn btn-red" onclick="ntfDeleteRule(\\'' + ntfEsc(r.id) + '\\')">删除</button>'
               + '</td>';
           }
@@ -4729,6 +4800,33 @@ ${customScript}</body>
             if (row && r) row.innerHTML = ntfRuleRowHtml(r);
             ntfUpdateRuleCount();
             ntfSetMsg('ntf-rule-msg', '规则「' + ((r && r.name) || id) + '」已' + (next ? '启用' : '停用'), 'ok');
+          }
+          async function ntfTestRule(id) {
+            const r = ntfFindRule(id);
+            const label = (r && r.name) ? r.name : id;
+            if (r && (r.channel_count || 0) === 0) {
+              ntfSetMsg('ntf-rule-msg', '规则「' + label + '」未绑定任何通道，无法测试发送，请先到「绑定配置」为该规则勾选通道', 'err');
+              return;
+            }
+            ntfSetMsg('ntf-rule-msg', '正在按规则「' + label + '」发送测试通知…', 'info');
+            const out = await ntfAdminPost('notify_test_rule', { id: id });
+            if (!out || out.success !== true) {
+              ntfSetMsg('ntf-rule-msg', '测试发送失败：' + ntfErrText(out && out.error) + '（规则「' + label + '」）', 'err');
+              return;
+            }
+            if (out.reason === 'no_binding' || !out.total) {
+              ntfSetMsg('ntf-rule-msg', '规则「' + label + '」未绑定任何通道，无法测试发送，请先到「绑定配置」为该规则勾选通道', 'err');
+              return;
+            }
+            const rs = out.results || [];
+            const parts = [];
+            for (let i = 0; i < rs.length; i++) {
+              const it = rs[i] || {};
+              const nm = it.channel_name || it.channel_id || '未知通道';
+              parts.push(nm + '：' + (it.ok === true ? '发送成功' : '发送失败（' + ntfErrText(it.error) + '）'));
+            }
+            if (out.failed > 0) ntfSetMsg('ntf-rule-msg', '测试发送完成：成功 ' + out.sent + ' 个 / 失败 ' + out.failed + ' 个 — ' + parts.join('；'), 'err');
+            else ntfSetMsg('ntf-rule-msg', '测试发送成功（共 ' + out.sent + ' 个通道）：' + parts.join('；'), 'ok');
           }
           async function ntfDeleteRule(id) {
             const r = ntfFindRule(id);
