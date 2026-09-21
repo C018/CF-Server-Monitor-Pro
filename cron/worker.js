@@ -223,6 +223,8 @@ function buildLegacyTelegramChannel(settings) {
 //       仅 deliverable === true 的事件需要发送，其余为抑制/清理事件。
 const NOTIFY_SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
 const NOTIFY_OFFLINE_DEFAULT_THRESHOLD = 120;
+const NOTIFY_REPEAT_DEFAULT_SEC = 1800;   // 离线持续告警重复提醒默认间隔（秒）：firing 状态下距上次提醒超过该间隔则再次推送
+const NOTIFY_REPEAT_MIN_SEC = 60;         // 重复提醒间隔下限（秒），防止配置过小导致刷屏
 const NOTIFY_TRAFFIC_DEFAULT_THRESHOLD = 90;
 const NOTIFY_EXPIRE_DEFAULT_DAYS = 7;
 function notifyStateKey(ruleId, serverId) { return String(ruleId) + '::' + String(serverId); }
@@ -274,6 +276,28 @@ function notifyOfflineThresholdMs(rule) {
   const extra = notifyToNum(p.forDuration === undefined ? p.for_duration : p.forDuration) || 0;
   const base = (thr === null || thr < 0) ? NOTIFY_OFFLINE_DEFAULT_THRESHOLD : thr;
   return { baseMs: base * 1000, forMs: extra * 1000, thresholdSec: base, forDurationSec: extra };
+}
+
+// 离线重复提醒间隔（秒）：params.repeat_interval > params.repeat > params.cooldown > rule.cooldown > 默认值
+// 约束：不低于 rule.cooldown（冷却下限）与聚合摘要窗口（避免同窗口去重键冲突导致续报被吞），且不小于 NOTIFY_REPEAT_MIN_SEC
+function notifyOfflineRepeatSec(rule) {
+  const r = (rule && typeof rule === 'object') ? rule : {};
+  const p = notifyNormalizeConfig(r.params) || {};
+  const read = (k) => { const v = notifyToNum(p[k]); return (v !== null && v > 0) ? v : null; };
+  let sec = read('repeat_interval');
+  if (sec === null) sec = read('repeatInterval');
+  if (sec === null) sec = read('repeat');
+  if (sec === null) sec = read('repeat_sec');
+  if (sec === null) sec = read('cooldown');
+  if (sec === null) {
+    const cd0 = notifyToNum(r.cooldown);
+    sec = (cd0 !== null && cd0 > 0) ? cd0 : NOTIFY_REPEAT_DEFAULT_SEC;
+  }
+  const cd = notifyToNum(r.cooldown) || 0;
+  if (cd > sec) sec = cd;
+  const dg = notifyDigestSpec(r);
+  if (dg && dg.enabled && dg.windowSec > sec) sec = dg.windowSec;
+  return Math.max(NOTIFY_REPEAT_MIN_SEC, Math.floor(sec));
 }
 function notifyCollectStateOps(events) {
   const patch = { upsert: [], remove: [] };
@@ -523,6 +547,32 @@ function evaluateNotifyRules(rules, servers, state, now) {
             ev.deliverable = false; ev.suppressed_by = 'silent_window';
             ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since, last_notified_at: notifyToNum(prev && prev.last_notified_at) || 0, fire_count: fireCount } };
           } else ev.deliverable = true;
+        } else if (isOffline && firing) {
+          // 治本改造：firing 状态不再永久抑制推送——距上次提醒已超过重复提醒间隔时，重新产生 fire 事件续报
+          const repeatSec = notifyOfflineRepeatSec(rule);
+          const lastNotified = notifyToNum(prev.last_notified_at);
+          const repeatDue = (lastNotified === null) || ((nowMs - lastNotified) >= repeatSec * 1000);
+          if (repeatDue) {
+            const since = notifyToNum(prev.since) || nowMs;
+            const fireCount = (notifyToNum(prev.fire_count) || 0) + 1;
+            const ev = emit(s, 'fire', metrics, { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: since, last_notified_at: nowMs, fire_count: fireCount } });
+            // 每轮续报使用独立去重键（含轮次），否则 notify_log 幂等去重会把重复提醒吞掉（inserted=false → skipped）
+            ev.dedupe_key = [String(rule.id), sid, 'fire', 'repeat', String(fireCount)].join('::');
+            ev.repeat = true;
+            ev.repeat_count = fireCount;
+            ev.repeat_interval_sec = repeatSec;
+            const offlineSec = Math.max(0, Math.round((notifyToNum(stale) || 0) / 1000));
+            const timeText = notifyEventTime(nowMs);
+            const nameTxt = String(s.name || '');
+            ev.title = '节点离线告警（持续提醒 第 ' + fireCount + ' 次）';
+            ev.text = '节点离线告警（持续提醒）\n\n节点名称: ' + nameTxt + '\n状态: 离线 (超过判定阈值未上报)\n已持续离线: ' + offlineSec + ' 秒\n提醒次数: 第 ' + fireCount + ' 次\n时间: ' + timeText;
+            ev.html = '⚠️ <b>节点离线告警（持续提醒）</b>\n\n<b>节点名称:</b> ' + tgEsc(nameTxt) + '\n<b>状态:</b> 离线 (超过判定阈值未上报)\n<b>已持续离线:</b> ' + offlineSec + ' 秒\n<b>提醒次数:</b> 第 ' + fireCount + ' 次\n<b>时间:</b> ' + timeText;
+            if (silentNow) {
+              // 免打扰时段内抑制投递，但不推进 last_notified_at：静默结束后可立即补推
+              ev.deliverable = false; ev.suppressed_by = 'silent_window';
+              ev.state_op = { op: 'upsert', row: { rule_id: String(rule.id), server_id: sid, state: 'firing', since: since, last_notified_at: (lastNotified === null ? 0 : lastNotified), fire_count: fireCount } };
+            } else ev.deliverable = true;
+          }
         } else if (!isOffline && firing) {
           const ev = emit(s, recoverNotify ? 'recover' : 'clear', metrics, { op: 'delete', rule_id: String(rule.id), server_id: sid, key: notifyStateKey(rule.id, sid) });
           if (recoverNotify) {
